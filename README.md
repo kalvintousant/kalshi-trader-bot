@@ -1,25 +1,22 @@
-# Kalshi Trading Bot
+# Kalshi Weather Trading Bot
 
-Automated trading bot for Kalshi prediction markets, supporting **hourly BTC markets** and **daily weather markets** with advanced strategies.
+Automated trading bot for Kalshi **daily weather markets** using advanced multi-source forecast aggregation and dual-strategy approach (longshot + conservative).
 
 ## Features
 
-- **Hourly BTC Markets**: Latency arbitrage strategy on Bitcoin price movement predictions
-  - Tracks real-time BTC moves from Binance
-  - Detects mispricing when Kalshi odds lag behind market movements
-  - Automated entry/exit logic
-  
 - **Daily Weather Markets**: Multi-source forecast aggregation strategy
   - Aggregates forecasts from multiple weather APIs (NWS, Tomorrow.io, Weatherbit)
   - Supports both HIGH and LOW temperature markets for 4 cities
+  - Dual strategy: Longshot mode (asymmetric payouts) + Conservative mode (steady gains)
   - Calculates edge and expected value (EV) based on probability distributions
-  - Trades when edge > threshold
-  - Optimized for AUSHIGH contract rules (5-minute scans, 30-minute cache)
+  - Optimized for all contract rules (NHIGH, CHIHIGH, MIHIGH, AUSHIGH, and LOW variants)
+  - Daytime schedule (6am-10pm) optimized for forecast update patterns
   
 - **Real-time Market Data**: Efficient polling with caching and connection pooling
 - **Trade Notifications**: macOS notifications + file logging for every trade
 - **Risk Management**: Daily loss limits and position sizing controls
 - **Performance Optimized**: Caching, connection pooling, parallel execution
+- **Automatic Scheduling**: Runs during optimal hours (6am-10pm) via cron
 
 ## Setup
 
@@ -62,23 +59,47 @@ Automated trading bot for Kalshi prediction markets, supporting **hourly BTC mar
 
 ## Usage
 
-Run the bot:
+### Daytime Schedule (Recommended)
+
+The bot is configured to run automatically during optimal trading hours:
+
+**Automatic (via cron):**
+- Starts at 6:00 AM daily
+- Stops at 10:00 PM daily
+- No manual intervention needed
+
+**Manual start:**
+```bash
+./start_daytime.sh
+```
+(Only starts if between 6am-10pm)
+
+**Set up automatic scheduling:**
+```bash
+./setup_schedule.sh
+```
+Follow instructions to configure cron jobs.
+
+### Manual Operation
+
+Run the bot manually:
 ```bash
 python3 bot.py
 ```
 
 Run in background (keeps laptop awake):
 ```bash
-caffeinate -i python3 -u bot.py > bot_output.log 2>&1 &
+nohup caffeinate -i python3 -u bot.py > bot_output.log 2>&1 &
 ```
 
 The bot will:
-- Scan markets adaptively: 0.5 seconds (BTC 15-min), 10 seconds (BTC hourly), or 5 minutes (weather)
-- Evaluate markets using enabled strategies
+- Scan markets every 30 minutes (optimized for daily weather markets)
+- Evaluate markets using dual strategy (longshot + conservative)
 - Place trades when opportunities are identified
 - Send macOS notifications for each trade
 - Log all trades to `trades.log`
 - Detect new markets immediately for early entry opportunities
+- Run during daytime hours (6am-10pm) when forecasts update most
 
 ### Monitoring
 
@@ -101,48 +122,30 @@ pkill -f "python3.*bot.py"
 
 Edit `.env` to customize:
 
-- `MAX_POSITION_SIZE`: Maximum contracts per trade (default: 10)
-- `MAX_DAILY_LOSS`: Stop trading if daily loss exceeds this (default: $100)
-- `ENABLED_STRATEGIES`: Comma-separated list:
-  - `btc_15m` - 15-minute BTC latency arbitrage (KXBTC15M - up/down markets)
-  - `btc_hourly` - Hourly BTC latency arbitrage (KXBTC - price range markets)
-  - `weather_daily` - Daily weather markets with multi-source forecasts
+- `MAX_POSITION_SIZE`: Maximum contracts per trade (default: 1 for weather)
+- `MAX_DAILY_LOSS`: Stop trading if daily loss exceeds this (default: $20)
+- `ENABLED_STRATEGIES`: Set to `weather_daily` for weather markets
 
 Example:
 ```
 MAX_POSITION_SIZE=1
-MAX_DAILY_LOSS=10
-ENABLED_STRATEGIES=btc_hourly
+MAX_DAILY_LOSS=20
+ENABLED_STRATEGIES=weather_daily
 ```
 
-## Strategies
+### Weather API Keys
 
-### BTC Hourly Strategy (Latency Arbitrage)
+Add to `.env`:
+```
+TOMORROWIO_API_KEY=your_key
+WEATHERBIT_API_KEY=your_key
+```
 
-**How it works:**
-1. Tracks real-time BTC price movements from Binance (5-minute candles)
-2. Calculates momentum and volatility over 1-hour periods
-3. Compares expected price (based on BTC move) to actual Kalshi odds
-4. Enters trades when mispricing detected (>3 cents difference)
-5. Exits automatically when pricing catches up
+NWS is free and requires no key. All APIs stay within free tier limits.
 
-**Entry Conditions:**
-- BTC momentum > 0.3% (configurable)
-- Volatility > 0.2% (ensures real move)
-- Mispricing > 3 cents (Kalshi hasn't caught up)
+## Strategy: Weather Daily Markets
 
-**Exit Logic:**
-- Pricing moves towards expected value (mispricing closes)
-- Position becomes profitable
-- Minimum hold time: 30 seconds
-
-**Contract Compliance:**
-- Uses `KXBTC` series (hourly BTC markets)
-- Tracks 1-hour price changes to match market expiration
-- Only trades markets with `status='open'` (respects expiration)
-- See [CONTRACT_COMPLIANCE.md](CONTRACT_COMPLIANCE.md) for details
-
-### Weather Daily Strategy (Edge + EV)
+### Dual Strategy Approach
 
 **Dual Strategy Approach:**
 
@@ -176,10 +179,17 @@ ENABLED_STRATEGIES=btc_hourly
 - **Cities**: New York City, Chicago, Miami, Austin
 
 **Official Measurement Locations (per contract rules):**
-- **New York**: Central Park (40.7711°N, 73.9742°W) - NHIGH contract
-- **Chicago**: Chicago Midway Airport (41.7868°N, 87.7522°W) - CHIHIGH contract
-- **Miami**: Miami International Airport (25.7932°N, 80.2906°W) - MIHIGH contract
-- **Austin**: Austin Bergstrom International Airport (30.1831°N, 97.6799°W) - AUSHIGH contract
+- **New York**: Central Park (40.7711°N, 73.9742°W) - NHIGH/NLOW contracts
+- **Chicago**: Chicago Midway Airport (41.7868°N, 87.7522°W) - CHIHIGH/CHILOW contracts
+- **Miami**: Miami International Airport (25.7932°N, 80.2906°W) - MIHIGH/MILOW contracts
+- **Austin**: Austin Bergstrom International Airport (30.1831°N, 97.6799°W) - AUSHIGH/AUSLOW contracts
+
+**Contract Compliance:**
+- Optimized for all weather contract rules (NHIGH, CHIHIGH, MIHIGH, AUSHIGH, and LOW variants)
+- Uses official NWS measurement locations matching contract settlement data
+- 30-minute scan interval matches forecast update frequency
+- 30-minute forecast cache ensures compliance with API rate limits
+- Coordinates match exact weather station locations used for contract settlement
 
 **Data Sources:**
 - National Weather Service (NWS) - Free, no API key needed
@@ -194,32 +204,32 @@ ENABLED_STRATEGIES=btc_hourly
 - Parallel fetching: All 3 APIs called simultaneously for speed
 - Official NWS coordinates: Matches exact measurement locations for accuracy
 - Quality thresholds: Min edge 5%, min EV $0.01, min volume 15 contracts
-- Reduced from 5-min to 30-min scan: 83% fewer scans (48/day vs 288/day)
+- Daytime schedule: 6am-10pm (when forecasts update most)
+- Contract compliance: Optimized for all weather contract rules
 
-See [WEATHER_STRATEGY.md](WEATHER_STRATEGY.md) and [BTC_STRATEGY.md](BTC_STRATEGY.md) for detailed strategy documentation.
+See [WEATHER_STRATEGY.md](WEATHER_STRATEGY.md), [LONGSHOT_STRATEGY.md](LONGSHOT_STRATEGY.md), and [DAYTIME_SCHEDULE.md](DAYTIME_SCHEDULE.md) for detailed documentation.
 
 ## Project Structure
 
 ```
 .
 ├── bot.py                       # Main bot orchestrator
-├── strategies.py                # Trading strategies (BTC 15-min, BTC hourly, Weather)
+├── strategies.py                # Weather trading strategies (dual mode)
 ├── kalshi_client.py             # Kalshi API client with authentication
-├── btc_data.py                  # BTC price tracking from Binance
 ├── weather_data.py              # Multi-source weather forecast aggregation
 ├── config.py                    # Configuration management
 ├── requirements.txt             # Python dependencies
 ├── .env.example                 # Environment variable template
 ├── README.md                    # This file
-├── BTC_15MIN_STRATEGY.md        # 15-minute BTC strategy documentation
-├── BTC_STRATEGY.md              # Hourly BTC strategy documentation
+├── start_daytime.sh             # Daytime startup script (6am-10pm)
+├── setup_schedule.sh            # Cron setup instructions
+├── start_bot.sh                 # 24/7 startup script (if needed)
 ├── WEATHER_STRATEGY.md          # Weather strategy documentation
-├── CONTRACT_COMPLIANCE.md       # Hourly BTC contract compliance
-├── CRYPTO15M_COMPLIANCE.md      # 15-minute BTC contract compliance
-├── PERFORMANCE_IMPROVEMENTS.md  # Performance optimizations
-├── OPTIMIZATION_RECOMMENDATIONS.md # Further optimization suggestions
-├── KEEP_RUNNING.md              # Guide for keeping bot running
-└── OVERNIGHT_TEST.md            # Overnight testing guide
+├── LONGSHOT_STRATEGY.md         # Asymmetric longshot strategy guide
+├── DAYTIME_SCHEDULE.md          # Daytime scheduling documentation
+├── WEATHER_OPTIMIZATION.md      # API efficiency analysis
+├── STRATEGY_IMPROVEMENTS.md     # Improvement framework
+└── OPTIMIZATION_FINAL.md        # Production optimization details
 ```
 
 ## Extending the Bot
@@ -248,23 +258,23 @@ The bot includes several performance optimizations:
 - **Orderbook caching**: 5-second cache to reduce API calls
 - **Connection pooling**: Reuses HTTP connections
 - **Market filtering**: Filters by series before expensive API calls
-- **Shared BTC tracker**: Updates once per scan, not per market
-- **Adaptive scan intervals**: 0.5s (BTC 15-min), 10s (BTC hourly), 5min (weather)
 - **Forecast caching**: 30-minute cache reduces weather API calls by 95%
 - **New market detection**: Tracks seen markets to prioritize new ones
 - **Parallel API calls**: Weather forecasts fetched simultaneously from 3 sources
-- **Optimized for free tiers**: All weather APIs stay within free tier limits
+- **Optimized for free tiers**: All weather APIs stay within free tier limits (38% usage)
+- **Daytime schedule**: Runs during optimal hours (6am-10pm) when forecasts update most
+- **Contract compliance**: Optimized scan intervals and coordinates for all weather contracts
 
-See [PERFORMANCE_IMPROVEMENTS.md](PERFORMANCE_IMPROVEMENTS.md) for details.
+See [OPTIMIZATION_FINAL.md](OPTIMIZATION_FINAL.md) and [WEATHER_OPTIMIZATION.md](WEATHER_OPTIMIZATION.md) for details.
 
 ## Important Notes
 
-- **Start with demo environment**: Always test in demo mode first
-- **Risk management**: Set appropriate position sizes and loss limits
-- **Rate limits**: The bot includes rate limiting and caching, but be mindful of API limits
-- **Market hours**: Some markets only trade during specific hours
-- **Contract compliance**: Bot respects Kalshi contract rules (see [CONTRACT_COMPLIANCE.md](CONTRACT_COMPLIANCE.md))
-- **BRTI vs Binance**: Bot uses Binance as a proxy for BRTI (official index) for real-time tracking
+- **Daytime schedule**: Bot runs 6am-10pm when forecasts update most (automatic via cron)
+- **Risk management**: Set appropriate position sizes and loss limits (default: $20 max daily loss)
+- **Rate limits**: All weather APIs stay within free tier limits (38% usage)
+- **Contract compliance**: Bot optimized for all weather contract rules (NHIGH, CHIHIGH, MIHIGH, AUSHIGH, and LOW variants)
+- **Official coordinates**: Uses exact NWS measurement locations matching contract settlement data
+- **Forecast accuracy**: Multi-source aggregation (3 APIs) for better probability estimates
 
 ## Trade Notifications
 
@@ -287,7 +297,7 @@ This bot is for educational purposes. Trading involves risk. Always:
 - [Kalshi API Documentation](https://docs.kalshi.com/)
 - [Kalshi Trading Console](https://kalshi.com)
 - [Kalshi Academy](https://help.kalshi.com/)
-- [Kalshi BTC Contract Terms](https://kalshi-public-docs.s3.amazonaws.com/contract_terms/BTC.pdf)
+- [Weather Contract Terms](https://kalshi-public-docs.s3.amazonaws.com/contract_terms/) (NHIGH, CHIHIGH, MIHIGH, AUSHIGH, and LOW variants)
 
 ## License
 
