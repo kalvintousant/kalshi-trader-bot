@@ -201,7 +201,7 @@ class KalshiTradingBot:
             elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
                 print("[Bot] Scan interval: 10 seconds (optimized for hourly BTC markets)")
             elif 'weather_daily' in Config.ENABLED_STRATEGIES:
-                print("[Bot] Scan interval: 5 minutes (optimized for daily weather markets - forecasts update hourly)")
+                print("[Bot] Scan interval: 30 minutes (optimized for daily weather markets - matches forecast cache)")
             else:
                 print("[Bot] Scan interval: 15 seconds")
             while self.running:
@@ -210,14 +210,16 @@ class KalshiTradingBot:
                     self.scan_and_trade()
                     scan_duration = time.time() - scan_start
                     
-                    # Ultra-fast scanning for new market detection (critical for early entry)
-                    # 0.5 second interval for BTC 15-min to catch markets in first few seconds
+                    # Adaptive scan intervals based on market type
+                    # BTC 15-min: 0.5s (ultra-fast for new market detection)
+                    # BTC hourly: 10s (moderate speed)
+                    # Weather daily: 30 min (matches forecast cache, appropriate for daily settlements)
                     if 'btc_15m' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 0.5 - scan_duration)  # 0.5 second interval for ultra-fast new market detection
+                        sleep_time = max(0, 0.5 - scan_duration)  # 0.5 second interval
                     elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 10 - scan_duration)  # 10 second interval for hourly BTC
+                        sleep_time = max(0, 10 - scan_duration)  # 10 second interval
                     elif 'weather_daily' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 300 - scan_duration)  # 5 minutes for weather (daily markets, forecasts update hourly)
+                        sleep_time = max(0, 1800 - scan_duration)  # 30 minutes (1800 seconds) for daily weather markets
                     else:
                         sleep_time = max(0, 15 - scan_duration)  # 15 second default
                     

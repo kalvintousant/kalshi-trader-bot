@@ -175,12 +175,13 @@ ENABLED_STRATEGIES=btc_hourly
 - OpenWeather - Removed (per optimization)
 
 **Optimizations:**
-- Scan interval: 5 minutes (per AUSHIGH contract rules - daily markets)
+- Scan interval: 30 minutes (matches forecast cache TTL - appropriate for daily settlements)
 - Forecast cache: 30 minutes (reduces API calls by 95%)
 - API calls: ~192/day per API (38.4% of 500/day free tier limit)
 - Parallel fetching: All 3 APIs called simultaneously for speed
 - Official NWS coordinates: Matches exact measurement locations for accuracy
 - Quality thresholds: Min edge 5%, min EV $0.01, min volume 15 contracts
+- Reduced from 5-min to 30-min scan: 83% fewer scans (48/day vs 288/day)
 
 See [WEATHER_STRATEGY.md](WEATHER_STRATEGY.md) and [BTC_STRATEGY.md](BTC_STRATEGY.md) for detailed strategy documentation.
 
