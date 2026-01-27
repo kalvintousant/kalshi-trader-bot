@@ -88,6 +88,12 @@ class KalshiTradingBot:
             markets_to_process = new_markets + existing_markets
             print(f"[Bot] Found {len(markets_to_process)} relevant markets ({len(new_markets)} new, {len(existing_markets)} existing)")
             
+            # Debug: show market details
+            if markets_to_process:
+                sample = markets_to_process[0]
+                print(f"[Bot] Sample market: {sample.get('ticker')} | Series: {sample.get('series_ticker')} | Volume: {sample.get('volume', 0)} | Status: {sample.get('status')}")
+            
+            markets_evaluated = 0
             for market in markets_to_process:
                 # Quick filter check before expensive orderbook call
                 should_trade = any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies)
@@ -103,6 +109,9 @@ class KalshiTradingBot:
                     if volume < 15:
                         print(f"[Bot] ⚠️  Market {market.get('ticker', 'unknown')} skipped: volume {volume} < 15")
                     continue
+                
+                markets_evaluated += 1
+                print(f"[Bot] Evaluating market: {market.get('ticker', 'unknown')} - {market.get('title', 'unknown')[:50]}")
                 
                 # Evaluate market with all strategies
                 try:
