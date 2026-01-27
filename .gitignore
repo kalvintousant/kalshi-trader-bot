@@ -48,8 +48,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# BTC/Crypto documentation (focus on weather markets only)
+# BTC/Crypto documentation and code (focus on weather markets only)
 BTC_*.md
 *BTC*.md
 CRYPTO*.md
 CONTRACT_COMPLIANCE.md
+btc_data.py
+COMPREHENSIVE_REVIEW.md
