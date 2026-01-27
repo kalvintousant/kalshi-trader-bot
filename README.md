@@ -145,11 +145,17 @@ ENABLED_STRATEGIES=btc_hourly
 ### Weather Daily Strategy (Edge + EV)
 
 **How it works:**
-1. Aggregates forecasts from multiple weather APIs
-2. Builds probability distributions over temperature ranges
+1. Aggregates forecasts from multiple weather APIs (3 sources)
+2. Builds probability distributions over temperature ranges using normal distribution
 3. Calculates edge: `(Your Probability - Market Price) × 100`
 4. Calculates EV: `(Win Prob × Payout) - (Loss Prob × Stake)`
-5. Trades when edge ≥ 5% and EV ≥ $0.001
+5. Trades when edge ≥ 5% and EV ≥ $0.01 (optimized thresholds)
+
+**Strategy Parameters (Optimized for Production):**
+- Min edge: 5% (ensures quality trades)
+- Min EV: $0.01 (10x threshold for better ROI)
+- Min volume: 15 contracts (better liquidity than 5)
+- Forecast sources: 3 parallel APIs (NWS, Tomorrow.io, Weatherbit)
 
 **Supported Markets:**
 - **High Temperature Markets**: KXHIGHNY, KXHIGHCH, KXHIGHMI, KXHIGHAU
@@ -169,10 +175,12 @@ ENABLED_STRATEGIES=btc_hourly
 - OpenWeather - Removed (per optimization)
 
 **Optimizations:**
-- Scan interval: 5 minutes (per AUSHIGH contract rules)
+- Scan interval: 5 minutes (per AUSHIGH contract rules - daily markets)
 - Forecast cache: 30 minutes (reduces API calls by 95%)
-- API calls: ~192/day total (well within free tier limits)
-- Parallel fetching: All 3 APIs called simultaneously
+- API calls: ~192/day per API (38.4% of 500/day free tier limit)
+- Parallel fetching: All 3 APIs called simultaneously for speed
+- Official NWS coordinates: Matches exact measurement locations for accuracy
+- Quality thresholds: Min edge 5%, min EV $0.01, min volume 15 contracts
 
 See [WEATHER_STRATEGY.md](WEATHER_STRATEGY.md) and [BTC_STRATEGY.md](BTC_STRATEGY.md) for detailed strategy documentation.
 

@@ -561,8 +561,9 @@ class WeatherDailyStrategy(TradingStrategy):
     def __init__(self, client: KalshiClient):
         super().__init__(client)
         self.max_position_size = Config.MAX_POSITION_SIZE
-        self.min_edge_threshold = 5.0  # Minimum edge % to trade (5% default)
-        self.min_ev_threshold = 0.001  # Minimum EV in dollars to trade
+        # Optimized parameters for production (balanced approach)
+        self.min_edge_threshold = 5.0  # Minimum edge % to trade (5% ensures quality)
+        self.min_ev_threshold = 0.01  # Minimum EV in dollars ($0.01 for better ROI, up from $0.001)
         
         # Weather data aggregator (shared instance)
         self.weather_agg = WeatherDataAggregator()
@@ -580,8 +581,9 @@ class WeatherDailyStrategy(TradingStrategy):
         if market.get('status') != 'open':
             return False
         
-        # Check if market has sufficient volume
-        if market.get('volume', 0) < 5:
+        # Check if market has sufficient volume (liquidity requirement)
+        # Increased from 5 to 15 for better liquidity and fill rates
+        if market.get('volume', 0) < 15:
             return False
         
         return True
