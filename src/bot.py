@@ -90,7 +90,18 @@ class KalshiTradingBot:
             
             for market in markets_to_process:
                 # Quick filter check before expensive orderbook call
-                if not any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies):
+                should_trade = any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies)
+                if not should_trade:
+                    # Debug: log why market was skipped
+                    series = market.get('series_ticker', 'unknown')
+                    status = market.get('status', 'unknown')
+                    volume = market.get('volume', 0)
+                    if series not in Config.WEATHER_SERIES:
+                        continue  # Not a weather market, skip silently
+                    if status != 'open':
+                        continue  # Not open, skip silently
+                    if volume < 15:
+                        print(f"[Bot] ⚠️  Market {market.get('ticker', 'unknown')} skipped: volume {volume} < 15")
                     continue
                 
                 # Evaluate market with all strategies
