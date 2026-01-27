@@ -575,11 +575,23 @@ class WeatherDailyStrategy(TradingStrategy):
     
     def should_trade(self, market: Dict) -> bool:
         """Check if this is a weather market we should trade"""
-        series_ticker = market.get('series_ticker', '')
-        if series_ticker not in Config.WEATHER_SERIES:
+        # Try multiple ways to get series ticker (Kalshi API may vary)
+        series_ticker = market.get('series_ticker') or market.get('series_ticker_symbol') or ''
+        
+        # Also check if ticker starts with weather series prefix
+        ticker = market.get('ticker', '')
+        is_weather = False
+        if series_ticker in Config.WEATHER_SERIES:
+            is_weather = True
+        elif any(ticker.startswith(prefix) for prefix in ['KXHIGH', 'KXLOW']):
+            is_weather = True
+        
+        if not is_weather:
             return False
         
-        if market.get('status') != 'open':
+        # Status can be 'open' or 'active' (both mean tradeable)
+        status = market.get('status', '').lower()
+        if status not in ['open', 'active']:
             return False
         
         # Check if market has sufficient volume (liquidity requirement)
