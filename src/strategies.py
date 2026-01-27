@@ -749,7 +749,8 @@ class WeatherDailyStrategy(TradingStrategy):
                     yes_edge >= self.longshot_min_edge):
                     
                     position_size = min(self.max_position_size * self.longshot_position_multiplier, 
-                                      self.max_position_size * 5)  # Cap at 5x
+                                      self.max_position_size * 5,  # Cap at 5x
+                                      Config.MAX_CONTRACTS_PER_MARKET)  # Cap at 25 contracts per market
                     
                     print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f}")
                     print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
@@ -770,7 +771,8 @@ class WeatherDailyStrategy(TradingStrategy):
                     no_edge >= self.longshot_min_edge):
                     
                     position_size = min(self.max_position_size * self.longshot_position_multiplier, 
-                                      self.max_position_size * 5)
+                                      self.max_position_size * 5,  # Cap at 5x
+                                      Config.MAX_CONTRACTS_PER_MARKET)  # Cap at 25 contracts per market
                     
                     print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f}")
                     print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
@@ -790,7 +792,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 return {
                     'action': 'buy',
                     'side': 'yes',
-                    'count': min(1, self.max_position_size),
+                    'count': min(1, self.max_position_size, Config.MAX_CONTRACTS_PER_MARKET),
                     'price': best_yes_ask,  # Pay the ask price to get filled
                     'edge': yes_edge,
                     'ev': yes_ev,
@@ -801,7 +803,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 return {
                     'action': 'buy',
                     'side': 'no',
-                    'count': min(1, self.max_position_size),
+                    'count': min(1, self.max_position_size, Config.MAX_CONTRACTS_PER_MARKET),
                     'price': best_no_ask,  # Pay the ask price to get filled
                     'edge': no_edge,
                     'ev': no_ev,

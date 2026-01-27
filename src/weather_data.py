@@ -36,8 +36,11 @@ class WeatherDataAggregator:
         'KXHIGHMI': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
         'KXLOWMI': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
         # Austin - Austin Bergstrom International Airport (AUSHIGH contract: "Austin Bergstrom")
-        'KXHIGHAU': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
-        'KXLOWAU': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
+        'KXHIGHAUS': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
+        'KXLOWAUS': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
+        # Los Angeles - Los Angeles International Airport (LAXHIGH contract - likely LAX)
+        'KXHIGHLAX': {'lat': 33.9425, 'lon': -118.4081, 'name': 'Los Angeles International Airport'},
+        'KXLOWLAX': {'lat': 33.9425, 'lon': -118.4081, 'name': 'Los Angeles International Airport'},
     }
     
     def __init__(self):

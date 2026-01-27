@@ -64,10 +64,31 @@ class KalshiTradingBot:
         try:
             # Filter markets by relevant series FIRST to reduce API calls
             # Increase limit to catch all markets, especially new ones
+            # Check both 'open' and 'active' status to catch all tradeable markets
             relevant_markets = []
             for series_ticker in self.relevant_series:
-                series_markets = self.client.get_markets(series_ticker=series_ticker, status='open', limit=200)
-                relevant_markets.extend(series_markets)
+                # Get open markets (primary status)
+                try:
+                    open_markets = self.client.get_markets(series_ticker=series_ticker, status='open', limit=200)
+                except Exception as e:
+                    print(f"[Bot] ⚠️  Error fetching open markets for {series_ticker}: {e}")
+                    open_markets = []
+                
+                # Try to get active markets (some series may not support this status)
+                active_markets = []
+                try:
+                    active_markets = self.client.get_markets(series_ticker=series_ticker, status='active', limit=200)
+                except Exception:
+                    # Active status not supported for this series, skip silently
+                    pass
+                
+                # Combine and deduplicate by ticker
+                seen_tickers = set()
+                for market in open_markets + active_markets:
+                    ticker = market.get('ticker')
+                    if ticker and ticker not in seen_tickers:
+                        seen_tickers.add(ticker)
+                        relevant_markets.append(market)
             
             # Detect new markets (prioritize them for early entry)
             new_markets = []
@@ -218,7 +239,7 @@ class KalshiTradingBot:
             elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
                 print("[Bot] Scan interval: 10 seconds (optimized for hourly BTC markets)")
             elif 'weather_daily' in Config.ENABLED_STRATEGIES:
-                print("[Bot] Scan interval: 30 minutes (optimized for daily weather markets - matches forecast cache)")
+                print("[Bot] Scan interval: 30 seconds (Kalshi odds check) | Weather forecast cache: 30 minutes")
             else:
                 print("[Bot] Scan interval: 15 seconds")
             # Heartbeat interval (log every 30 minutes for weather, every hour for BTC)
@@ -241,13 +262,13 @@ class KalshiTradingBot:
                     # Adaptive scan intervals based on market type
                     # BTC 15-min: 0.5s (ultra-fast for new market detection)
                     # BTC hourly: 10s (moderate speed)
-                    # Weather daily: 30 min (matches forecast cache, appropriate for daily settlements)
+                    # Weather daily: 30s (frequent Kalshi odds check, weather forecasts cached for 30 min)
                     if 'btc_15m' in Config.ENABLED_STRATEGIES:
                         sleep_time = max(0, 0.5 - scan_duration)  # 0.5 second interval
                     elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
                         sleep_time = max(0, 10 - scan_duration)  # 10 second interval
                     elif 'weather_daily' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 1800 - scan_duration)  # 30 minutes (1800 seconds) for daily weather markets
+                        sleep_time = max(0, 30 - scan_duration)  # 30 seconds - frequent Kalshi odds check (forecasts cached 30 min)
                     else:
                         sleep_time = max(0, 15 - scan_duration)  # 15 second default
                     

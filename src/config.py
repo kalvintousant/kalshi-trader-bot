@@ -12,18 +12,20 @@ class Config:
     
     # Trading Settings
     MAX_POSITION_SIZE = int(os.getenv('MAX_POSITION_SIZE', '10'))
-    MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '100'))
+    MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '10'))  # $10 max daily loss limit
+    MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '25'))  # Cap at 25 contracts per market ($0.25 max at 1¢)
     ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'btc_15m,weather_daily').split(',')
     
     # Market Tickers
     BTC_15M_SERIES = 'KXBTC15M'  # 15-minute BTC markets (up/down)
     BTC_HOURLY_SERIES = 'KXBTC'  # Hourly BTC markets (price ranges)
-    # High and Low temperature markets for NYC, Chicago, Miami, Austin
+    # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles
     WEATHER_SERIES = [
         'KXHIGHNY', 'KXLOWNY',   # New York City
         'KXHIGHCH', 'KXLOWCH',   # Chicago
         'KXHIGHMI', 'KXLOWMI',   # Miami
-        'KXHIGHAU', 'KXLOWAU'    # Austin
+        'KXHIGHAUS', 'KXLOWAUS',   # Austin
+        'KXHIGHLAX', 'KXLOWLAX'  # Los Angeles
     ]
     
     @classmethod

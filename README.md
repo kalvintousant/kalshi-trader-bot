@@ -44,8 +44,13 @@ kalshi-trader-bot/
 - **Dual Strategy**: Longshot mode (asymmetric payouts) + Conservative mode (steady gains)
 - **Multi-Source Forecasts**: Aggregates from NWS, Tomorrow.io, and Weatherbit
 - **Automatic Scheduling**: Runs 6am-10pm via cron (optimal for weather markets)
-- **Contract Compliance**: Optimized for all weather contract rules
-- **Risk Management**: Daily loss limits and position sizing controls
+- **Contract Compliance**: All locations verified against NWS official weather station coordinates
+- **Risk Management**: 
+  - $10 daily loss limit (trading pauses if reached)
+  - 25 contracts max per market ($0.25 max exposure per market)
+  - Position sizing controls
+- **Market Coverage**: NYC, Chicago, Miami, Austin, Los Angeles (high & low temp markets)
+- **Real-Time Monitoring**: 30-second Kalshi odds checks (weather forecasts cached 30 min)
 
 ## Documentation
 
