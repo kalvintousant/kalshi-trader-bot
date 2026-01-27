@@ -326,6 +326,234 @@ class BTCHourlyStrategy(TradingStrategy):
             return None
 
 
+class BTC15MinStrategy(TradingStrategy):
+    """
+    Latency Arbitrage Strategy for 15-minute BTC markets (KXBTC15M)
+    Tracks real-time BTC moves from Binance and trades during lag window when Kalshi pricing hasn't caught up.
+    
+    This strategy is optimized for the "Bitcoin price up or down in next 15 mins" markets.
+    Uses 15-minute price change calculations for faster reaction to BTC movements.
+    """
+    
+    def __init__(self, client: KalshiClient, btc_tracker: Optional[BTCPriceTracker] = None):
+        super().__init__(client)
+        self.max_position_size = Config.MAX_POSITION_SIZE
+        
+        # Use provided BTC tracker or create new one (shared instance from bot)
+        self.btc_tracker = btc_tracker or BTCPriceTracker()
+        
+        # Strategy parameters (tuned for 15-minute markets - more sensitive)
+        self.momentum_threshold = 0.2  # Lower threshold for 15-min moves (0.2%)
+        self.volatility_threshold = 0.15  # Lower volatility threshold (0.15%)
+        self.mispricing_threshold = 2  # Lower mispricing threshold (2 cents) for faster reaction
+        
+        # Track active positions for exit logic
+        self.active_positions = {}  # {market_ticker: {'side': 'yes'/'no', 'entry_price': int, 'entry_time': datetime}}
+        
+        # Update BTC data on init if we created the tracker
+        if btc_tracker is None:
+            self.btc_tracker.update()
+    
+    def should_trade(self, market: Dict) -> bool:
+        """
+        Check if this is a 15-minute BTC market we should trade
+        
+        Contract Rules Compliance:
+        - Only trades markets with status='open' (respects Last Trading Date/Time)
+        - Kalshi API filters out expired markets automatically
+        - Minimum volume check ensures liquidity
+        """
+        series_ticker = market.get('series_ticker', '')
+        if series_ticker != Config.BTC_15M_SERIES:
+            return False
+        
+        # Contract Rule: Respect Last Trading Date/Time - only trade open markets
+        if market.get('status') != 'open':
+            return False
+        
+        # Check if market has sufficient volume (liquidity requirement)
+        if market.get('volume', 0) < 5:
+            return False
+        
+        return True
+    
+    def get_trade_decision(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
+        """
+        Latency arbitrage strategy for 15-minute markets:
+        1. Read real-time BTC moves from Binance (5-minute candles)
+        2. Check Kalshi's delayed pricing
+        3. Enter during lag window if there's desynchronization
+        4. Exit once pricing catches up
+        """
+        try:
+            market_ticker = market.get('ticker', '')
+            
+            # Note: BTC data should be updated at bot level, not here for performance
+            # This check is just a safety fallback
+            if not self.btc_tracker.is_fresh(max_age_seconds=15):  # More frequent updates for 15-min
+                self.btc_tracker.update()
+            
+            # Check if we have an active position to exit
+            if market_ticker in self.active_positions:
+                return self._check_exit(market, orderbook, market_ticker)
+            
+            # Detect significant BTC move
+            has_move, direction = self.btc_tracker.detect_significant_move(
+                momentum_threshold=self.momentum_threshold,
+                volatility_threshold=self.volatility_threshold
+            )
+            
+            if not has_move:
+                return None
+            
+            # Get current BTC price change over 15 minutes (for 15-min markets)
+            # Contract uses BRTI average for minute prior to expiration - we track 15-min moves
+            btc_change_15m = self.btc_tracker.get_price_change_period(minutes=15)
+            
+            if btc_change_15m is None:
+                return None
+            
+            # Get Kalshi market pricing
+            yes_price = market.get('yes_price', 50)
+            no_price = market.get('no_price', 50)
+            
+            yes_bids = orderbook.get('orderbook', {}).get('yes', [])
+            no_bids = orderbook.get('orderbook', {}).get('no', [])
+            
+            if not yes_bids or not no_bids:
+                return None
+            
+            best_yes_bid = yes_bids[0][0] if yes_bids else yes_price
+            best_no_bid = no_bids[0][0] if no_bids else no_price
+            
+            # Calculate expected Kalshi price based on BTC move
+            # If BTC is up, YES should be higher priced
+            # If BTC is down, NO should be higher priced
+            
+            # Convert BTC change to expected probability
+            # Positive change = higher probability of YES
+            # Negative change = higher probability of NO
+            # For 15-min markets, moves are smaller so we scale differently
+            expected_yes_prob = 50 + (btc_change_15m * 15)  # Scale: 1% BTC move = 15% prob change (more sensitive)
+            expected_yes_prob = max(1, min(99, expected_yes_prob))  # Clamp to 1-99
+            
+            # Compare expected price to actual Kalshi price
+            price_mispricing = abs(expected_yes_prob - best_yes_bid)
+            
+            # Trade logic: If BTC pumped and YES is underpriced, buy YES
+            # If BTC dumped and NO is underpriced, buy NO
+            if direction == "up" and btc_change_15m > 0:
+                # BTC pumped, check if YES is mispriced
+                if expected_yes_prob > best_yes_bid + self.mispricing_threshold:
+                    print(f"[BTC15MinStrategy] BTC PUMP detected: {btc_change_15m:.2f}% move (15m), YES expected {expected_yes_prob:.1f}¢, market {best_yes_bid}¢, mispricing {price_mispricing:.1f}¢")
+                    # Record position for exit logic
+                    self.active_positions[market_ticker] = {
+                        'side': 'yes',
+                        'entry_price': best_yes_bid + 1,
+                        'entry_time': datetime.now(),
+                        'expected_prob': expected_yes_prob
+                    }
+                    return {
+                        'action': 'buy',
+                        'side': 'yes',
+                        'count': min(1, self.max_position_size),
+                        'price': best_yes_bid + 1,
+                        'btc_move': btc_change_15m,
+                        'mispricing': price_mispricing
+                    }
+            
+            elif direction == "down" and btc_change_15m < 0:
+                # BTC dumped, check if NO is mispriced
+                expected_no_prob = 100 - expected_yes_prob
+                if expected_no_prob > best_no_bid + self.mispricing_threshold:
+                    print(f"[BTC15MinStrategy] BTC DUMP detected: {btc_change_15m:.2f}% move (15m), NO expected {expected_no_prob:.1f}¢, market {best_no_bid}¢, mispricing {price_mispricing:.1f}¢")
+                    # Record position for exit logic
+                    self.active_positions[market_ticker] = {
+                        'side': 'no',
+                        'entry_price': best_no_bid + 1,
+                        'entry_time': datetime.now(),
+                        'expected_prob': expected_no_prob
+                    }
+                    return {
+                        'action': 'buy',
+                        'side': 'no',
+                        'count': min(1, self.max_position_size),
+                        'price': best_no_bid + 1,
+                        'btc_move': btc_change_15m,
+                        'mispricing': price_mispricing
+                    }
+            
+            return None
+            
+        except Exception as e:
+            print(f"[BTC15MinStrategy] Error in get_trade_decision: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _check_exit(self, market: Dict, orderbook: Dict, market_ticker: str) -> Optional[Dict]:
+        """
+        Check if we should exit an active position
+        Exit when pricing catches up (mispricing closes)
+        For 15-min markets, exits are faster (15 seconds minimum hold)
+        """
+        try:
+            position = self.active_positions[market_ticker]
+            side = position['side']
+            entry_price = position['entry_price']
+            entry_time = position['entry_time']
+            
+            # Check if enough time has passed (at least 15 seconds for 15-min markets)
+            if (datetime.now() - entry_time).total_seconds() < 15:
+                return None  # Too soon to exit
+            
+            # Get current market prices
+            yes_price = market.get('yes_price', 50)
+            no_price = market.get('no_price', 50)
+            
+            yes_bids = orderbook.get('orderbook', {}).get('yes', [])
+            no_bids = orderbook.get('orderbook', {}).get('no', [])
+            
+            if not yes_bids or not no_bids:
+                return None
+            
+            current_yes = yes_bids[0][0] if yes_bids else yes_price
+            current_no = no_bids[0][0] if no_bids else no_price
+            
+            # Check if pricing has caught up (mispricing closed)
+            if side == 'yes':
+                current_price = current_yes
+                # Exit if price moved towards expected (caught up) or we're profitable
+                if current_price >= position['expected_prob'] - 2 or current_price > entry_price + 2:
+                    print(f"[BTC15MinStrategy] Exiting YES position: entry {entry_price}¢, current {current_price}¢, expected {position['expected_prob']:.1f}¢")
+                    del self.active_positions[market_ticker]
+                    return {
+                        'action': 'sell',
+                        'side': 'yes',
+                        'count': 1,
+                        'price': current_yes - 1  # Slightly below best bid to exit quickly
+                    }
+            
+            elif side == 'no':
+                current_price = current_no
+                # Exit if price moved towards expected (caught up) or we're profitable
+                if current_price >= position['expected_prob'] - 2 or current_price > entry_price + 2:
+                    print(f"[BTC15MinStrategy] Exiting NO position: entry {entry_price}¢, current {current_price}¢, expected {position['expected_prob']:.1f}¢")
+                    del self.active_positions[market_ticker]
+                    return {
+                        'action': 'sell',
+                        'side': 'no',
+                        'count': 1,
+                        'price': current_no - 1
+                    }
+            
+            return None
+            
+        except Exception as e:
+            print(f"[BTC15MinStrategy] Error in _check_exit: {e}")
+            return None
+
+
 class WeatherDailyStrategy(TradingStrategy):
     """
     Advanced weather trading strategy using multi-source forecasts, probability distributions, and Edge/EV calculations
@@ -500,7 +728,9 @@ class StrategyManager:
         self.strategies = []
         
         # Share BTC tracker across strategies for efficiency
-        if 'btc_hourly' in Config.ENABLED_STRATEGIES or 'btc_15m' in Config.ENABLED_STRATEGIES:  # Support both for backward compat
+        if 'btc_15m' in Config.ENABLED_STRATEGIES:
+            self.strategies.append(BTC15MinStrategy(client, btc_tracker=btc_tracker))
+        if 'btc_hourly' in Config.ENABLED_STRATEGIES:
             self.strategies.append(BTCHourlyStrategy(client, btc_tracker=btc_tracker))
         
         if 'weather_daily' in Config.ENABLED_STRATEGIES:

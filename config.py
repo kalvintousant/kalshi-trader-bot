@@ -16,7 +16,8 @@ class Config:
     ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'btc_15m,weather_daily').split(',')
     
     # Market Tickers
-    BTC_HOURLY_SERIES = 'KXBTC'  # Hourly BTC markets (not 15-minute)
+    BTC_15M_SERIES = 'KXBTC15M'  # 15-minute BTC markets (up/down)
+    BTC_HOURLY_SERIES = 'KXBTC'  # Hourly BTC markets (price ranges)
     WEATHER_SERIES = ['KXHIGHNY', 'KXHIGHCH', 'KXHIGHMI', 'KXHIGHAU']  # NYC, Chicago, Miami, Austin
     
     @classmethod

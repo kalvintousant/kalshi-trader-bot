@@ -18,7 +18,7 @@ class KalshiTradingBot:
         
         # Create shared BTC tracker (update once per scan, not per market)
         self.btc_tracker = None
-        if 'btc_hourly' in Config.ENABLED_STRATEGIES or 'btc_15m' in Config.ENABLED_STRATEGIES:  # Support both for backward compat
+        if 'btc_15m' in Config.ENABLED_STRATEGIES or 'btc_hourly' in Config.ENABLED_STRATEGIES:
             self.btc_tracker = BTCPriceTracker()
             self.btc_tracker.update()
         
@@ -30,7 +30,9 @@ class KalshiTradingBot:
         
         # Track relevant series for filtering
         self.relevant_series: Set[str] = set()
-        if 'btc_hourly' in Config.ENABLED_STRATEGIES or 'btc_15m' in Config.ENABLED_STRATEGIES:  # Support both for backward compat
+        if 'btc_15m' in Config.ENABLED_STRATEGIES:
+            self.relevant_series.add(Config.BTC_15M_SERIES)
+        if 'btc_hourly' in Config.ENABLED_STRATEGIES:
             self.relevant_series.add(Config.BTC_HOURLY_SERIES)
         if 'weather_daily' in Config.ENABLED_STRATEGIES:
             self.relevant_series.update(Config.WEATHER_SERIES)
@@ -60,7 +62,9 @@ class KalshiTradingBot:
         print(f"[Bot] Scanning markets at {datetime.now()}")
         
         # Update BTC data once per scan (not per market) for performance
-        if self.btc_tracker and not self.btc_tracker.is_fresh(max_age_seconds=30):
+        # More frequent updates for 15-min strategy (15s), less frequent for hourly (30s)
+        max_age = 15 if 'btc_15m' in Config.ENABLED_STRATEGIES else 30
+        if self.btc_tracker and not self.btc_tracker.is_fresh(max_age_seconds=max_age):
             self.btc_tracker.update()
         
         try:
@@ -171,7 +175,9 @@ class KalshiTradingBot:
         else:
             # Run polling mode
             print("[Bot] Running in polling mode...")
-            if 'btc_hourly' in Config.ENABLED_STRATEGIES or 'btc_15m' in Config.ENABLED_STRATEGIES:
+            if 'btc_15m' in Config.ENABLED_STRATEGIES:
+                print("[Bot] Scan interval: 5 seconds (optimized for 15-minute BTC latency arbitrage)")
+            elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
                 print("[Bot] Scan interval: 10 seconds (optimized for hourly BTC markets)")
             else:
                 print("[Bot] Scan interval: 15 seconds")
@@ -181,9 +187,11 @@ class KalshiTradingBot:
                     self.scan_and_trade()
                     scan_duration = time.time() - scan_start
                     
-                    # Adaptive sleep: 10 seconds for BTC hourly (less frequent than 15-min), 15 for weather
-                    if 'btc_hourly' in Config.ENABLED_STRATEGIES or 'btc_15m' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 10 - scan_duration)  # 10 second interval for BTC hourly
+                    # Adaptive sleep: 5 seconds for BTC 15-min (fastest), 10 for BTC hourly, 15 for weather
+                    if 'btc_15m' in Config.ENABLED_STRATEGIES:
+                        sleep_time = max(0, 5 - scan_duration)  # 5 second interval for 15-min BTC (latency arb needs speed)
+                    elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
+                        sleep_time = max(0, 10 - scan_duration)  # 10 second interval for hourly BTC
                     else:
                         sleep_time = max(0, 15 - scan_duration)  # 15 second for weather
                     
