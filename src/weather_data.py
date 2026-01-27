@@ -158,12 +158,14 @@ class WeatherDataAggregator:
         
         # Fetch forecasts in parallel for better performance
         # Using NWS, Tomorrow.io, and Weatherbit (OpenWeather removed)
+        # Weatherbit is used as fallback only to stay within free tier (50 requests/day)
         forecasts = []
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        
+        # First, try NWS and Tomorrow.io (both have higher free tier limits)
+        with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
                 executor.submit(self.get_forecast_nws, lat, lon, target_date): 'nws',
-                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date): 'tomorrowio',
-                executor.submit(self.get_forecast_weatherbit, lat, lon, target_date, series_ticker): 'weatherbit'
+                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date): 'tomorrowio'
             }
             
             for future in as_completed(futures):
@@ -174,6 +176,18 @@ class WeatherDataAggregator:
                 except Exception as e:
                     source = futures[future]
                     print(f"[Weather] Error fetching from {source}: {e}")
+        
+        # Only use Weatherbit if we have ZERO forecasts (emergency fallback only)
+        # This keeps Weatherbit usage minimal to stay within 50 requests/day free tier
+        # Weatherbit free tier: 50 requests/day - must be very conservative
+        if len(forecasts) == 0 and self.weatherbit_api_key:
+            try:
+                weatherbit_temp = self.get_forecast_weatherbit(lat, lon, target_date, series_ticker)
+                if weatherbit_temp is not None:
+                    forecasts.append(weatherbit_temp)
+                    print(f"[Weather] Using Weatherbit fallback for {series_ticker} (NWS/Tomorrow.io unavailable)")
+            except Exception as e:
+                print(f"[Weather] Error fetching from weatherbit (fallback): {e}")
         
         # Cache the results
         if forecasts:

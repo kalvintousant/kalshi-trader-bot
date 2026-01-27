@@ -12,8 +12,10 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your API keys
 
-# Start bot (daytime schedule: 6am-10pm)
-./scripts/start_daytime.sh
+# Start bot (24/7 operation - required for low temp markets that occur early morning)
+./scripts/start_bot.sh
+
+# Bot will auto-start on system reboot via cron (@reboot)
 ```
 
 ## Project Structure
@@ -43,14 +45,17 @@ kalshi-trader-bot/
 
 - **Dual Strategy**: Longshot mode (asymmetric payouts) + Conservative mode (steady gains)
 - **Multi-Source Forecasts**: Aggregates from NWS, Tomorrow.io, and Weatherbit
-- **Automatic Scheduling**: Runs 6am-10pm via cron (optimal for weather markets)
+- **24/7 Operation**: Runs continuously to monitor both high and low temperature markets (low temps occur early morning)
 - **Contract Compliance**: All locations verified against NWS official weather station coordinates
 - **Risk Management**: 
   - $10 daily loss limit (trading pauses if reached)
-  - 25 contracts max per market ($0.25 max exposure per market)
+  - $3 OR 25 contracts max per market (whichever is hit first)
+  - Automatic order cancellation when edge/EV no longer valid
   - Position sizing controls
 - **Market Coverage**: NYC, Chicago, Miami, Austin, Los Angeles (high & low temp markets)
 - **Real-Time Monitoring**: 30-second Kalshi odds checks (weather forecasts cached 30 min)
+- **Smart Notifications**: Only notify when orders actually fill (not when placed)
+- **API Optimization**: All weather APIs within free tier limits (NWS unlimited, Tomorrow.io 500/day, Weatherbit 50/day as emergency fallback)
 
 ## Documentation
 

@@ -26,6 +26,9 @@ class KalshiTradingBot:
         # Track seen markets to detect new ones quickly
         self.seen_markets: Set[str] = set()
         
+        # Track orders we've already notified about (to avoid duplicate notifications)
+        self.notified_orders: Set[str] = set()
+        
         # Track relevant series for filtering
         self.relevant_series: Set[str] = set()
         if 'btc_15m' in Config.ENABLED_STRATEGIES:
@@ -50,6 +53,160 @@ class KalshiTradingBot:
             print(f"[Bot] Daily loss limit reached: ${self.daily_pnl}")
             return True
         return False
+    
+    def check_filled_orders(self):
+        """Check for filled orders and send notifications"""
+        try:
+            filled_orders = self.client.get_orders(status='filled')
+            
+            for order in filled_orders:
+                order_id = order.get('order_id')
+                
+                # Skip if we've already notified about this order
+                if order_id in self.notified_orders:
+                    continue
+                
+                # Only notify about recently filled orders (within last 5 minutes)
+                # This prevents notifying about old filled orders on startup
+                last_update = order.get('last_update_time')
+                if last_update:
+                    try:
+                        from datetime import datetime, timezone
+                        update_time = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+                        now = datetime.now(timezone.utc)
+                        if (now - update_time).total_seconds() > 300:  # 5 minutes
+                            continue
+                    except:
+                        pass  # If we can't parse time, check anyway
+                
+                # Mark as notified
+                self.notified_orders.add(order_id)
+                
+                # Get order details
+                action = order.get('action', 'buy').upper()
+                side = order.get('side', 'yes').upper()
+                fill_count = order.get('fill_count', 0)
+                ticker = order.get('ticker', 'unknown')
+                
+                # Get fill price (average of fills)
+                yes_price = order.get('yes_price', 0)
+                no_price = order.get('no_price', 0)
+                fill_price = yes_price if yes_price > 0 else no_price
+                
+                if fill_count > 0:
+                    # Send notification
+                    self._send_notification(
+                        f"✅ Trade Filled: {action} {side}",
+                        f"{fill_count} contract(s) @ {fill_price}¢\nMarket: {ticker}"
+                    )
+                    print(f"[Bot] 📬 Notification sent: {action} {fill_count} {side} @ {fill_price}¢ filled for {ticker}")
+        
+        except Exception as e:
+            print(f"[Bot] Error checking filled orders: {e}")
+    
+    def check_and_cancel_stale_orders(self):
+        """Check resting orders and cancel if edge/EV no longer meets strategy thresholds"""
+        try:
+            resting_orders = self.client.get_orders(status='resting')
+            
+            if not resting_orders:
+                return
+            
+            for order in resting_orders:
+                order_id = order.get('order_id')
+                ticker = order.get('ticker')
+                side = order.get('side')
+                order_price = order.get('yes_price') or order.get('no_price', 0)
+                
+                if not ticker:
+                    continue
+                
+                # Get current market data
+                try:
+                    # Get market info
+                    markets = self.client.get_markets(limit=200)
+                    market = next((m for m in markets if m.get('ticker') == ticker), None)
+                    
+                    if not market:
+                        # Market might have closed, cancel order
+                        print(f"[Bot] 🗑️  Canceling order {order_id}: Market {ticker} not found (likely closed)")
+                        self.client.cancel_order(order_id)
+                        continue
+                    
+                    # Get current orderbook
+                    orderbook = self.client.get_market_orderbook(ticker)
+                    
+                    # Re-evaluate market with strategy (pass orderbook to avoid re-fetching)
+                    decisions = self.strategy_manager.evaluate_market(market, orderbook)
+                    
+                    # Check if any decision matches our order
+                    order_still_valid = False
+                    
+                    # Get strategy thresholds
+                    weather_strategy = next((s for s in self.strategy_manager.strategies 
+                                            if s.name == 'WeatherDailyStrategy'), None)
+                    
+                    if not weather_strategy:
+                        # No weather strategy, skip cancellation check
+                        continue
+                    
+                    # Get current ask prices
+                    yes_orders = orderbook.get('orderbook', {}).get('yes', [])
+                    no_orders = orderbook.get('orderbook', {}).get('no', [])
+                    current_yes_ask = yes_orders[-1][0] if yes_orders else market.get('yes_price', 50)
+                    current_no_ask = no_orders[-1][0] if no_orders else market.get('no_price', 50)
+                    current_ask = current_yes_ask if side == 'yes' else current_no_ask
+                    
+                    for decision in decisions:
+                        decision_side = decision.get('side')
+                        edge = decision.get('edge', 0)
+                        ev = decision.get('ev', 0)
+                        strategy_mode = decision.get('strategy_mode', 'conservative')
+                        
+                        # Check if this decision matches our order side
+                        if decision_side == side:
+                            # Check if still meets strategy thresholds
+                            if strategy_mode == 'longshot':
+                                # Longshot thresholds
+                                if (current_ask <= weather_strategy.longshot_max_price and 
+                                    edge >= weather_strategy.longshot_min_edge and 
+                                    ev > 0):
+                                    order_still_valid = True
+                                    break
+                            else:
+                                # Conservative thresholds
+                                if edge >= weather_strategy.min_edge_threshold and ev >= weather_strategy.min_ev_threshold:
+                                    order_still_valid = True
+                                    break
+                    
+                    # If no matching decision found, or decision doesn't meet thresholds, cancel
+                    if not order_still_valid:
+                        print(f"[Bot] 🗑️  Canceling order {order_id}: Edge/EV no longer meets strategy thresholds")
+                        print(f"     Market: {ticker}, Side: {side.upper()}, Order Price: {order_price}¢, Current Ask: {current_ask}¢")
+                        try:
+                            self.client.cancel_order(order_id)
+                            print(f"[Bot] ✅ Order {order_id} canceled successfully")
+                        except Exception as e:
+                            print(f"[Bot] ⚠️  Error canceling order {order_id}: {e}")
+                
+                except Exception as e:
+                    print(f"[Bot] ⚠️  Error evaluating order {order_id} for cancellation: {e}")
+                    continue
+        
+        except Exception as e:
+            print(f"[Bot] Error checking stale orders: {e}")
+    
+    def _send_notification(self, title: str, message: str):
+        """Send macOS notification"""
+        try:
+            import subprocess
+            script = f'''
+            display notification "{message}" with title "{title}"
+            '''
+            subprocess.run(['osascript', '-e', script], capture_output=True)
+        except Exception as e:
+            # Silently fail if notifications don't work
+            pass
     
     def scan_and_trade(self):
         """Scan markets and execute trades"""
@@ -251,6 +408,12 @@ class KalshiTradingBot:
                     scan_start = time.time()
                     self.scan_and_trade()
                     scan_duration = time.time() - scan_start
+                    
+                    # Check for filled orders and send notifications
+                    self.check_filled_orders()
+                    
+                    # Check and cancel stale orders (edge/EV no longer valid)
+                    self.check_and_cancel_stale_orders()
                     
                     # Heartbeat logging to confirm bot is alive
                     if time.time() - last_heartbeat >= heartbeat_interval:

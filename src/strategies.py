@@ -62,9 +62,8 @@ class TradingStrategy:
             # Log to file
             self._log_trade(trade_msg, order, decision, market_ticker)
             
-            # macOS notification
-            self._send_notification(f"Trade Placed: {action.upper()} {side.upper()}", 
-                                  f"{count} contract(s) @ {price}¢\nMarket: {market_ticker}")
+            # Don't send notification on order placement - only when order fills
+            # Notification will be sent when order status changes to 'filled'
             
             return order
         except Exception as e:
@@ -748,9 +747,14 @@ class WeatherDailyStrategy(TradingStrategy):
                     our_prob >= (self.longshot_min_prob / 100.0) and 
                     yes_edge >= self.longshot_min_edge):
                     
-                    position_size = min(self.max_position_size * self.longshot_position_multiplier, 
-                                      self.max_position_size * 5,  # Cap at 5x
-                                      Config.MAX_CONTRACTS_PER_MARKET)  # Cap at 25 contracts per market
+                    # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
+                    base_position = min(self.max_position_size * self.longshot_position_multiplier, 
+                                       self.max_position_size * 5)  # Cap at 5x
+                    # Cap by contract count (25 contracts)
+                    contract_cap = Config.MAX_CONTRACTS_PER_MARKET
+                    # Cap by dollar amount ($3.00 = 300 cents)
+                    dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_yes_ask) if best_yes_ask > 0 else contract_cap
+                    position_size = min(base_position, contract_cap, dollar_cap_contracts)
                     
                     print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f}")
                     print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
@@ -770,9 +774,14 @@ class WeatherDailyStrategy(TradingStrategy):
                     no_prob >= (self.longshot_min_prob / 100.0) and 
                     no_edge >= self.longshot_min_edge):
                     
-                    position_size = min(self.max_position_size * self.longshot_position_multiplier, 
-                                      self.max_position_size * 5,  # Cap at 5x
-                                      Config.MAX_CONTRACTS_PER_MARKET)  # Cap at 25 contracts per market
+                    # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
+                    base_position = min(self.max_position_size * self.longshot_position_multiplier, 
+                                       self.max_position_size * 5)  # Cap at 5x
+                    # Cap by contract count (25 contracts)
+                    contract_cap = Config.MAX_CONTRACTS_PER_MARKET
+                    # Cap by dollar amount ($3.00 = 300 cents)
+                    dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_no_ask) if best_no_ask > 0 else contract_cap
+                    position_size = min(base_position, contract_cap, dollar_cap_contracts)
                     
                     print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f}")
                     print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
@@ -788,22 +797,34 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold:
+                # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
+                base_position = min(1, self.max_position_size)
+                contract_cap = Config.MAX_CONTRACTS_PER_MARKET
+                dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_yes_ask) if best_yes_ask > 0 else contract_cap
+                position_size = min(base_position, contract_cap, dollar_cap_contracts)
+                
                 print(f"[WeatherStrategy] ✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f}, Our Prob: {our_prob:.2%}, Ask: {best_yes_ask}¢")
                 return {
                     'action': 'buy',
                     'side': 'yes',
-                    'count': min(1, self.max_position_size, Config.MAX_CONTRACTS_PER_MARKET),
+                    'count': position_size,
                     'price': best_yes_ask,  # Pay the ask price to get filled
                     'edge': yes_edge,
                     'ev': yes_ev,
                     'strategy_mode': 'conservative'
                 }
             elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold:
+                # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
+                base_position = min(1, self.max_position_size)
+                contract_cap = Config.MAX_CONTRACTS_PER_MARKET
+                dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_no_ask) if best_no_ask > 0 else contract_cap
+                position_size = min(base_position, contract_cap, dollar_cap_contracts)
+                
                 print(f"[WeatherStrategy] ✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f}, Our Prob: {no_prob:.2%}, Ask: {best_no_ask}¢")
                 return {
                     'action': 'buy',
                     'side': 'no',
-                    'count': min(1, self.max_position_size, Config.MAX_CONTRACTS_PER_MARKET),
+                    'count': position_size,
                     'price': best_no_ask,  # Pay the ask price to get filled
                     'edge': no_edge,
                     'ev': no_ev,
@@ -830,18 +851,17 @@ class StrategyManager:
         if 'weather_daily' in Config.ENABLED_STRATEGIES:
             self.strategies.append(WeatherDailyStrategy(client))
     
-    def evaluate_market(self, market: Dict) -> List[Dict]:
+    def evaluate_market(self, market: Dict, orderbook: Optional[Dict] = None) -> List[Dict]:
         """Evaluate a market with all strategies and return trade decisions"""
         decisions = []
         
         # Only fetch orderbook once per market, share across strategies
-        orderbook = None
-        orderbook_fetched = False
+        orderbook_fetched = orderbook is not None
         
         for strategy in self.strategies:
             if strategy.should_trade(market):
                 try:
-                    # Fetch orderbook only once per market (with caching)
+                    # Fetch orderbook only once per market (with caching) if not provided
                     if not orderbook_fetched:
                         orderbook = self.client.get_market_orderbook(market['ticker'], use_cache=True)
                         orderbook_fetched = True

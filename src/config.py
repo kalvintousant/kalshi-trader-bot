@@ -13,7 +13,8 @@ class Config:
     # Trading Settings
     MAX_POSITION_SIZE = int(os.getenv('MAX_POSITION_SIZE', '10'))
     MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '10'))  # $10 max daily loss limit
-    MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '25'))  # Cap at 25 contracts per market ($0.25 max at 1¢)
+    MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '25'))  # Max contracts per market
+    MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '3.0'))  # Max dollars per market ($3.00)
     ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'btc_15m,weather_daily').split(',')
     
     # Market Tickers
