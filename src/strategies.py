@@ -581,6 +581,79 @@ class WeatherDailyStrategy(TradingStrategy):
         # Cache for probability distributions (keyed by series_ticker + date)
         self.prob_cache = {}
     
+    def _extract_market_date(self, market: Dict) -> Optional[datetime]:
+        """Extract the target date from market ticker or title"""
+        ticker = market.get('ticker', '')
+        title = market.get('title', '')
+        
+        # Method 1: Parse from ticker (e.g., KXHIGHNY-26JAN28-T26 -> 26JAN28)
+        # Format is YYMMMDD: 26JAN28 = Year 2026, Month JAN, Day 28 = Jan 28, 2026
+        if '-' in ticker:
+            parts = ticker.split('-')
+            if len(parts) >= 2:
+                date_str = parts[1]  # e.g., "26JAN28"
+                try:
+                    if len(date_str) >= 7:  # YYMMMDD = 7 chars
+                        year_str = date_str[:2]  # "26"
+                        month_str = date_str[2:5].upper()  # "JAN"
+                        day_str = date_str[5:]  # "28"
+                        
+                        # Map month abbreviations
+                        month_map = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                                   'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+                        
+                        if month_str in month_map:
+                            year = 2000 + int(year_str)  # "26" -> 2026
+                            month = month_map[month_str]
+                            day = int(day_str)
+                            target = datetime(year, month, day)
+                            return target
+                except (ValueError, KeyError, IndexError):
+                    pass
+        
+        # Method 2: Parse from title (e.g., "on Jan 28, 2026")
+        import re
+        date_patterns = [
+            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s+(\d{4})',  # "Jan 28, 2026"
+            r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',  # "01/28/2026" or "01-28-2026"
+        ]
+        
+        month_map = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, title, re.IGNORECASE)
+            if match:
+                try:
+                    if 'Jan|Feb' in pattern:  # First pattern
+                        month_name, day, year = match.groups()
+                        month = month_map[month_name.lower()]
+                        return datetime(int(year), month, int(day))
+                    else:  # Second pattern
+                        parts = match.groups()
+                        if len(parts) == 3:
+                            # Could be MM/DD/YYYY or DD/MM/YYYY - try both
+                            try:
+                                month, day, year = map(int, parts)
+                                # Try MM/DD/YYYY first (US format)
+                                return datetime(year, month, day)
+                            except ValueError:
+                                pass
+                except (ValueError, KeyError):
+                    continue
+        
+        # Method 3: Check if title says "today" or "tomorrow"
+        title_lower = title.lower()
+        today = datetime.now()
+        if 'today' in title_lower:
+            return today
+        elif 'tomorrow' in title_lower:
+            return today + timedelta(days=1)
+        
+        # Fallback: assume tomorrow (original behavior)
+        print(f"[WeatherStrategy] ⚠️  Could not parse date from market, defaulting to tomorrow")
+        return today + timedelta(days=1)
+    
     def should_trade(self, market: Dict) -> bool:
         """Check if this is a weather market we should trade"""
         # Try multiple ways to get series ticker (Kalshi API may vary)
@@ -633,9 +706,22 @@ class WeatherDailyStrategy(TradingStrategy):
                 print(f"[WeatherStrategy] ⚠️  Could not determine series for market: {ticker}")
                 return None
             
-            # Extract target date from market (usually tomorrow or today)
-            # Kalshi weather markets are typically for the next day
-            target_date = datetime.now() + timedelta(days=1)
+            # Extract target date from market ticker or title
+            # Ticker format: KXHIGHNY-26JAN28-T26 (date is 26JAN28 = Jan 28, 2026)
+            # Title format: "Will the **high temp in NYC** be >26° on Jan 28, 2026?"
+            target_date = self._extract_market_date(market)
+            if not target_date:
+                print(f"[WeatherStrategy] ⚠️  Could not extract date from market: {ticker}")
+                return None
+            
+            # Verify date is reasonable (not too far in past/future)
+            today = datetime.now().date()
+            market_date = target_date.date()
+            days_diff = (market_date - today).days
+            
+            if days_diff < -1 or days_diff > 7:  # Allow -1 (yesterday) to +7 days
+                print(f"[WeatherStrategy] ⚠️  Market date {market_date} is too far from today ({days_diff} days), skipping")
+                return None
             
             # Extract temperature threshold from market title
             threshold = self.extract_threshold(market)
