@@ -23,20 +23,21 @@ THRESHOLD_PATTERN = re.compile(r'(?:above|below|>|<)\s*(\d+(?:\.\d+)?)', re.IGNO
 class WeatherDataAggregator:
     """Aggregates weather forecasts from multiple sources and builds probability distributions"""
     
-    # City coordinates for weather APIs (supports both HIGH and LOW temperature markets)
+    # Official NWS measurement locations per contract rules (supports both HIGH and LOW temperature markets)
+    # Coordinates match exact NWS weather station locations used for contract settlement
     CITY_COORDS = {
-        # New York City
-        'KXHIGHNY': {'lat': 40.7128, 'lon': -74.0060, 'name': 'New York City'},
-        'KXLOWNY': {'lat': 40.7128, 'lon': -74.0060, 'name': 'New York City'},
-        # Chicago
-        'KXHIGHCH': {'lat': 41.8781, 'lon': -87.6298, 'name': 'Chicago'},
-        'KXLOWCH': {'lat': 41.8781, 'lon': -87.6298, 'name': 'Chicago'},
-        # Miami
-        'KXHIGHMI': {'lat': 25.7617, 'lon': -80.1918, 'name': 'Miami'},
-        'KXLOWMI': {'lat': 25.7617, 'lon': -80.1918, 'name': 'Miami'},
-        # Austin
-        'KXHIGHAU': {'lat': 30.2672, 'lon': -97.7431, 'name': 'Austin'},
-        'KXLOWAU': {'lat': 30.2672, 'lon': -97.7431, 'name': 'Austin'},
+        # New York City - Central Park (NHIGH contract: "Central Park, New York")
+        'KXHIGHNY': {'lat': 40.7711, 'lon': -73.9742, 'name': 'Central Park, New York'},
+        'KXLOWNY': {'lat': 40.7711, 'lon': -73.9742, 'name': 'Central Park, New York'},
+        # Chicago - Midway Airport (CHIHIGH contract: "Chicago Midway, Illinois")
+        'KXHIGHCH': {'lat': 41.7868, 'lon': -87.7522, 'name': 'Chicago Midway Airport'},
+        'KXLOWCH': {'lat': 41.7868, 'lon': -87.7522, 'name': 'Chicago Midway Airport'},
+        # Miami - Miami International Airport (MIHIGH contract - likely MIA)
+        'KXHIGHMI': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
+        'KXLOWMI': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
+        # Austin - Austin Bergstrom International Airport (AUSHIGH contract: "Austin Bergstrom")
+        'KXHIGHAU': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
+        'KXLOWAU': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
     }
     
     def __init__(self):

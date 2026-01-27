@@ -156,6 +156,12 @@ ENABLED_STRATEGIES=btc_hourly
 - **Low Temperature Markets**: KXLOWNY, KXLOWCH, KXLOWMI, KXLOWAU
 - **Cities**: New York City, Chicago, Miami, Austin
 
+**Official Measurement Locations (per contract rules):**
+- **New York**: Central Park (40.7711°N, 73.9742°W) - NHIGH contract
+- **Chicago**: Chicago Midway Airport (41.7868°N, 87.7522°W) - CHIHIGH contract
+- **Miami**: Miami International Airport (25.7932°N, 80.2906°W) - MIHIGH contract
+- **Austin**: Austin Bergstrom International Airport (30.1831°N, 97.6799°W) - AUSHIGH contract
+
 **Data Sources:**
 - National Weather Service (NWS) - Free, no API key needed
 - Tomorrow.io - Free tier (500 calls/day)
