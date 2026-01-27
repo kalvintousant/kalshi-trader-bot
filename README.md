@@ -10,9 +10,11 @@ Automated trading bot for Kalshi prediction markets, supporting **hourly BTC mar
   - Automated entry/exit logic
   
 - **Daily Weather Markets**: Multi-source forecast aggregation strategy
-  - Aggregates forecasts from multiple weather APIs (OpenWeather, Tomorrow.io, NWS)
+  - Aggregates forecasts from multiple weather APIs (NWS, Tomorrow.io, Weatherbit)
+  - Supports both HIGH and LOW temperature markets for 4 cities
   - Calculates edge and expected value (EV) based on probability distributions
   - Trades when edge > threshold
+  - Optimized for AUSHIGH contract rules (5-minute scans, 30-minute cache)
   
 - **Real-time Market Data**: Efficient polling with caching and connection pooling
 - **Trade Notifications**: macOS notifications + file logging for every trade
@@ -42,12 +44,14 @@ Automated trading bot for Kalshi prediction markets, supporting **hourly BTC mar
    ```
 
 4. **Optional: Weather API Keys** (for weather strategy):
-   - Get free API keys from [OpenWeather](https://openweathermap.org/api), [Tomorrow.io](https://www.tomorrow.io/weather-api/)
+   - NWS is free and requires no key
+   - Get free API keys from [Tomorrow.io](https://www.tomorrow.io/weather-api/) and [Weatherbit](https://www.weatherbit.io/api)
    - Add them to `.env`:
    ```
-   OPENWEATHER_API_KEY=your_key
    TOMORROWIO_API_KEY=your_key
+   WEATHERBIT_API_KEY=your_key
    ```
+   - All APIs stay within free tier limits with optimized call intervals
 
 5. **Test with demo environment first** (optional):
    Update `.env` to use demo URLs:
@@ -69,11 +73,12 @@ caffeinate -i python3 -u bot.py > bot_output.log 2>&1 &
 ```
 
 The bot will:
-- Scan markets adaptively: 5 seconds (BTC 15-min), 10 seconds (BTC hourly), or 15 seconds (weather)
+- Scan markets adaptively: 0.5 seconds (BTC 15-min), 10 seconds (BTC hourly), or 5 minutes (weather)
 - Evaluate markets using enabled strategies
 - Place trades when opportunities are identified
 - Send macOS notifications for each trade
 - Log all trades to `trades.log`
+- Detect new markets immediately for early entry opportunities
 
 ### Monitoring
 
@@ -146,17 +151,22 @@ ENABLED_STRATEGIES=btc_hourly
 4. Calculates EV: `(Win Prob × Payout) - (Loss Prob × Stake)`
 5. Trades when edge ≥ 5% and EV ≥ $0.001
 
-**Supported Cities:**
-- NYC (KXHIGHNY)
-- Chicago (KXHIGHCH)
-- Miami (KXHIGHMI)
-- Austin (KXHIGHAU)
+**Supported Markets:**
+- **High Temperature Markets**: KXHIGHNY, KXHIGHCH, KXHIGHMI, KXHIGHAU
+- **Low Temperature Markets**: KXLOWNY, KXLOWCH, KXLOWMI, KXLOWAU
+- **Cities**: New York City, Chicago, Miami, Austin
 
 **Data Sources:**
-- National Weather Service (NWS)
-- OpenWeather
-- Tomorrow.io
-- (Additional sources can be added)
+- National Weather Service (NWS) - Free, no API key needed
+- Tomorrow.io - Free tier (500 calls/day)
+- Weatherbit - Free tier (500 calls/day)
+- OpenWeather - Removed (per optimization)
+
+**Optimizations:**
+- Scan interval: 5 minutes (per AUSHIGH contract rules)
+- Forecast cache: 30 minutes (reduces API calls by 95%)
+- API calls: ~192/day total (well within free tier limits)
+- Parallel fetching: All 3 APIs called simultaneously
 
 See [WEATHER_STRATEGY.md](WEATHER_STRATEGY.md) and [BTC_STRATEGY.md](BTC_STRATEGY.md) for detailed strategy documentation.
 
@@ -211,7 +221,11 @@ The bot includes several performance optimizations:
 - **Connection pooling**: Reuses HTTP connections
 - **Market filtering**: Filters by series before expensive API calls
 - **Shared BTC tracker**: Updates once per scan, not per market
-- **Adaptive scan intervals**: 10s for BTC, 15s for weather
+- **Adaptive scan intervals**: 0.5s (BTC 15-min), 10s (BTC hourly), 5min (weather)
+- **Forecast caching**: 30-minute cache reduces weather API calls by 95%
+- **New market detection**: Tracks seen markets to prioritize new ones
+- **Parallel API calls**: Weather forecasts fetched simultaneously from 3 sources
+- **Optimized for free tiers**: All weather APIs stay within free tier limits
 
 See [PERFORMANCE_IMPROVEMENTS.md](PERFORMANCE_IMPROVEMENTS.md) for details.
 

@@ -18,7 +18,13 @@ class Config:
     # Market Tickers
     BTC_15M_SERIES = 'KXBTC15M'  # 15-minute BTC markets (up/down)
     BTC_HOURLY_SERIES = 'KXBTC'  # Hourly BTC markets (price ranges)
-    WEATHER_SERIES = ['KXHIGHNY', 'KXHIGHCH', 'KXHIGHMI', 'KXHIGHAU']  # NYC, Chicago, Miami, Austin
+    # High and Low temperature markets for NYC, Chicago, Miami, Austin
+    WEATHER_SERIES = [
+        'KXHIGHNY', 'KXLOWNY',   # New York City
+        'KXHIGHCH', 'KXLOWCH',   # Chicago
+        'KXHIGHMI', 'KXLOWMI',   # Miami
+        'KXHIGHAU', 'KXLOWAU'    # Austin
+    ]
     
     @classmethod
     def validate(cls):

@@ -28,6 +28,9 @@ class KalshiTradingBot:
         self.daily_pnl = 0
         self.last_reset_date = datetime.now().date()
         
+        # Track seen markets to detect new ones quickly
+        self.seen_markets: Set[str] = set()
+        
         # Track relevant series for filtering
         self.relevant_series: Set[str] = set()
         if 'btc_15m' in Config.ENABLED_STRATEGIES:
@@ -69,14 +72,32 @@ class KalshiTradingBot:
         
         try:
             # Filter markets by relevant series FIRST to reduce API calls
+            # Increase limit to catch all markets, especially new ones
             relevant_markets = []
             for series_ticker in self.relevant_series:
-                series_markets = self.client.get_markets(series_ticker=series_ticker, status='open', limit=50)
+                series_markets = self.client.get_markets(series_ticker=series_ticker, status='open', limit=200)
                 relevant_markets.extend(series_markets)
             
-            print(f"[Bot] Found {len(relevant_markets)} relevant markets (filtered from series)")
-            
+            # Detect new markets (prioritize them for early entry)
+            new_markets = []
+            existing_markets = []
             for market in relevant_markets:
+                market_ticker = market.get('ticker', '')
+                if market_ticker not in self.seen_markets:
+                    new_markets.append(market)
+                    self.seen_markets.add(market_ticker)
+                else:
+                    existing_markets.append(market)
+            
+            # Process new markets FIRST (critical for early entry)
+            if new_markets:
+                print(f"[Bot] 🆕 Found {len(new_markets)} NEW markets! Processing immediately...")
+            
+            # Combine: new markets first, then existing
+            markets_to_process = new_markets + existing_markets
+            print(f"[Bot] Found {len(markets_to_process)} relevant markets ({len(new_markets)} new, {len(existing_markets)} existing)")
+            
+            for market in markets_to_process:
                 # Quick filter check before expensive orderbook call
                 if not any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies):
                     continue
@@ -176,9 +197,11 @@ class KalshiTradingBot:
             # Run polling mode
             print("[Bot] Running in polling mode...")
             if 'btc_15m' in Config.ENABLED_STRATEGIES:
-                print("[Bot] Scan interval: 5 seconds (optimized for 15-minute BTC latency arbitrage)")
+                print("[Bot] Scan interval: 0.5 seconds (ultra-fast for new market detection and latency arbitrage)")
             elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
                 print("[Bot] Scan interval: 10 seconds (optimized for hourly BTC markets)")
+            elif 'weather_daily' in Config.ENABLED_STRATEGIES:
+                print("[Bot] Scan interval: 5 minutes (optimized for daily weather markets - forecasts update hourly)")
             else:
                 print("[Bot] Scan interval: 15 seconds")
             while self.running:
@@ -187,13 +210,16 @@ class KalshiTradingBot:
                     self.scan_and_trade()
                     scan_duration = time.time() - scan_start
                     
-                    # Adaptive sleep: 5 seconds for BTC 15-min (fastest), 10 for BTC hourly, 15 for weather
+                    # Ultra-fast scanning for new market detection (critical for early entry)
+                    # 0.5 second interval for BTC 15-min to catch markets in first few seconds
                     if 'btc_15m' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 1 - scan_duration)  # 1 second interval for 15-min BTC (ultra-fast for latency arb) (latency arb needs speed)
+                        sleep_time = max(0, 0.5 - scan_duration)  # 0.5 second interval for ultra-fast new market detection
                     elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
                         sleep_time = max(0, 10 - scan_duration)  # 10 second interval for hourly BTC
+                    elif 'weather_daily' in Config.ENABLED_STRATEGIES:
+                        sleep_time = max(0, 300 - scan_duration)  # 5 minutes for weather (daily markets, forecasts update hourly)
                     else:
-                        sleep_time = max(0, 15 - scan_duration)  # 15 second for weather
+                        sleep_time = max(0, 15 - scan_duration)  # 15 second default
                     
                     if sleep_time > 0:
                         time.sleep(sleep_time)

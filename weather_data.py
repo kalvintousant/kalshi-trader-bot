@@ -23,55 +23,38 @@ THRESHOLD_PATTERN = re.compile(r'(?:above|below|>|<)\s*(\d+(?:\.\d+)?)', re.IGNO
 class WeatherDataAggregator:
     """Aggregates weather forecasts from multiple sources and builds probability distributions"""
     
-    # City coordinates for weather APIs
+    # City coordinates for weather APIs (supports both HIGH and LOW temperature markets)
     CITY_COORDS = {
-        'KXHIGHNY': {'lat': 40.7128, 'lon': -74.0060, 'name': 'New York City'},  # Central Park
+        # New York City
+        'KXHIGHNY': {'lat': 40.7128, 'lon': -74.0060, 'name': 'New York City'},
+        'KXLOWNY': {'lat': 40.7128, 'lon': -74.0060, 'name': 'New York City'},
+        # Chicago
         'KXHIGHCH': {'lat': 41.8781, 'lon': -87.6298, 'name': 'Chicago'},
+        'KXLOWCH': {'lat': 41.8781, 'lon': -87.6298, 'name': 'Chicago'},
+        # Miami
         'KXHIGHMI': {'lat': 25.7617, 'lon': -80.1918, 'name': 'Miami'},
+        'KXLOWMI': {'lat': 25.7617, 'lon': -80.1918, 'name': 'Miami'},
+        # Austin
         'KXHIGHAU': {'lat': 30.2672, 'lon': -97.7431, 'name': 'Austin'},
+        'KXLOWAU': {'lat': 30.2672, 'lon': -97.7431, 'name': 'Austin'},
     }
     
     def __init__(self):
         # API keys from environment (optional - will use free tiers where possible)
-        self.openweather_api_key = os.getenv('OPENWEATHER_API_KEY', '')
+        # OpenWeather removed per user request
         self.tomorrowio_api_key = os.getenv('TOMORROWIO_API_KEY', '')
         self.accuweather_api_key = os.getenv('ACCUWEATHER_API_KEY', '')
         self.weatherbit_api_key = os.getenv('WEATHERBIT_API_KEY', '')
         
-        # Cache for forecasts (refresh every hour)
+        # Cache for forecasts (refresh every 30 minutes)
+        # Based on AUSHIGH contract rules: daily markets, forecasts update 2-4x/day
+        # 30 min cache balances freshness with API rate limits
         self.forecast_cache = {}
         self.cache_timestamp = {}
-        self.cache_ttl = 3600  # 1 hour in seconds
+        self.cache_ttl = 1800  # 30 minutes in seconds (forecasts update hourly at most)
         
         # Use session for connection pooling
         self.session = requests.Session()
-    
-    def get_forecast_openweather(self, lat: float, lon: float, date: datetime) -> Optional[float]:
-        """Get forecast from OpenWeather API (free tier available)"""
-        if not self.openweather_api_key:
-            return None
-        
-        try:
-            # OpenWeather provides 5-day forecast
-            url = f"https://api.openweathermap.org/data/2.5/forecast"
-            params = {
-                'lat': lat,
-                'lon': lon,
-                'appid': self.openweather_api_key,
-                'units': 'imperial'
-            }
-            response = self.session.get(url, params=params, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                # Find forecast for target date
-                target_date_str = date.strftime('%Y-%m-%d')
-                for item in data.get('list', []):
-                    forecast_date = datetime.fromtimestamp(item['dt']).strftime('%Y-%m-%d')
-                    if forecast_date == target_date_str:
-                        return item['main']['temp_max']
-        except Exception as e:
-            print(f"[Weather] OpenWeather API error: {e}")
-        return None
     
     def get_forecast_tomorrowio(self, lat: float, lon: float, date: datetime) -> Optional[float]:
         """Get forecast from Tomorrow.io API"""
@@ -122,6 +105,36 @@ class WeatherDataAggregator:
             print(f"[Weather] NWS API error: {e}")
         return None
     
+    def get_forecast_weatherbit(self, lat: float, lon: float, date: datetime, series_ticker: str = '') -> Optional[float]:
+        """Get forecast from Weatherbit API - returns max temp for HIGH markets, min temp for LOW markets"""
+        if not self.weatherbit_api_key:
+            return None
+        
+        try:
+            # Weatherbit provides 16-day forecast
+            url = "https://api.weatherbit.io/v2.0/forecast/daily"
+            params = {
+                'lat': lat,
+                'lon': lon,
+                'key': self.weatherbit_api_key,
+                'units': 'I'  # Imperial (Fahrenheit)
+            }
+            response = self.session.get(url, params=params, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                target_date_str = date.strftime('%Y-%m-%d')
+                for day in data.get('data', []):
+                    forecast_date = day.get('valid_date', '')
+                    if forecast_date == target_date_str:
+                        # Return max temp for HIGH markets, min temp for LOW markets
+                        if 'LOW' in series_ticker:
+                            return day.get('min_temp')  # Minimum temperature for LOW markets
+                        else:
+                            return day.get('max_temp')  # Maximum temperature for HIGH markets
+        except Exception as e:
+            print(f"[Weather] Weatherbit API error: {e}")
+        return None
+    
     def get_all_forecasts(self, series_ticker: str, target_date: datetime) -> List[float]:
         """
         Collect forecasts from all available sources with caching and parallel execution
@@ -140,12 +153,13 @@ class WeatherDataAggregator:
         lat, lon = city['lat'], city['lon']
         
         # Fetch forecasts in parallel for better performance
+        # Using NWS, Tomorrow.io, and Weatherbit (OpenWeather removed)
         forecasts = []
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(self.get_forecast_nws, lat, lon, target_date): 'nws',
-                executor.submit(self.get_forecast_openweather, lat, lon, target_date): 'openweather',
-                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date): 'tomorrowio'
+                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date): 'tomorrowio',
+                executor.submit(self.get_forecast_weatherbit, lat, lon, target_date, series_ticker): 'weatherbit'
             }
             
             for future in as_completed(futures):
