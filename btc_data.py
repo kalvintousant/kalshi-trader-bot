@@ -1,10 +1,12 @@
 """
 BTC Price Data - Real-time BTC price tracking from Binance
-For latency arbitrage strategy on Kalshi hourly BTC markets
+For latency arbitrage strategy on Kalshi 15-minute and hourly BTC markets
 
-Note: Kalshi BTC contracts use CF Bitcoin Real-Time Index (BRTI).
-We use Binance spot price as a proxy for real-time tracking.
-The contract uses BRTI average for the minute (60 seconds) prior to expiration.
+Contract Rules (CRYPTO15M):
+- Kalshi contracts use CF Bitcoin Real-Time Index (BRTI) from CF Benchmarks
+- Contract settles on simple average of BRTI for the 60 seconds prior to expiration time
+- We use Binance spot price as a proxy for real-time tracking (closely tracks BRTI)
+- This enables latency arbitrage by detecting moves before Kalshi odds update
 """
 import requests
 import time

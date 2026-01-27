@@ -333,6 +333,12 @@ class BTC15MinStrategy(TradingStrategy):
     
     This strategy is optimized for the "Bitcoin price up or down in next 15 mins" markets.
     Uses 15-minute price change calculations for faster reaction to BTC movements.
+    
+    Contract Rules Compliance (CRYPTO15M):
+    - Uses CF Benchmarks index (BRTI) equivalent (Binance spot price as proxy)
+    - Contract settles on 60-second average prior to expiration, but we track 15-min moves for latency detection
+    - Respects Last Trading Date/Time by only trading markets with status='open'
+    - Position Accountability Level: $25,000 per strike (we use MAX_POSITION_SIZE)
     """
     
     def __init__(self, client: KalshiClient, btc_tracker: Optional[BTCPriceTracker] = None):
@@ -358,10 +364,11 @@ class BTC15MinStrategy(TradingStrategy):
         """
         Check if this is a 15-minute BTC market we should trade
         
-        Contract Rules Compliance:
-        - Only trades markets with status='open' (respects Last Trading Date/Time)
+        Contract Rules Compliance (CRYPTO15M):
+        - Only trades markets with status='open' (respects Last Trading Date/Time per contract rules)
         - Kalshi API filters out expired markets automatically
         - Minimum volume check ensures liquidity
+        - Position Accountability Level: $25,000 per strike (enforced via MAX_POSITION_SIZE)
         """
         series_ticker = market.get('series_ticker', '')
         if series_ticker != Config.BTC_15M_SERIES:
@@ -407,7 +414,8 @@ class BTC15MinStrategy(TradingStrategy):
                 return None
             
             # Get current BTC price change over 15 minutes (for 15-min markets)
-            # Contract uses BRTI average for minute prior to expiration - we track 15-min moves
+            # Contract Rule (CRYPTO15M): Settles on 60-second average of CF Benchmarks index prior to expiration
+            # We track 15-minute moves to detect latency arbitrage opportunities before expiration
             btc_change_15m = self.btc_tracker.get_price_change_period(minutes=15)
             
             if btc_change_15m is None:
