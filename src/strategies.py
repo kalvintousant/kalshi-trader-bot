@@ -608,6 +608,7 @@ class WeatherDailyStrategy(TradingStrategy):
             threshold = self.extract_threshold(market)
             if not threshold:
                 # Can't determine threshold, skip
+                print(f"[WeatherStrategy] ⚠️  Could not extract threshold from market: {market.get('title', 'unknown')}")
                 return None
             
             # Get forecasts from all available sources
@@ -615,6 +616,7 @@ class WeatherDailyStrategy(TradingStrategy):
             
             if not forecasts:
                 # No forecasts available, skip
+                print(f"[WeatherStrategy] ⚠️  No forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
                 return None
             
             # Build temperature ranges (2-degree brackets as mentioned in guide)

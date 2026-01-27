@@ -94,7 +94,13 @@ class KalshiTradingBot:
                     continue
                 
                 # Evaluate market with all strategies
-                decisions = self.strategy_manager.evaluate_market(market)
+                try:
+                    decisions = self.strategy_manager.evaluate_market(market)
+                except Exception as e:
+                    print(f"[Bot] ⚠️  Error evaluating market {market.get('ticker', 'unknown')}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
                 
                 for decision in decisions:
                     strategy_name = decision.pop('strategy')
