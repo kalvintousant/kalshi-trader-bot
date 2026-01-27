@@ -63,7 +63,7 @@ class KalshiTradingBot:
         
         # Update BTC data once per scan (not per market) for performance
         # More frequent updates for 15-min strategy (15s), less frequent for hourly (30s)
-        max_age = 15 if 'btc_15m' in Config.ENABLED_STRATEGIES else 30
+        max_age = 1 if 'btc_15m' in Config.ENABLED_STRATEGIES else 30
         if self.btc_tracker and not self.btc_tracker.is_fresh(max_age_seconds=max_age):
             self.btc_tracker.update()
         
@@ -189,7 +189,7 @@ class KalshiTradingBot:
                     
                     # Adaptive sleep: 5 seconds for BTC 15-min (fastest), 10 for BTC hourly, 15 for weather
                     if 'btc_15m' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 5 - scan_duration)  # 5 second interval for 15-min BTC (latency arb needs speed)
+                        sleep_time = max(0, 1 - scan_duration)  # 1 second interval for 15-min BTC (ultra-fast for latency arb) (latency arb needs speed)
                     elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
                         sleep_time = max(0, 10 - scan_duration)  # 10 second interval for hourly BTC
                     else:

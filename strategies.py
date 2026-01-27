@@ -389,109 +389,98 @@ class BTC15MinStrategy(TradingStrategy):
     def get_trade_decision(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
         """
         Latency arbitrage strategy for 15-minute markets:
-        1. Read real-time BTC moves from Binance (5-minute candles)
-        2. Check Kalshi's delayed pricing
-        3. Enter during lag window if there's desynchronization
-        4. Exit once pricing catches up
+        Compares current BTC price to strike price to determine which side (higher/lower) has better probability.
+        Trades when Kalshi pricing lags behind real-time BTC price movements.
         """
         try:
             market_ticker = market.get('ticker', '')
             
-            # Note: BTC data should be updated at bot level, not here for performance
-            # This check is just a safety fallback
-            if not self.btc_tracker.is_fresh(max_age_seconds=15):  # More frequent updates for 15-min
+            # Update BTC data if stale (1 second refresh for fast reaction)
+            if not self.btc_tracker.is_fresh(max_age_seconds=1):
                 self.btc_tracker.update()
             
             # Check if we have an active position to exit
             if market_ticker in self.active_positions:
                 return self._check_exit(market, orderbook, market_ticker)
             
-            # Detect significant BTC move
-            has_move, direction = self.btc_tracker.detect_significant_move(
-                momentum_threshold=self.momentum_threshold,
-                volatility_threshold=self.volatility_threshold
-            )
-            
-            if not has_move:
+            # Get strike price from market (market is "BTC higher or lower than strike price")
+            strike_price = market.get('floor_strike')
+            if strike_price is None:
                 return None
             
-            # Get current BTC price change over 15 minutes (for 15-min markets)
-            # Contract Rule (CRYPTO15M): Settles on 60-second average of CF Benchmarks index prior to expiration
-            # We track 15-minute moves to detect latency arbitrage opportunities before expiration
-            btc_change_15m = self.btc_tracker.get_price_change_period(minutes=15)
-            
-            if btc_change_15m is None:
+            # Get current BTC price
+            current_btc = self.btc_tracker.get_current_price()
+            if current_btc is None:
                 return None
             
             # Get Kalshi market pricing
-            yes_price = market.get('yes_price', 50)
-            no_price = market.get('no_price', 50)
-            
             yes_bids = orderbook.get('orderbook', {}).get('yes', [])
             no_bids = orderbook.get('orderbook', {}).get('no', [])
             
             if not yes_bids or not no_bids:
                 return None
             
-            best_yes_bid = yes_bids[0][0] if yes_bids else yes_price
-            best_no_bid = no_bids[0][0] if no_bids else no_price
+            best_yes_bid = yes_bids[0][0]
+            best_no_bid = no_bids[0][0]
             
-            # Calculate expected Kalshi price based on BTC move
-            # If BTC is up, YES should be higher priced
-            # If BTC is down, NO should be higher priced
+            # Calculate distance from strike price (percentage difference)
+            # YES = BTC >= strike, NO = BTC < strike
+            distance_pct = ((current_btc - strike_price) / strike_price) * 100
             
-            # Convert BTC change to expected probability
-            # Positive change = higher probability of YES
-            # Negative change = higher probability of NO
-            # For 15-min markets, moves are smaller so we scale differently
-            expected_yes_prob = 50 + (btc_change_15m * 15)  # Scale: 1% BTC move = 15% prob change (more sensitive)
+            # Calculate expected probability based on distance from strike
+            # Scale: 1% distance = 10% probability change
+            # If BTC is 1% above strike, YES should be ~60%
+            # If BTC is 1% below strike, YES should be ~40%
+            expected_yes_prob = 50 + (distance_pct * 10)
             expected_yes_prob = max(1, min(99, expected_yes_prob))  # Clamp to 1-99
+            expected_no_prob = 100 - expected_yes_prob
             
-            # Compare expected price to actual Kalshi price
-            price_mispricing = abs(expected_yes_prob - best_yes_bid)
+            # Calculate mispricing for both sides
+            yes_mispricing = abs(expected_yes_prob - best_yes_bid)
+            no_mispricing = abs(expected_no_prob - best_no_bid)
             
-            # Trade logic: If BTC pumped and YES is underpriced, buy YES
-            # If BTC dumped and NO is underpriced, buy NO
-            if direction == "up" and btc_change_15m > 0:
-                # BTC pumped, check if YES is mispriced
-                if expected_yes_prob > best_yes_bid + self.mispricing_threshold:
-                    print(f"[BTC15MinStrategy] BTC PUMP detected: {btc_change_15m:.2f}% move (15m), YES expected {expected_yes_prob:.1f}¢, market {best_yes_bid}¢, mispricing {price_mispricing:.1f}¢")
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'yes',
-                        'entry_price': best_yes_bid + 1,
-                        'entry_time': datetime.now(),
-                        'expected_prob': expected_yes_prob
-                    }
-                    return {
-                        'action': 'buy',
-                        'side': 'yes',
-                        'count': min(1, self.max_position_size),
-                        'price': best_yes_bid + 1,
-                        'btc_move': btc_change_15m,
-                        'mispricing': price_mispricing
-                    }
+            # Determine which side has better edge
+            # Trade YES if BTC is above strike AND YES is underpriced
+            if current_btc >= strike_price and expected_yes_prob > best_yes_bid + self.mispricing_threshold:
+                print(f"[BTC15MinStrategy] BTC ABOVE STRIKE: ${current_btc:,.2f} >= ${strike_price:,.2f}, YES expected {expected_yes_prob:.1f}¢, market {best_yes_bid}¢, mispricing {yes_mispricing:.1f}¢")
+                self.active_positions[market_ticker] = {
+                    'side': 'yes',
+                    'entry_price': best_yes_bid + 1,
+                    'entry_time': datetime.now(),
+                    'expected_prob': expected_yes_prob,
+                    'strike_price': strike_price,
+                    'btc_price': current_btc
+                }
+                return {
+                    'action': 'buy',
+                    'side': 'yes',
+                    'count': min(1, self.max_position_size),
+                    'price': best_yes_bid + 1,
+                    'btc_price': current_btc,
+                    'strike_price': strike_price,
+                    'mispricing': yes_mispricing
+                }
             
-            elif direction == "down" and btc_change_15m < 0:
-                # BTC dumped, check if NO is mispriced
-                expected_no_prob = 100 - expected_yes_prob
-                if expected_no_prob > best_no_bid + self.mispricing_threshold:
-                    print(f"[BTC15MinStrategy] BTC DUMP detected: {btc_change_15m:.2f}% move (15m), NO expected {expected_no_prob:.1f}¢, market {best_no_bid}¢, mispricing {price_mispricing:.1f}¢")
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'no',
-                        'entry_price': best_no_bid + 1,
-                        'entry_time': datetime.now(),
-                        'expected_prob': expected_no_prob
-                    }
-                    return {
-                        'action': 'buy',
-                        'side': 'no',
-                        'count': min(1, self.max_position_size),
-                        'price': best_no_bid + 1,
-                        'btc_move': btc_change_15m,
-                        'mispricing': price_mispricing
-                    }
+            # Trade NO if BTC is below strike AND NO is underpriced
+            elif current_btc < strike_price and expected_no_prob > best_no_bid + self.mispricing_threshold:
+                print(f"[BTC15MinStrategy] BTC BELOW STRIKE: ${current_btc:,.2f} < ${strike_price:,.2f}, NO expected {expected_no_prob:.1f}¢, market {best_no_bid}¢, mispricing {no_mispricing:.1f}¢")
+                self.active_positions[market_ticker] = {
+                    'side': 'no',
+                    'entry_price': best_no_bid + 1,
+                    'entry_time': datetime.now(),
+                    'expected_prob': expected_no_prob,
+                    'strike_price': strike_price,
+                    'btc_price': current_btc
+                }
+                return {
+                    'action': 'buy',
+                    'side': 'no',
+                    'count': min(1, self.max_position_size),
+                    'price': best_no_bid + 1,
+                    'btc_price': current_btc,
+                    'strike_price': strike_price,
+                    'mispricing': no_mispricing
+                }
             
             return None
             
@@ -500,7 +489,6 @@ class BTC15MinStrategy(TradingStrategy):
             import traceback
             traceback.print_exc()
             return None
-    
     def _check_exit(self, market: Dict, orderbook: Dict, market_ticker: str) -> Optional[Dict]:
         """
         Check if we should exit an active position
