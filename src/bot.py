@@ -22,6 +22,7 @@ class KalshiTradingBot:
         self.markets_being_tracked = set()
         self.daily_pnl = 0
         self.last_reset_date = datetime.now().date()
+        self.starting_account_value = None  # Track starting account value for daily P&L
         
         # Track seen markets to detect new ones quickly
         self.seen_markets: Set[str] = set()
@@ -42,15 +43,40 @@ class KalshiTradingBot:
         """Reset daily statistics"""
         today = datetime.now().date()
         if today > self.last_reset_date:
+            # Get starting account value (balance + portfolio_value) for the day
+            portfolio = self.client.get_portfolio()
+            balance = portfolio.get('balance', 0) / 100.0  # Convert cents to dollars
+            portfolio_value = portfolio.get('portfolio_value', 0) / 100.0
+            self.starting_account_value = balance + portfolio_value
             self.daily_pnl = 0
             self.last_reset_date = today
             print(f"[Bot] Daily stats reset for {today}")
+            print(f"[Bot] Starting account value: ${self.starting_account_value:.2f}")
     
     def check_daily_loss_limit(self):
-        """Check if we've hit daily loss limit"""
+        """Check if we've hit daily loss limit based on total portfolio P&L"""
         self.reset_daily_stats()
+        
+        # Get current account value (cash balance + portfolio value)
+        portfolio = self.client.get_portfolio()
+        balance = portfolio.get('balance', 0) / 100.0  # Convert cents to dollars
+        portfolio_value = portfolio.get('portfolio_value', 0) / 100.0
+        current_account_value = balance + portfolio_value
+        
+        # Calculate daily P&L from account value change
+        if self.starting_account_value is not None:
+            self.daily_pnl = current_account_value - self.starting_account_value
+        else:
+            # First check of the day - set starting value
+            self.starting_account_value = current_account_value
+            self.daily_pnl = 0
+        
+        # Check if we've hit the loss limit
         if self.daily_pnl <= -Config.MAX_DAILY_LOSS:
-            print(f"[Bot] Daily loss limit reached: ${self.daily_pnl}")
+            print(f"[Bot] ⛔ Daily loss limit reached!")
+            print(f"[Bot] Starting value: ${self.starting_account_value:.2f}")
+            print(f"[Bot] Current value: ${current_account_value:.2f}")
+            print(f"[Bot] Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
             return True
         return False
     
@@ -419,7 +445,16 @@ class KalshiTradingBot:
                     if time.time() - last_heartbeat >= heartbeat_interval:
                         portfolio = self.client.get_portfolio()
                         balance = portfolio.get('balance', 0) / 100  # Convert cents to dollars
-                        print(f"[Bot] ❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h, Balance: ${balance:.2f}, Daily P&L: ${self.daily_pnl:.2f}")
+                        portfolio_value = portfolio.get('portfolio_value', 0) / 100  # Convert cents to dollars
+                        total_value = balance + portfolio_value
+                        
+                        # Update daily P&L for heartbeat
+                        if self.starting_account_value is not None:
+                            self.daily_pnl = total_value - self.starting_account_value
+                        
+                        print(f"[Bot] ❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h")
+                        print(f"[Bot]    Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
+                        print(f"[Bot]    Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
                         last_heartbeat = time.time()
                     
                     # Adaptive scan intervals based on market type

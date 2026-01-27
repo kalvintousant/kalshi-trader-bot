@@ -48,7 +48,7 @@ kalshi-trader-bot/
 - **24/7 Operation**: Runs continuously to monitor both high and low temperature markets (low temps occur early morning)
 - **Contract Compliance**: All locations verified against NWS official weather station coordinates
 - **Risk Management**: 
-  - $10 daily loss limit (trading pauses if reached)
+  - $10 daily loss limit (tracks total portfolio P&L: cash + positions, trading pauses if reached)
   - $3 OR 25 contracts max per market (whichever is hit first)
   - Automatic order cancellation when edge/EV no longer valid
   - Position sizing controls
