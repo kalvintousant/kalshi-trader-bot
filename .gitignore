@@ -1,5 +1,7 @@
 # Environment variables
 .env
+.env.backup
+.env.test
 
 # Python
 __pycache__/
@@ -43,6 +45,7 @@ traderbot.txt
 # Logs
 *.log
 logs/
+cron.log
 
 # OS
 .DS_Store
@@ -55,3 +58,7 @@ CRYPTO*.md
 CONTRACT_COMPLIANCE.md
 btc_data.py
 COMPREHENSIVE_REVIEW.md
+
+# Temporary files
+*.tmp
+*.bak

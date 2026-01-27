@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
-from config import Config
+from .config import Config
 
 
 class KalshiClient:

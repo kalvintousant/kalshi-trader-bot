@@ -7,6 +7,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 START_SCRIPT="$SCRIPT_DIR/start_daytime.sh"
 
 echo "This will set up automatic bot scheduling:"
