@@ -696,33 +696,44 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # Get market prices (reuse from earlier calculation if available)
             # Get orderbook data
-            yes_bids = orderbook.get('orderbook', {}).get('yes', [])
-            no_bids = orderbook.get('orderbook', {}).get('no', [])
+            # Kalshi orderbook format: [[price, quantity], ...] sorted by price descending
+            # First entries = highest bids (buyers paying most)
+            # Last entries = lowest asks (sellers wanting least)
+            yes_orders = orderbook.get('orderbook', {}).get('yes', [])
+            no_orders = orderbook.get('orderbook', {}).get('no', [])
             
-            if not yes_bids or not no_bids:
+            if not yes_orders or not no_orders:
                 return None
             
-            # Use market prices as fallback, but prefer orderbook
-            yes_price = market.get('yes_price', 50)
-            no_price = market.get('no_price', 50)
-            best_yes_bid = yes_bids[0][0] if yes_bids else yes_price
-            best_no_bid = no_bids[0][0] if no_bids else no_price
+            # Use market prices as fallback
+            yes_market_price = market.get('yes_price', 50)
+            no_market_price = market.get('no_price', 50)
             
-            # Calculate edge for YES side
-            yes_edge = self.weather_agg.calculate_edge(our_prob, int(best_yes_bid))
+            # For BUYING: we need to pay the ASK price (what sellers want)
+            # ASK = lowest price someone will sell at = last entry in sorted orderbook
+            # BID = highest price someone will buy at = first entry in sorted orderbook
+            best_yes_ask = yes_orders[-1][0] if len(yes_orders) > 0 else yes_market_price  # Lowest YES ask
+            best_no_ask = no_orders[-1][0] if len(no_orders) > 0 else no_market_price    # Lowest NO ask
             
-            # Calculate edge for NO side (inverse probability)
+            # Also get bids for reference (what other buyers are paying)
+            best_yes_bid = yes_orders[0][0] if yes_orders else yes_market_price
+            best_no_bid = no_orders[0][0] if no_orders else no_market_price
+            
+            # Calculate edge for YES side using ASK price (what we'd actually pay)
+            yes_edge = self.weather_agg.calculate_edge(our_prob, int(best_yes_ask))
+            
+            # Calculate edge for NO side (inverse probability) using ASK price
             no_prob = 1.0 - our_prob
-            no_edge = self.weather_agg.calculate_edge(no_prob, int(best_no_bid))
+            no_edge = self.weather_agg.calculate_edge(no_prob, int(best_no_ask))
             
-            # Calculate EV for both sides
-            # For YES: if we win, we get $1 per contract, if we lose we lose the price we paid
-            yes_stake = best_yes_bid / 100.0  # Convert cents to dollars
+            # Calculate EV for both sides using ASK prices (actual cost to enter)
+            # For YES: if we win, we get $1 per contract, if we lose we lose what we paid (ASK)
+            yes_stake = best_yes_ask / 100.0  # Convert cents to dollars
             yes_payout = 1.0  # $1 per contract if YES wins
             yes_ev = self.weather_agg.calculate_ev(our_prob, yes_payout, no_prob, yes_stake)
             
-            # For NO: if we win, we get $1 per contract, if we lose we lose the price we paid
-            no_stake = best_no_bid / 100.0
+            # For NO: if we win, we get $1 per contract, if we lose we lose what we paid (ASK)
+            no_stake = best_no_ask / 100.0
             no_payout = 1.0
             no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake)
             
@@ -732,40 +743,42 @@ class WeatherDailyStrategy(TradingStrategy):
             # Inspired by successful Polymarket bot: buy cheap certainty
             if self.longshot_enabled:
                 # Check YES side for longshot opportunity
-                if (best_yes_bid <= self.longshot_max_price and 
+                # Use ASK price to check if it's cheap enough
+                if (best_yes_ask <= self.longshot_max_price and 
                     our_prob >= (self.longshot_min_prob / 100.0) and 
                     yes_edge >= self.longshot_min_edge):
                     
                     position_size = min(self.max_position_size * self.longshot_position_multiplier, 
                                       self.max_position_size * 5)  # Cap at 5x
                     
-                    print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Market {best_yes_bid}¢ (cheap!), Our Prob: {our_prob:.1%}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f}")
-                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_yes_bid/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_bid):.1f}x)")
+                    print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f}")
+                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
                     return {
                         'action': 'buy',
                         'side': 'yes',
                         'count': position_size,
-                        'price': best_yes_bid + 1,
+                        'price': best_yes_ask,  # Pay the ask price to get filled
                         'edge': yes_edge,
                         'ev': yes_ev,
                         'strategy_mode': 'longshot'
                     }
                 
                 # Check NO side for longshot opportunity
-                if (best_no_bid <= self.longshot_max_price and 
+                # Use ASK price to check if it's cheap enough
+                if (best_no_ask <= self.longshot_max_price and 
                     no_prob >= (self.longshot_min_prob / 100.0) and 
                     no_edge >= self.longshot_min_edge):
                     
                     position_size = min(self.max_position_size * self.longshot_position_multiplier, 
                                       self.max_position_size * 5)
                     
-                    print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Market {best_no_bid}¢ (cheap!), Our Prob: {no_prob:.1%}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f}")
-                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_no_bid/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_bid):.1f}x)")
+                    print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f}")
+                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
                     return {
                         'action': 'buy',
                         'side': 'no',
                         'count': position_size,
-                        'price': best_no_bid + 1,
+                        'price': best_no_ask,  # Pay the ask price to get filled
                         'edge': no_edge,
                         'ev': no_ev,
                         'strategy_mode': 'longshot'
@@ -773,23 +786,23 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold:
-                print(f"[WeatherStrategy] ✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f}, Our Prob: {our_prob:.2%}, Market: {best_yes_bid}¢")
+                print(f"[WeatherStrategy] ✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f}, Our Prob: {our_prob:.2%}, Ask: {best_yes_ask}¢")
                 return {
                     'action': 'buy',
                     'side': 'yes',
                     'count': min(1, self.max_position_size),
-                    'price': best_yes_bid + 1,
+                    'price': best_yes_ask,  # Pay the ask price to get filled
                     'edge': yes_edge,
                     'ev': yes_ev,
                     'strategy_mode': 'conservative'
                 }
             elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold:
-                print(f"[WeatherStrategy] ✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f}, Our Prob: {no_prob:.2%}, Market: {best_no_bid}¢")
+                print(f"[WeatherStrategy] ✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f}, Our Prob: {no_prob:.2%}, Ask: {best_no_ask}¢")
                 return {
                     'action': 'buy',
                     'side': 'no',
                     'count': min(1, self.max_position_size),
-                    'price': best_no_bid + 1,
+                    'price': best_no_ask,  # Pay the ask price to get filled
                     'edge': no_edge,
                     'ev': no_ev,
                     'strategy_mode': 'conservative'
