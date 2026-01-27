@@ -34,7 +34,8 @@ if [ $HOUR -ge 6 ] && [ $HOUR -lt 22 ]; then
         rm -f bot_output.log nohup.out
         
         # Start bot
-        cd "$(dirname "$0")/.."
+        PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+        cd "$PROJECT_ROOT"
         nohup caffeinate -i python3 -u src/bot.py > bot_output.log 2>&1 &
         BOT_PID=$!
         

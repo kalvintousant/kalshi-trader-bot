@@ -207,7 +207,8 @@ class KalshiTradingBot:
                     
                     # Heartbeat logging to confirm bot is alive
                     if time.time() - last_heartbeat >= heartbeat_interval:
-                        balance = self.client.get_balance()
+                        portfolio = self.client.get_portfolio()
+                        balance = portfolio.get('balance', 0) / 100  # Convert cents to dollars
                         print(f"[Bot] ❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h, Balance: ${balance:.2f}, Daily P&L: ${self.daily_pnl:.2f}")
                         last_heartbeat = time.time()
                     
