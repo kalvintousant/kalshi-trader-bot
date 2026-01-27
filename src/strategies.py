@@ -742,7 +742,6 @@ class WeatherDailyStrategy(TradingStrategy):
             # Kalshi weather markets typically have 6 brackets
             # We'll create a fine-grained distribution first, then map to brackets
             mean_forecast = sum(forecasts) / len(forecasts)
-            std_forecast = (sum((x - mean_forecast)**2 for x in forecasts) / len(forecasts))**0.5 if len(forecasts) > 1 else 2.0
             
             # Create temperature ranges around the forecast (2-degree brackets)
             temp_ranges = []
@@ -750,8 +749,10 @@ class WeatherDailyStrategy(TradingStrategy):
             for i in range(20):  # 20 brackets of 2 degrees each = 40 degree range
                 temp_ranges.append((base_temp + i * 2, base_temp + (i + 1) * 2))
             
-            # Build probability distribution
-            prob_dist = self.weather_agg.build_probability_distribution(forecasts, temp_ranges)
+            # Build probability distribution with dynamic std and historical data
+            prob_dist = self.weather_agg.build_probability_distribution(
+                forecasts, temp_ranges, series_ticker, target_date
+            )
             
             if not prob_dist:
                 return None
@@ -811,16 +812,39 @@ class WeatherDailyStrategy(TradingStrategy):
             no_prob = 1.0 - our_prob
             no_edge = self.weather_agg.calculate_edge(no_prob, int(best_no_ask))
             
-            # Calculate EV for both sides using ASK prices (actual cost to enter)
-            # For YES: if we win, we get $1 per contract, if we lose we lose what we paid (ASK)
-            yes_stake = best_yes_ask / 100.0  # Convert cents to dollars
-            yes_payout = 1.0  # $1 per contract if YES wins
-            yes_ev = self.weather_agg.calculate_ev(our_prob, yes_payout, no_prob, yes_stake)
+            # Calculate confidence intervals for probability estimates
+            # For "above" markets, YES = temp > threshold
+            # For "below" markets, YES = temp < threshold
+            prob_ci_yes, (ci_lower_yes, ci_upper_yes) = self.weather_agg.calculate_confidence_interval(
+                forecasts, threshold, is_above=is_above_market
+            )
+            prob_ci_no = 1.0 - prob_ci_yes
+            ci_lower_no = 1.0 - ci_upper_yes
+            ci_upper_no = 1.0 - ci_lower_yes
             
-            # For NO: if we win, we get $1 per contract, if we lose we lose what we paid (ASK)
-            no_stake = best_no_ask / 100.0
+            # Estimate fill prices based on orderbook depth (for position sizing)
+            estimated_yes_price = self.weather_agg.estimate_fill_price(orderbook, 'yes', 
+                                                                       self.max_position_size * 5)
+            estimated_no_price = self.weather_agg.estimate_fill_price(orderbook, 'no', 
+                                                                      self.max_position_size * 5)
+            
+            # Use estimated fill price if significantly different from best ask
+            # (indicates we might experience slippage)
+            yes_price_for_ev = estimated_yes_price if abs(estimated_yes_price - best_yes_ask) > 2 else best_yes_ask
+            no_price_for_ev = estimated_no_price if abs(estimated_no_price - best_no_ask) > 2 else best_no_ask
+            
+            # Calculate EV for both sides using estimated fill prices and INCLUDING FEES
+            # For YES: if we win, we get $1 per contract, if we lose we lose what we paid
+            yes_stake = yes_price_for_ev / 100.0  # Convert cents to dollars
+            yes_payout = 1.0  # $1 per contract if YES wins
+            yes_ev = self.weather_agg.calculate_ev(our_prob, yes_payout, no_prob, yes_stake, 
+                                                   include_fees=True, fee_rate=0.05)
+            
+            # For NO: if we win, we get $1 per contract, if we lose we lose what we paid
+            no_stake = no_price_for_ev / 100.0
             no_payout = 1.0
-            no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake)
+            no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake,
+                                                  include_fees=True, fee_rate=0.05)
             
             # DUAL STRATEGY: Check both conservative and longshot modes
             
@@ -833,16 +857,32 @@ class WeatherDailyStrategy(TradingStrategy):
                     our_prob >= (self.longshot_min_prob / 100.0) and 
                     yes_edge >= self.longshot_min_edge):
                     
-                    # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
-                    base_position = min(self.max_position_size * self.longshot_position_multiplier, 
-                                       self.max_position_size * 5)  # Cap at 5x
+                    # Calculate position size using Kelly Criterion (if high confidence) or fixed multiplier
+                    # Check confidence: only use Kelly if CI doesn't overlap with market price
+                    use_kelly = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
+                    
+                    if use_kelly and len(forecasts) >= 2:
+                        # Use Kelly Criterion for optimal position sizing
+                        payout_ratio = 1.0 / (best_yes_ask / 100.0)  # Payout / Stake
+                        kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.5)
+                        # Get portfolio value for Kelly calculation
+                        portfolio = self.client.get_portfolio()
+                        portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
+                        kelly_position = int(kelly_fraction * portfolio_value / (best_yes_ask / 100.0))
+                        base_position = min(kelly_position, self.max_position_size * 5)
+                    else:
+                        # Use fixed multiplier for longshot
+                        base_position = min(self.max_position_size * self.longshot_position_multiplier, 
+                                           self.max_position_size * 5)  # Cap at 5x
+                    
                     # Cap by contract count (25 contracts)
                     contract_cap = Config.MAX_CONTRACTS_PER_MARKET
                     # Cap by dollar amount ($3.00 = 300 cents)
                     dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_yes_ask) if best_yes_ask > 0 else contract_cap
                     position_size = min(base_position, contract_cap, dollar_cap_contracts)
                     
-                    print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f}")
+                    confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
+                    print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
                     print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
                     return {
                         'action': 'buy',
@@ -860,16 +900,32 @@ class WeatherDailyStrategy(TradingStrategy):
                     no_prob >= (self.longshot_min_prob / 100.0) and 
                     no_edge >= self.longshot_min_edge):
                     
-                    # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
-                    base_position = min(self.max_position_size * self.longshot_position_multiplier, 
-                                       self.max_position_size * 5)  # Cap at 5x
+                    # Calculate position size using Kelly Criterion (if high confidence) or fixed multiplier
+                    # Check confidence: only use Kelly if CI doesn't overlap with market price
+                    use_kelly = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
+                    
+                    if use_kelly and len(forecasts) >= 2:
+                        # Use Kelly Criterion for optimal position sizing
+                        payout_ratio = 1.0 / (best_no_ask / 100.0)  # Payout / Stake
+                        kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.5)
+                        # Get portfolio value for Kelly calculation
+                        portfolio = self.client.get_portfolio()
+                        portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
+                        kelly_position = int(kelly_fraction * portfolio_value / (best_no_ask / 100.0))
+                        base_position = min(kelly_position, self.max_position_size * 5)
+                    else:
+                        # Use fixed multiplier for longshot
+                        base_position = min(self.max_position_size * self.longshot_position_multiplier, 
+                                           self.max_position_size * 5)  # Cap at 5x
+                    
                     # Cap by contract count (25 contracts)
                     contract_cap = Config.MAX_CONTRACTS_PER_MARKET
                     # Cap by dollar amount ($3.00 = 300 cents)
                     dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_no_ask) if best_no_ask > 0 else contract_cap
                     position_size = min(base_position, contract_cap, dollar_cap_contracts)
                     
-                    print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f}")
+                    confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
+                    print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
                     print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
                     return {
                         'action': 'buy',
@@ -882,14 +938,28 @@ class WeatherDailyStrategy(TradingStrategy):
                     }
             
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
-            if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold:
+            # Only trade if confidence interval doesn't overlap with market price (high confidence)
+            high_confidence_yes = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
+            high_confidence_no = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
+            
+            if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold and high_confidence_yes:
                 # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
-                base_position = min(1, self.max_position_size)
+                # Optionally use Kelly Criterion for conservative trades with very high confidence
+                if len(forecasts) >= 2 and our_prob > 0.7:  # Only for high-probability trades
+                    payout_ratio = 1.0 / (best_yes_ask / 100.0)
+                    kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.25)  # Very conservative
+                    portfolio = self.client.get_portfolio()
+                    portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
+                    kelly_position = int(kelly_fraction * portfolio_value / (best_yes_ask / 100.0))
+                    base_position = min(max(kelly_position, self.max_position_size), self.max_position_size * 2)
+                else:
+                    base_position = self.max_position_size
+                
                 contract_cap = Config.MAX_CONTRACTS_PER_MARKET
                 dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_yes_ask) if best_yes_ask > 0 else contract_cap
                 position_size = min(base_position, contract_cap, dollar_cap_contracts)
                 
-                print(f"[WeatherStrategy] ✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f}, Our Prob: {our_prob:.2%}, Ask: {best_yes_ask}¢")
+                print(f"[WeatherStrategy] ✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
                 return {
                     'action': 'buy',
                     'side': 'yes',
@@ -899,14 +969,24 @@ class WeatherDailyStrategy(TradingStrategy):
                     'ev': yes_ev,
                     'strategy_mode': 'conservative'
                 }
-            elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold:
+            elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and high_confidence_no:
                 # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
-                base_position = min(1, self.max_position_size)
+                # Optionally use Kelly Criterion for conservative trades with very high confidence
+                if len(forecasts) >= 2 and no_prob > 0.7:  # Only for high-probability trades
+                    payout_ratio = 1.0 / (best_no_ask / 100.0)
+                    kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.25)  # Very conservative
+                    portfolio = self.client.get_portfolio()
+                    portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
+                    kelly_position = int(kelly_fraction * portfolio_value / (best_no_ask / 100.0))
+                    base_position = min(max(kelly_position, self.max_position_size), self.max_position_size * 2)
+                else:
+                    base_position = self.max_position_size
+                
                 contract_cap = Config.MAX_CONTRACTS_PER_MARKET
                 dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_no_ask) if best_no_ask > 0 else contract_cap
                 position_size = min(base_position, contract_cap, dollar_cap_contracts)
                 
-                print(f"[WeatherStrategy] ✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f}, Our Prob: {no_prob:.2%}, Ask: {best_no_ask}¢")
+                print(f"[WeatherStrategy] ✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
                 return {
                     'action': 'buy',
                     'side': 'no',

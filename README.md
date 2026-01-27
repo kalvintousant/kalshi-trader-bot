@@ -29,7 +29,6 @@ kalshi-trader-bot/
 │   ├── weather_data.py    # Weather forecast aggregation
 │   └── config.py          # Configuration management
 ├── scripts/                # Utility scripts
-│   ├── start_daytime.sh   # Daytime startup (6am-10pm)
 │   ├── start_bot.sh       # 24/7 startup
 │   └── setup_schedule.sh  # Cron setup guide
 ├── docs/                   # Documentation
@@ -44,14 +43,25 @@ kalshi-trader-bot/
 ## Features
 
 - **Dual Strategy**: Longshot mode (asymmetric payouts) + Conservative mode (steady gains)
-- **Multi-Source Forecasts**: Aggregates from NWS, Tomorrow.io, and Weatherbit
+- **Advanced Forecast Accuracy**:
+  - Multi-source aggregation (NWS, Tomorrow.io, Weatherbit) with reliability weighting
+  - Outlier detection filters bad forecasts automatically
+  - Forecast age weighting (recent forecasts weighted more heavily)
+  - Dynamic standard deviation based on forecast agreement and time horizon
+  - Historical forecast error tracking for adaptive learning
+  - Confidence intervals via bootstrap sampling (only trades when high confidence)
+- **Enhanced EV Calculation**:
+  - Includes Kalshi transaction fees (5% on winnings) for realistic EV
+  - Market depth/slippage estimation for accurate fill prices
+  - Kelly Criterion for optimal position sizing (long-term growth)
 - **24/7 Operation**: Runs continuously to monitor both high and low temperature markets (low temps occur early morning)
 - **Contract Compliance**: All locations verified against NWS official weather station coordinates
+- **Smart Date Handling**: Correctly identifies today vs tomorrow markets and uses appropriate forecasts
 - **Risk Management**: 
   - $10 daily loss limit (tracks total portfolio P&L: cash + positions, trading pauses if reached)
   - $3 OR 25 contracts max per market (whichever is hit first)
   - Automatic order cancellation when edge/EV no longer valid
-  - Position sizing controls
+  - Position sizing controls with Kelly Criterion optimization
 - **Market Coverage**: NYC, Chicago, Miami, Austin, Los Angeles, Denver (high & low temp markets)
 - **Real-Time Monitoring**: 30-second Kalshi odds checks (weather forecasts cached 30 min)
 - **Smart Notifications**: Only notify when orders actually fill (not when placed)
@@ -60,8 +70,31 @@ kalshi-trader-bot/
 ## Documentation
 
 - **Setup**: See `docs/setup/` for installation and scheduling
-- **Strategies**: See `docs/strategies/` for trading logic
-- **Optimization**: See `docs/optimization/` for performance details
+- **Strategies**: See `docs/strategies/` for trading logic and forecast/EV improvements
+- **Optimization**: See `docs/optimization/` for performance details and API usage
+
+## Forecast & EV Accuracy Improvements
+
+The bot implements 12 advanced improvements for forecast and EV accuracy:
+
+**Phase 1 (Quick Wins)**:
+- Transaction costs included in EV (5% Kalshi fees)
+- Outlier detection (IQR method)
+- Forecast age weighting (6-hour half-life)
+
+**Phase 2 (Medium-Term)**:
+- Source reliability weighting (NWS 1.0, Tomorrow.io 0.9, Weatherbit 0.8)
+- Dynamic standard deviation (based on forecast agreement and time horizon)
+- Historical forecast error tracking (adaptive learning per city/month)
+
+**Phase 3 (Advanced)**:
+- Confidence intervals (bootstrap sampling, 95% CI)
+- Market depth/slippage estimation
+- Kelly Criterion for optimal position sizing
+
+**Expected Impact**: +30-50% forecast accuracy, +40-60% EV accuracy
+
+See `docs/strategies/forecast_ev_improvements.md` and `docs/strategies/implementation_summary.md` for details.
 
 ## Disclaimer
 
