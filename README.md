@@ -53,6 +53,15 @@ kalshi-trader-bot/
 - **Strategies**: See `docs/strategies/` for trading logic
 - **Optimization**: See `docs/optimization/` for performance details
 
+## Disclaimer
+
+**This software is for educational and research purposes only.**
+
+- Trading involves substantial risk of loss
+- Past performance does not guarantee future results
+- Users are responsible for compliance with all applicable laws and exchange terms
+- The authors are not responsible for any trading losses
+
 ## License
 
 Private repository - All rights reserved.
