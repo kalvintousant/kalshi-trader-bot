@@ -52,7 +52,7 @@ kalshi-trader-bot/
   - $3 OR 25 contracts max per market (whichever is hit first)
   - Automatic order cancellation when edge/EV no longer valid
   - Position sizing controls
-- **Market Coverage**: NYC, Chicago, Miami, Austin, Los Angeles (high & low temp markets)
+- **Market Coverage**: NYC, Chicago, Miami, Austin, Los Angeles, Denver (high & low temp markets)
 - **Real-Time Monitoring**: 30-second Kalshi odds checks (weather forecasts cached 30 min)
 - **Smart Notifications**: Only notify when orders actually fill (not when placed)
 - **API Optimization**: All weather APIs within free tier limits (NWS unlimited, Tomorrow.io 500/day, Weatherbit 50/day as emergency fallback)

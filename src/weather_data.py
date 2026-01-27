@@ -30,17 +30,20 @@ class WeatherDataAggregator:
         'KXHIGHNY': {'lat': 40.7711, 'lon': -73.9742, 'name': 'Central Park, New York'},
         'KXLOWNY': {'lat': 40.7711, 'lon': -73.9742, 'name': 'Central Park, New York'},
         # Chicago - Midway Airport (CHIHIGH contract: "Chicago Midway, Illinois")
-        'KXHIGHCH': {'lat': 41.7868, 'lon': -87.7522, 'name': 'Chicago Midway Airport'},
-        'KXLOWCH': {'lat': 41.7868, 'lon': -87.7522, 'name': 'Chicago Midway Airport'},
+        'KXHIGHCHI': {'lat': 41.7868, 'lon': -87.7522, 'name': 'Chicago Midway Airport'},
+        'KXLOWCHI': {'lat': 41.7868, 'lon': -87.7522, 'name': 'Chicago Midway Airport'},
         # Miami - Miami International Airport (MIHIGH contract - likely MIA)
-        'KXHIGHMI': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
-        'KXLOWMI': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
+        'KXHIGHMIA': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
+        'KXLOWMIA': {'lat': 25.7932, 'lon': -80.2906, 'name': 'Miami International Airport'},
         # Austin - Austin Bergstrom International Airport (AUSHIGH contract: "Austin Bergstrom")
         'KXHIGHAUS': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
         'KXLOWAUS': {'lat': 30.1831, 'lon': -97.6799, 'name': 'Austin Bergstrom International Airport'},
         # Los Angeles - Los Angeles International Airport (LAXHIGH contract - likely LAX)
         'KXHIGHLAX': {'lat': 33.9425, 'lon': -118.4081, 'name': 'Los Angeles International Airport'},
         'KXLOWLAX': {'lat': 33.9425, 'lon': -118.4081, 'name': 'Los Angeles International Airport'},
+        # Denver - Denver International Airport (DENHIGH contract - likely DEN)
+        'KXHIGHDEN': {'lat': 39.8561, 'lon': -104.6737, 'name': 'Denver International Airport'},
+        'KXLOWDEN': {'lat': 39.8561, 'lon': -104.6737, 'name': 'Denver International Airport'},
     }
     
     def __init__(self):

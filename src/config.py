@@ -20,13 +20,14 @@ class Config:
     # Market Tickers
     BTC_15M_SERIES = 'KXBTC15M'  # 15-minute BTC markets (up/down)
     BTC_HOURLY_SERIES = 'KXBTC'  # Hourly BTC markets (price ranges)
-    # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles
+    # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles, Denver
     WEATHER_SERIES = [
-        'KXHIGHNY', 'KXLOWNY',   # New York City
-        'KXHIGHCH', 'KXLOWCH',   # Chicago
-        'KXHIGHMI', 'KXLOWMI',   # Miami
-        'KXHIGHAUS', 'KXLOWAUS',   # Austin
-        'KXHIGHLAX', 'KXLOWLAX'  # Los Angeles
+        'KXHIGHNY', 'KXLOWNY',      # New York City
+        'KXHIGHCHI', 'KXLOWCHI',    # Chicago (corrected from KXHIGHCH)
+        'KXHIGHMIA', 'KXLOWMIA',    # Miami (corrected from KXHIGHMI)
+        'KXHIGHAUS', 'KXLOWAUS',    # Austin
+        'KXHIGHLAX', 'KXLOWLAX',    # Los Angeles
+        'KXHIGHDEN', 'KXLOWDEN'     # Denver
     ]
     
     @classmethod
