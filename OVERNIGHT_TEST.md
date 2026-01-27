@@ -20,7 +20,7 @@ Before running overnight, test for a few minutes:
 
 ```bash
 cd "/Users/kalvintousant/Desktop/Kalshi Trader Bot"
-python3 test_bot.py
+python3 bot.py
 ```
 
 Watch for:
@@ -37,7 +37,7 @@ Press `Ctrl+C` to stop after 5-10 minutes.
 
 ```bash
 cd "/Users/kalvintousant/Desktop/Kalshi Trader Bot"
-python3 test_bot.py
+python3 bot.py
 ```
 
 **Keep terminal open** - the bot will run until you stop it or hit daily loss limit.
@@ -46,7 +46,7 @@ python3 test_bot.py
 
 ```bash
 cd "/Users/kalvintousant/Desktop/Kalshi Trader Bot"
-nohup python3 test_bot.py > bot.log 2>&1 &
+nohup python3 bot.py > bot.log 2>&1 &
 ```
 
 Check logs:
@@ -56,7 +56,7 @@ tail -f bot.log
 
 Stop the bot:
 ```bash
-pkill -f test_bot.py
+pkill -f bot.py
 ```
 
 ## Safety Features

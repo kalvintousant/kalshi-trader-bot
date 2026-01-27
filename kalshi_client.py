@@ -117,8 +117,14 @@ class KalshiClient:
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
+                # Handle rate limiting (429) and other retryable errors
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
+                    if hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                        # Rate limited - use longer backoff
+                        wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
+                        print(f"[API] Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    else:
+                        wait_time = 2 ** attempt
                     time.sleep(wait_time)
                     continue
                 raise
@@ -135,8 +141,14 @@ class KalshiClient:
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
+                # Handle rate limiting (429) and other retryable errors
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
+                    if hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                        # Rate limited - use longer backoff
+                        wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
+                        print(f"[API] Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    else:
+                        wait_time = 2 ** attempt
                     time.sleep(wait_time)
                     continue
                 raise
@@ -153,8 +165,14 @@ class KalshiClient:
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
+                # Handle rate limiting (429) and other retryable errors
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
+                    if hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                        # Rate limited - use longer backoff
+                        wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
+                        print(f"[API] Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    else:
+                        wait_time = 2 ** attempt
                     time.sleep(wait_time)
                     continue
                 raise

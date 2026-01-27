@@ -69,7 +69,7 @@ caffeinate -i python3 -u bot.py > bot_output.log 2>&1 &
 ```
 
 The bot will:
-- Scan open markets every 10 seconds (BTC) or 15 seconds (weather)
+- Scan markets adaptively: 5 seconds (BTC 15-min), 10 seconds (BTC hourly), or 15 seconds (weather)
 - Evaluate markets using enabled strategies
 - Place trades when opportunities are identified
 - Send macOS notifications for each trade
@@ -99,7 +99,8 @@ Edit `.env` to customize:
 - `MAX_POSITION_SIZE`: Maximum contracts per trade (default: 10)
 - `MAX_DAILY_LOSS`: Stop trading if daily loss exceeds this (default: $100)
 - `ENABLED_STRATEGIES`: Comma-separated list:
-  - `btc_hourly` - Hourly BTC latency arbitrage
+  - `btc_15m` - 15-minute BTC latency arbitrage (KXBTC15M - up/down markets)
+  - `btc_hourly` - Hourly BTC latency arbitrage (KXBTC - price range markets)
   - `weather_daily` - Daily weather markets with multi-source forecasts
 
 Example:
@@ -163,19 +164,24 @@ See [WEATHER_STRATEGY.md](WEATHER_STRATEGY.md) and [BTC_STRATEGY.md](BTC_STRATEG
 
 ```
 .
-├── bot.py                 # Main bot orchestrator
-├── strategies.py          # Trading strategies (BTC, Weather)
-├── kalshi_client.py       # Kalshi API client with authentication
-├── btc_data.py            # BTC price tracking from Binance
-├── weather_data.py        # Multi-source weather forecast aggregation
-├── config.py              # Configuration management
-├── requirements.txt       # Python dependencies
-├── .env.example           # Environment variable template
-├── README.md              # This file
-├── BTC_STRATEGY.md        # Detailed BTC strategy documentation
-├── WEATHER_STRATEGY.md    # Detailed weather strategy documentation
-├── CONTRACT_COMPLIANCE.md # Kalshi contract rules compliance
-└── PERFORMANCE_IMPROVEMENTS.md # Performance optimizations
+├── bot.py                       # Main bot orchestrator
+├── strategies.py                # Trading strategies (BTC 15-min, BTC hourly, Weather)
+├── kalshi_client.py             # Kalshi API client with authentication
+├── btc_data.py                  # BTC price tracking from Binance
+├── weather_data.py              # Multi-source weather forecast aggregation
+├── config.py                    # Configuration management
+├── requirements.txt             # Python dependencies
+├── .env.example                 # Environment variable template
+├── README.md                    # This file
+├── BTC_15MIN_STRATEGY.md        # 15-minute BTC strategy documentation
+├── BTC_STRATEGY.md              # Hourly BTC strategy documentation
+├── WEATHER_STRATEGY.md          # Weather strategy documentation
+├── CONTRACT_COMPLIANCE.md       # Hourly BTC contract compliance
+├── CRYPTO15M_COMPLIANCE.md      # 15-minute BTC contract compliance
+├── PERFORMANCE_IMPROVEMENTS.md  # Performance optimizations
+├── OPTIMIZATION_RECOMMENDATIONS.md # Further optimization suggestions
+├── KEEP_RUNNING.md              # Guide for keeping bot running
+└── OVERNIGHT_TEST.md            # Overnight testing guide
 ```
 
 ## Extending the Bot

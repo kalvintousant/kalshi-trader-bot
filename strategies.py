@@ -145,7 +145,8 @@ class BTCHourlyStrategy(TradingStrategy):
             return False
         
         # Check if market has sufficient volume (liquidity requirement)
-        if market.get('volume', 0) < 5:
+        # Minimum volume threshold to ensure adequate liquidity
+        if market.get('volume', 0) < 20:
             return False
         
         return True
@@ -379,7 +380,8 @@ class BTC15MinStrategy(TradingStrategy):
             return False
         
         # Check if market has sufficient volume (liquidity requirement)
-        if market.get('volume', 0) < 5:
+        # Minimum volume threshold to ensure adequate liquidity
+        if market.get('volume', 0) < 20:
             return False
         
         return True

@@ -1,8 +1,10 @@
-# BTC Latency Arbitrage Strategy
+# BTC Hourly Latency Arbitrage Strategy
 
 ## Overview
 
-This strategy implements the exact loop described: tracking real-time BTC moves from Binance and trading during the lag window when Kalshi pricing hasn't caught up.
+This strategy implements latency arbitrage for **hourly BTC markets** (KXBTC): tracking real-time BTC moves from Binance and trading during the lag window when Kalshi pricing hasn't caught up.
+
+**Note**: For 15-minute BTC markets (KXBTC15M), see [BTC_15MIN_STRATEGY.md](BTC_15MIN_STRATEGY.md)
 
 ## How It Works
 
@@ -66,15 +68,15 @@ Automatically exits when:
 
 ## Example Trade
 
-**Scenario: BTC Pumps**
+**Scenario: BTC Pumps (1-Hour Market)**
 
-1. **Binance**: BTC moves +0.5% in last 15 minutes
+1. **Binance**: BTC moves +0.5% in last 1 hour
 2. **Momentum detected**: 0.5% move, volatility 0.3%
 3. **Expected Kalshi price**: YES should be ~55¢ (50 + 0.5% × 10)
 4. **Actual Kalshi price**: YES at 48¢ (hasn't caught up)
 5. **Mispricing**: 7 cents (55 - 48)
 6. **Action**: Buy YES at 49¢
-7. **Exit**: When YES price moves to ~53¢ or higher (pricing caught up)
+7. **Exit**: When YES price moves to ~53¢ or higher (pricing caught up), after minimum 30-second hold
 
 ## Configuration
 
