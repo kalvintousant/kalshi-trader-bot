@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import requests
 from datetime import datetime
 from typing import Dict, List, Set
 from kalshi_client import KalshiClient
@@ -204,11 +205,21 @@ class KalshiTradingBot:
                 print("[Bot] Scan interval: 30 minutes (optimized for daily weather markets - matches forecast cache)")
             else:
                 print("[Bot] Scan interval: 15 seconds")
+            # Heartbeat interval (log every 30 minutes for weather, every hour for BTC)
+            heartbeat_interval = 1800 if 'weather_daily' in Config.ENABLED_STRATEGIES else 3600
+            last_heartbeat = time.time()
+            
             while self.running:
                 try:
                     scan_start = time.time()
                     self.scan_and_trade()
                     scan_duration = time.time() - scan_start
+                    
+                    # Heartbeat logging to confirm bot is alive
+                    if time.time() - last_heartbeat >= heartbeat_interval:
+                        balance = self.client.get_balance()
+                        print(f"[Bot] ❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h, Balance: ${balance:.2f}, Daily P&L: ${self.daily_pnl:.2f}")
+                        last_heartbeat = time.time()
                     
                     # Adaptive scan intervals based on market type
                     # BTC 15-min: 0.5s (ultra-fast for new market detection)
@@ -225,12 +236,22 @@ class KalshiTradingBot:
                     
                     if sleep_time > 0:
                         time.sleep(sleep_time)
+                        
                 except KeyboardInterrupt:
                     print("\n[Bot] Shutting down...")
                     self.running = False
+                except ConnectionError as e:
+                    print(f"[Bot] ⚠️  Connection error: {e}. Retrying in 30 seconds...")
+                    time.sleep(30)
+                except requests.exceptions.RequestException as e:
+                    print(f"[Bot] ⚠️  Network error: {e}. Retrying in 30 seconds...")
+                    time.sleep(30)
                 except Exception as e:
-                    print(f"[Bot] Error in main loop: {e}")
-                    time.sleep(5)
+                    print(f"[Bot] ⚠️  Unexpected error in main loop: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("[Bot] Continuing in 60 seconds...")
+                    time.sleep(60)
     
     def stop(self):
         """Stop the bot"""
