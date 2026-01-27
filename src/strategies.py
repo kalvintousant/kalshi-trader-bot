@@ -610,7 +610,20 @@ class WeatherDailyStrategy(TradingStrategy):
         4. Trade when edge > threshold
         """
         try:
-            series_ticker = market.get('series_ticker', '')
+            # Get series ticker - try multiple fields, fallback to ticker prefix
+            series_ticker = market.get('series_ticker') or market.get('series_ticker_symbol') or ''
+            ticker = market.get('ticker', '')
+            
+            # If series_ticker is empty, extract from ticker (e.g., KXHIGHNY-26JAN28-T26 -> KXHIGHNY)
+            if not series_ticker and ticker:
+                for weather_series in Config.WEATHER_SERIES:
+                    if ticker.startswith(weather_series):
+                        series_ticker = weather_series
+                        break
+            
+            if not series_ticker:
+                print(f"[WeatherStrategy] ⚠️  Could not determine series for market: {ticker}")
+                return None
             
             # Extract target date from market (usually tomorrow or today)
             # Kalshi weather markets are typically for the next day
