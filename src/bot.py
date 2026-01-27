@@ -14,3 +14,9 @@ from src.kalshi_client import KalshiClient
 from src.strategies import StrategyManager
 from src.config import Config
 
+sys.path.insert(0, project_root)
+
+from src.kalshi_client import KalshiClient
+from src.strategies import StrategyManager
+from src.config import Config
+
