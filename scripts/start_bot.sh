@@ -20,7 +20,7 @@ echo "✅ Cleaned old logs"
 echo ""
 
 # Start bot with full persistence
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 nohup caffeinate -i python3 -u bot.py > bot_output.log 2>&1 &
 BOT_PID=$!
 
