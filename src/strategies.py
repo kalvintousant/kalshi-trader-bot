@@ -96,18 +96,15 @@ class TradingStrategy:
             pass
 
 
+# BTC strategies removed - focusing on weather markets only
+"""
+# BTC strategies removed - focusing on weather markets only
+"""
 class BTCHourlyStrategy(TradingStrategy):
-    """
-    Latency Arbitrage Strategy for Hourly BTC markets
-    Tracks real-time BTC moves from Binance and trades during lag window when Kalshi pricing hasn't caught up.
+    # Latency Arbitrage Strategy for Hourly BTC markets - REMOVED
+    # Focusing on weather markets only
     
-    Contract Rules Compliance:
-    - Uses CF Bitcoin Real-Time Index (BRTI) equivalent (Binance spot price as proxy)
-    - Tracks price movements over 1-hour periods to match hourly market expiration
-    - Respects expiration times and last trading dates per contract rules
-    """
-    
-    def __init__(self, client: KalshiClient, btc_tracker: Optional[BTCPriceTracker] = None):
+    def __init__(self, client: KalshiClient, btc_tracker=None):
         super().__init__(client)
         self.max_position_size = Config.MAX_POSITION_SIZE
         
@@ -326,22 +323,15 @@ class BTCHourlyStrategy(TradingStrategy):
             return None
 
 
+# BTC strategies removed - focusing on weather markets only
+"""
+# BTC strategies removed - focusing on weather markets only
+"""
 class BTC15MinStrategy(TradingStrategy):
-    """
-    Latency Arbitrage Strategy for 15-minute BTC markets (KXBTC15M)
-    Tracks real-time BTC moves from Binance and trades during lag window when Kalshi pricing hasn't caught up.
+    # Latency Arbitrage Strategy for 15-minute BTC markets - REMOVED
+    # Focusing on weather markets only
     
-    This strategy is optimized for the "Bitcoin price up or down in next 15 mins" markets.
-    Uses 15-minute price change calculations for faster reaction to BTC movements.
-    
-    Contract Rules Compliance (CRYPTO15M):
-    - Uses CF Benchmarks index (BRTI) equivalent (Binance spot price as proxy)
-    - Contract settles on 60-second average prior to expiration, but we track 15-min moves for latency detection
-    - Respects Last Trading Date/Time by only trading markets with status='open'
-    - Position Accountability Level: $25,000 per strike (we use MAX_POSITION_SIZE)
-    """
-    
-    def __init__(self, client: KalshiClient, btc_tracker: Optional[BTCPriceTracker] = None):
+    def __init__(self, client: KalshiClient, btc_tracker=None):
         super().__init__(client)
         self.max_position_size = Config.MAX_POSITION_SIZE
         
@@ -549,7 +539,10 @@ class BTC15MinStrategy(TradingStrategy):
         except Exception as e:
             print(f"[BTC15MinStrategy] Error in _check_exit: {e}")
             return None
+"""
 
+
+"""
 
 class WeatherDailyStrategy(TradingStrategy):
     """
@@ -778,16 +771,11 @@ class WeatherDailyStrategy(TradingStrategy):
 class StrategyManager:
     """Manages multiple trading strategies"""
     
-    def __init__(self, client: KalshiClient, btc_tracker: Optional[BTCPriceTracker] = None):
+    def __init__(self, client: KalshiClient, btc_tracker=None):
         self.client = client
         self.strategies = []
         
-        # Share BTC tracker across strategies for efficiency
-        if 'btc_15m' in Config.ENABLED_STRATEGIES:
-            self.strategies.append(BTC15MinStrategy(client, btc_tracker=btc_tracker))
-        if 'btc_hourly' in Config.ENABLED_STRATEGIES:
-            self.strategies.append(BTCHourlyStrategy(client, btc_tracker=btc_tracker))
-        
+        # Focus on weather markets only
         if 'weather_daily' in Config.ENABLED_STRATEGIES:
             self.strategies.append(WeatherDailyStrategy(client))
     
