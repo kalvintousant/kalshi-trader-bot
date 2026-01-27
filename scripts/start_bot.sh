@@ -21,7 +21,7 @@ echo ""
 
 # Start bot with full persistence
 cd "$(dirname "$0")/.."
-nohup caffeinate -i python3 -u bot.py > bot_output.log 2>&1 &
+nohup caffeinate -i python3 -u src/bot.py > bot_output.log 2>&1 &
 BOT_PID=$!
 
 echo "🚀 Bot started successfully!"
