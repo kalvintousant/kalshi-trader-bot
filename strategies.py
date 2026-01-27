@@ -561,9 +561,18 @@ class WeatherDailyStrategy(TradingStrategy):
     def __init__(self, client: KalshiClient):
         super().__init__(client)
         self.max_position_size = Config.MAX_POSITION_SIZE
-        # Optimized parameters for production (balanced approach)
+        
+        # Conservative strategy parameters (high win rate)
         self.min_edge_threshold = 5.0  # Minimum edge % to trade (5% ensures quality)
-        self.min_ev_threshold = 0.01  # Minimum EV in dollars ($0.01 for better ROI, up from $0.001)
+        self.min_ev_threshold = 0.01  # Minimum EV in dollars ($0.01 for better ROI)
+        
+        # Longshot strategy parameters (asymmetric payouts)
+        # Inspired by successful Polymarket weather bot: buy cheap certainty
+        self.longshot_enabled = True  # Enable longshot mode
+        self.longshot_max_price = 10  # Only consider if market price ≤ 10¢ (10%)
+        self.longshot_min_edge = 30.0  # Require massive edge (30%+)
+        self.longshot_min_prob = 50.0  # Our probability must be ≥ 50% (forecast certainty)
+        self.longshot_position_multiplier = 3  # Trade 3x normal size for longshots
         
         # Weather data aggregator (shared instance)
         self.weather_agg = WeatherDataAggregator()
@@ -689,26 +698,73 @@ class WeatherDailyStrategy(TradingStrategy):
             no_payout = 1.0
             no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake)
             
-            # Trade on the side with positive edge and EV
+            # DUAL STRATEGY: Check both conservative and longshot modes
+            
+            # LONGSHOT MODE: Hunt for extreme mispricings (0.1-10% odds with massive edges)
+            # Inspired by successful Polymarket bot: buy cheap certainty
+            if self.longshot_enabled:
+                # Check YES side for longshot opportunity
+                if (best_yes_bid <= self.longshot_max_price and 
+                    our_prob >= (self.longshot_min_prob / 100.0) and 
+                    yes_edge >= self.longshot_min_edge):
+                    
+                    position_size = min(self.max_position_size * self.longshot_position_multiplier, 
+                                      self.max_position_size * 5)  # Cap at 5x
+                    
+                    print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Market {best_yes_bid}¢ (cheap!), Our Prob: {our_prob:.1%}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f}")
+                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_yes_bid/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_bid):.1f}x)")
+                    return {
+                        'action': 'buy',
+                        'side': 'yes',
+                        'count': position_size,
+                        'price': best_yes_bid + 1,
+                        'edge': yes_edge,
+                        'ev': yes_ev,
+                        'strategy_mode': 'longshot'
+                    }
+                
+                # Check NO side for longshot opportunity
+                if (best_no_bid <= self.longshot_max_price and 
+                    no_prob >= (self.longshot_min_prob / 100.0) and 
+                    no_edge >= self.longshot_min_edge):
+                    
+                    position_size = min(self.max_position_size * self.longshot_position_multiplier, 
+                                      self.max_position_size * 5)
+                    
+                    print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Market {best_no_bid}¢ (cheap!), Our Prob: {no_prob:.1%}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f}")
+                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_no_bid/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_bid):.1f}x)")
+                    return {
+                        'action': 'buy',
+                        'side': 'no',
+                        'count': position_size,
+                        'price': best_no_bid + 1,
+                        'edge': no_edge,
+                        'ev': no_ev,
+                        'strategy_mode': 'longshot'
+                    }
+            
+            # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold:
-                print(f"[WeatherStrategy] YES Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f}, Our Prob: {our_prob:.2%}, Market: {best_yes_bid}¢")
+                print(f"[WeatherStrategy] ✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f}, Our Prob: {our_prob:.2%}, Market: {best_yes_bid}¢")
                 return {
                     'action': 'buy',
                     'side': 'yes',
                     'count': min(1, self.max_position_size),
-                    'price': best_yes_bid + 1,  # Slightly above best bid
+                    'price': best_yes_bid + 1,
                     'edge': yes_edge,
-                    'ev': yes_ev
+                    'ev': yes_ev,
+                    'strategy_mode': 'conservative'
                 }
             elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold:
-                print(f"[WeatherStrategy] NO Edge: {no_edge:.2f}%, EV: ${no_ev:.4f}, Our Prob: {no_prob:.2%}, Market: {best_no_bid}¢")
+                print(f"[WeatherStrategy] ✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f}, Our Prob: {no_prob:.2%}, Market: {best_no_bid}¢")
                 return {
                     'action': 'buy',
                     'side': 'no',
                     'count': min(1, self.max_position_size),
                     'price': best_no_bid + 1,
                     'edge': no_edge,
-                    'ev': no_ev
+                    'ev': no_ev,
+                    'strategy_mode': 'conservative'
                 }
             
             return None

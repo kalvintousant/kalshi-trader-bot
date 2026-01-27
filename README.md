@@ -144,18 +144,31 @@ ENABLED_STRATEGIES=btc_hourly
 
 ### Weather Daily Strategy (Edge + EV)
 
-**How it works:**
-1. Aggregates forecasts from multiple weather APIs (3 sources)
-2. Builds probability distributions over temperature ranges using normal distribution
-3. Calculates edge: `(Your Probability - Market Price) × 100`
-4. Calculates EV: `(Win Prob × Payout) - (Loss Prob × Stake)`
-5. Trades when edge ≥ 5% and EV ≥ $0.01 (optimized thresholds)
+**Dual Strategy Approach:**
 
-**Strategy Parameters (Optimized for Production):**
-- Min edge: 5% (ensures quality trades)
-- Min EV: $0.01 (10x threshold for better ROI)
-- Min volume: 15 contracts (better liquidity than 5)
-- Forecast sources: 3 parallel APIs (NWS, Tomorrow.io, Weatherbit)
+**1. Conservative Mode (High Win Rate)**
+- Min edge: 5%, Min EV: $0.01
+- Any price range
+- Position size: 1 contract
+- Expected win rate: 60-80%
+- Steady, predictable returns
+
+**2. Longshot Mode (Asymmetric Payouts) 🎯**
+- Target: Market price ≤ 10¢ (cheap shares)
+- Min edge: 30% (massive mispricing)
+- Our probability: ≥ 50% (forecast certainty)
+- Position size: 3 contracts (3x multiplier)
+- Expected win rate: 25-40%
+- 10-20x returns when right
+
+**How it works:**
+1. Aggregates forecasts from 3 weather APIs (NWS, Tomorrow.io, Weatherbit)
+2. Builds probability distributions using normal distribution
+3. Calculates edge: `(Your Probability - Market Price) × 100`
+4. Checks longshot criteria first (priority for big wins)
+5. Falls back to conservative mode (consistent gains)
+
+**Why this works:** Inspired by successful Polymarket bot ($27 → $63K). Buys "cheap certainty" - when market says 10% but forecasts say 80%. Low win rate acceptable when payouts are 10-20x.
 
 **Supported Markets:**
 - **High Temperature Markets**: KXHIGHNY, KXHIGHCH, KXHIGHMI, KXHIGHAU
