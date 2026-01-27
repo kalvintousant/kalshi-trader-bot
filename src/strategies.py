@@ -25,14 +25,23 @@ class TradingStrategy:
     def execute_trade(self, decision: Dict, market_ticker: str) -> Optional[Dict]:
         """Execute a trade"""
         try:
+            # Set price for the side we're trading (YES or NO)
+            price = decision.get('price', 0)
+            if decision['side'] == 'yes':
+                yes_price = price
+                no_price = None
+            else:
+                yes_price = None
+                no_price = price
+            
             order = self.client.create_order(
                 ticker=market_ticker,
                 action=decision['action'],
                 side=decision['side'],
                 count=decision['count'],
                 order_type='limit',
-                yes_price=decision.get('price'),
-                no_price=decision.get('price'),
+                yes_price=yes_price,
+                no_price=no_price,
                 client_order_id=str(uuid.uuid4())
             )
             
