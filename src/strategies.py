@@ -421,6 +421,48 @@ class WeatherDailyStrategy(TradingStrategy):
                 logger.warning(f"Could not extract threshold from market: {market.get('title', 'unknown')}")
                 return None
             
+            # CRITICAL: Check if outcome is already determined by today's observations
+            # Only check if this is a market for TODAY (not future dates)
+            if target_date.date() == datetime.now().date():
+                # This market is for today - check if outcome already determined
+                observed = self.weather_agg.get_todays_observed_high(series_ticker)
+                
+                if observed:
+                    observed_high, obs_time = observed
+                    is_range_market = isinstance(threshold, tuple)
+                    
+                    # Check if outcome is already certain based on observations
+                    outcome_determined = False
+                    reason = ""
+                    
+                    if is_range_market:
+                        range_low, range_high = threshold
+                        # For range markets like "51-52°", if we've already seen temp outside range, outcome is NO
+                        if observed_high >= range_high:
+                            outcome_determined = True
+                            reason = f"Observed high {observed_high:.1f}°F already exceeds range [{range_low}-{range_high}°F)"
+                        # If observed high is already in range, YES is likely but not certain (could go higher)
+                        # So we only skip if outcome is definitely NO
+                    else:
+                        # Single threshold market
+                        market_title = market.get('title', '').lower()
+                        is_above_market = 'above' in market_title or '>' in market_title
+                        
+                        if is_above_market:
+                            # Market is "Will high be >X°?"
+                            if observed_high > threshold:
+                                outcome_determined = True
+                                reason = f"Observed high {observed_high:.1f}°F already exceeds threshold {threshold}°F (YES certain)"
+                        else:
+                            # Market is "Will high be <X°?"
+                            if observed_high >= threshold:
+                                outcome_determined = True
+                                reason = f"Observed high {observed_high:.1f}°F already reached threshold {threshold}°F (NO certain)"
+                    
+                    if outcome_determined:
+                        logger.info(f"⏭️  Skipping {market_ticker}: Outcome already determined - {reason}")
+                        return None
+            
             # Get forecasts from all available sources
             forecasts = self.weather_agg.get_all_forecasts(series_ticker, target_date)
             

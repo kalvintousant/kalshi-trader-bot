@@ -198,6 +198,112 @@ class WeatherDataAggregator:
         
         return valid_forecasts if valid_forecasts else forecasts  # Keep all if filtering removes everything
     
+    def get_todays_observed_high(self, series_ticker: str) -> Optional[Tuple[float, datetime]]:
+        """
+        Get today's observed high temperature from NWS station observations.
+        Returns (high_temp_f, timestamp) or None if unavailable.
+        
+        This is critical for avoiding trades on already-determined outcomes.
+        For example, if the market is "Denver high >50°F" and we've already 
+        observed 55°F today, the outcome is certain (YES will win).
+        """
+        if series_ticker not in self.CITY_COORDS:
+            logger.debug(f"Unknown series ticker: {series_ticker}")
+            return None
+        
+        city = self.CITY_COORDS[series_ticker]
+        lat, lon = city['lat'], city['lon']
+        
+        try:
+            # Get NWS observation station for this location
+            points_url = f"https://api.weather.gov/points/{lat},{lon}"
+            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            
+            if resp.status_code != 200:
+                logger.debug(f"NWS points API failed for {series_ticker}: {resp.status_code}")
+                return None
+            
+            points_data = resp.json()
+            obs_stations_url = points_data['properties'].get('observationStations')
+            
+            if not obs_stations_url:
+                logger.debug(f"No observation stations URL for {series_ticker}")
+                return None
+            
+            # Get the nearest observation station
+            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            
+            if stations_resp.status_code != 200:
+                logger.debug(f"NWS stations API failed: {stations_resp.status_code}")
+                return None
+            
+            stations_data = stations_resp.json()
+            features = stations_data.get('features', [])
+            
+            if not features:
+                logger.debug(f"No observation stations found for {series_ticker}")
+                return None
+            
+            station_id = features[0]['id']
+            
+            # Get recent observations from this station
+            obs_url = f"{station_id}/observations"
+            obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            
+            if obs_resp.status_code != 200:
+                logger.debug(f"NWS observations API failed: {obs_resp.status_code}")
+                return None
+            
+            obs_data = obs_resp.json()
+            observations = obs_data.get('features', [])
+            
+            if not observations:
+                logger.debug(f"No observations available for {series_ticker}")
+                return None
+            
+            # Filter for today's observations and find the maximum
+            from datetime import timezone
+            today = datetime.now(timezone.utc).date()
+            today_temps = []
+            
+            for obs in observations[:100]:  # Check last 100 observations (should cover >24 hours)
+                props = obs['properties']
+                timestamp_str = props.get('timestamp')
+                
+                if not timestamp_str:
+                    continue
+                
+                # Parse timestamp
+                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                
+                # Only include today's observations
+                if timestamp.date() != today:
+                    continue
+                
+                # Get temperature
+                temp_c = props.get('temperature', {}).get('value')
+                
+                if temp_c is None:
+                    continue
+                
+                # Convert to Fahrenheit
+                temp_f = (temp_c * 9/5) + 32
+                today_temps.append((temp_f, timestamp))
+            
+            if not today_temps:
+                logger.debug(f"No observations for today found for {series_ticker}")
+                return None
+            
+            # Find the maximum temperature observed today
+            max_temp, max_time = max(today_temps, key=lambda x: x[0])
+            
+            logger.debug(f"Today's observed high for {series_ticker}: {max_temp:.1f}°F (at {max_time.strftime('%H:%M')})")
+            return (max_temp, max_time)
+        
+        except Exception as e:
+            logger.debug(f"Error getting today's observed high for {series_ticker}: {e}")
+            return None
+    
     def get_all_forecasts(self, series_ticker: str, target_date: datetime) -> List[float]:
         """
         Collect forecasts from all available sources with caching, parallel execution,
