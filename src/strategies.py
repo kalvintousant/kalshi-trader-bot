@@ -18,6 +18,63 @@ class TradingStrategy:
         self.client = client
         self.name = self.__class__.__name__
     
+    def _get_market_exposure(self, market_ticker: str) -> Dict:
+        """
+        Calculate total exposure (contracts + dollars) on a specific market
+        Includes both filled positions and resting (open) orders
+        Base implementation - can be overridden by subclasses
+        """
+        try:
+            total_contracts = 0
+            total_dollars = 0.0
+            
+            # Get filled positions
+            try:
+                fills = self.client.get_fills(ticker=market_ticker, limit=100)
+                for fill in fills:
+                    if fill.get('ticker') == market_ticker:
+                        count = fill.get('count', 0)
+                        total_contracts += count
+                        
+                        side = fill.get('side', '')
+                        if side == 'yes':
+                            price = fill.get('yes_price', 0)
+                        else:
+                            price = fill.get('no_price', 0)
+                        total_dollars += (count * price) / 100.0
+            except Exception as e:
+                logger.debug(f"Could not fetch fills for {market_ticker}: {e}")
+            
+            # Get resting (open) orders
+            try:
+                orders = self.client.get_orders(status='resting')
+                for order in orders:
+                    if order.get('ticker') == market_ticker:
+                        remaining = order.get('remaining_count', 0)
+                        total_contracts += remaining
+                        
+                        side = order.get('side', '')
+                        if side == 'yes':
+                            price = order.get('yes_price', 0)
+                        else:
+                            price = order.get('no_price', 0)
+                        total_dollars += (remaining * price) / 100.0
+            except Exception as e:
+                logger.debug(f"Could not fetch orders for {market_ticker}: {e}")
+            
+            return {
+                'total_contracts': total_contracts,
+                'total_dollars': total_dollars
+            }
+        
+        except Exception as e:
+            logger.error(f"Error getting market exposure for {market_ticker}: {e}", exc_info=True)
+            # Return safe defaults (assume at limit to prevent over-trading)
+            return {
+                'total_contracts': Config.MAX_CONTRACTS_PER_MARKET,
+                'total_dollars': Config.MAX_DOLLARS_PER_MARKET
+            }
+    
     def should_trade(self, market: Dict) -> bool:
         """Determine if we should trade this market"""
         raise NotImplementedError
@@ -29,6 +86,25 @@ class TradingStrategy:
     def execute_trade(self, decision: Dict, market_ticker: str) -> Optional[Dict]:
         """Execute a trade"""
         try:
+            # CRITICAL: Re-check exposure limits RIGHT BEFORE placing order
+            # This prevents multiple strategies/scans from over-trading the same market
+            existing_exposure = self._get_market_exposure(market_ticker)
+            existing_contracts = existing_exposure['total_contracts']
+            existing_dollars = existing_exposure['total_dollars']
+            
+            # Check if we would exceed limits with this trade
+            new_count = decision.get('count', 0)
+            new_price = decision.get('price', 0)
+            new_dollars = (new_count * new_price) / 100.0
+            
+            if existing_contracts + new_count > Config.MAX_CONTRACTS_PER_MARKET:
+                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed contract limit ({existing_contracts} + {new_count} > {Config.MAX_CONTRACTS_PER_MARKET})")
+                return None
+            
+            if existing_dollars + new_dollars > Config.MAX_DOLLARS_PER_MARKET:
+                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed dollar limit (${existing_dollars:.2f} + ${new_dollars:.2f} > ${Config.MAX_DOLLARS_PER_MARKET:.2f})")
+                return None
+            
             # Set price for the side we're trading (YES or NO)
             price = decision.get('price', 0)
             if decision['side'] == 'yes':
@@ -49,14 +125,21 @@ class TradingStrategy:
                 client_order_id=str(uuid.uuid4())
             )
             
-            # Enhanced trade notification
+            # Enhanced trade notification  
             order_id = order.get('order_id', 'N/A')
             action = decision['action']
             side = decision['side']
             count = decision['count']
             price = decision.get('price', 'N/A')
             
-            trade_msg = f"🔄 TRADE EXECUTED: {action.upper()} {count} {side.upper()} @ {price}¢ | Order: {order_id} | Market: {market_ticker}"
+            # Get current exposure for this market to display
+            try:
+                exp = self._get_market_exposure(market_ticker)
+                exposure_str = f" | Exposure: {exp['total_contracts']}/{Config.MAX_CONTRACTS_PER_MARKET} contracts"
+            except:
+                exposure_str = ""
+            
+            trade_msg = f"🔄 TRADE EXECUTED: {action.upper()} {count} {side.upper()} @ {price}¢{exposure_str} | Order: {order_id} | Market: {market_ticker}"
             
             # Log to console and file
             logger.info("="*70)
@@ -469,6 +552,23 @@ class WeatherDailyStrategy(TradingStrategy):
             no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake,
                                                   include_fees=True, fee_rate=0.05)
             
+            # Check existing exposure on this market BEFORE placing new orders
+            # This prevents the bug where we place multiple orders on the same market
+            existing_exposure = self._get_market_exposure(market_ticker)
+            existing_contracts = existing_exposure['total_contracts']
+            existing_dollars = existing_exposure['total_dollars']
+            
+            # Calculate remaining capacity
+            contracts_remaining = max(0, Config.MAX_CONTRACTS_PER_MARKET - existing_contracts)
+            dollars_remaining = max(0, Config.MAX_DOLLARS_PER_MARKET - existing_dollars)
+            
+            # If we're at or over limits, skip this market
+            if contracts_remaining == 0 or dollars_remaining < 0.01:
+                logger.info(f"⛔ Skipping {market_ticker}: At limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f})")
+                return None
+            
+            logger.info(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
+            
             # DUAL STRATEGY: Check both conservative and longshot modes
             
             # LONGSHOT MODE: Hunt for extreme mispricings (0.1-10% odds with massive edges)
@@ -498,11 +598,14 @@ class WeatherDailyStrategy(TradingStrategy):
                         base_position = min(self.max_position_size * self.longshot_position_multiplier, 
                                            self.max_position_size * 5)  # Cap at 5x
                     
-                    # Cap by contract count (25 contracts)
-                    contract_cap = Config.MAX_CONTRACTS_PER_MARKET
-                    # Cap by dollar amount ($3.00 = 300 cents)
-                    dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_yes_ask) if best_yes_ask > 0 else contract_cap
-                    position_size = min(base_position, contract_cap, dollar_cap_contracts)
+                    # Cap by REMAINING contract count and dollars (not absolute limits)
+                    dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
+                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
+                    
+                    # Skip if no room left after checking
+                    if position_size <= 0:
+                        logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                        return None
                     
                     confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
                     logger.info(f"🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
@@ -553,11 +656,14 @@ class WeatherDailyStrategy(TradingStrategy):
                         base_position = min(self.max_position_size * self.longshot_position_multiplier, 
                                            self.max_position_size * 5)  # Cap at 5x
                     
-                    # Cap by contract count (25 contracts)
-                    contract_cap = Config.MAX_CONTRACTS_PER_MARKET
-                    # Cap by dollar amount ($3.00 = 300 cents)
-                    dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_no_ask) if best_no_ask > 0 else contract_cap
-                    position_size = min(base_position, contract_cap, dollar_cap_contracts)
+                    # Cap by REMAINING contract count and dollars (not absolute limits)
+                    dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
+                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
+                    
+                    # Skip if no room left
+                    if position_size <= 0:
+                        logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                        return None
                     
                     confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
                     logger.info(f"🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
@@ -602,9 +708,14 @@ class WeatherDailyStrategy(TradingStrategy):
                 else:
                     base_position = self.max_position_size
                 
-                contract_cap = Config.MAX_CONTRACTS_PER_MARKET
-                dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_yes_ask) if best_yes_ask > 0 else contract_cap
-                position_size = min(base_position, contract_cap, dollar_cap_contracts)
+                # Cap by REMAINING capacity, not absolute limits
+                dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
+                position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
+                
+                # Skip if no room left
+                if position_size <= 0:
+                    logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                    return None
                 
                 logger.info(f"✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
                 
@@ -641,9 +752,14 @@ class WeatherDailyStrategy(TradingStrategy):
                 else:
                     base_position = self.max_position_size
                 
-                contract_cap = Config.MAX_CONTRACTS_PER_MARKET
-                dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_no_ask) if best_no_ask > 0 else contract_cap
-                position_size = min(base_position, contract_cap, dollar_cap_contracts)
+                # Cap by REMAINING capacity, not absolute limits
+                dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
+                position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
+                
+                # Skip if no room left
+                if position_size <= 0:
+                    logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                    return None
                 
                 logger.info(f"✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
                 
