@@ -23,7 +23,8 @@ This bot implements a dual-strategy approach combining conservative edge-based t
   - **Longshot**: Undervalued low-probability events (≤10¢, ≥50% estimated probability, ≥30% edge)
 - **💰 Position Management**: Automatic exit logic with take-profit (20%), stop-loss (30%), and edge monitoring
 - **📈 Kelly Criterion Sizing**: Intelligent position sizing for high-confidence trades
-- **🔒 Risk Controls**: Daily loss limits, position caps, and contract/dollar limits per market
+- **🔒 Risk Controls**: Daily loss limits, position caps, and per-market exposure tracking (prevents over-trading)
+- **✅ Outcome Validation**: Checks NWS observations to skip trades on already-determined outcomes
 - **⚡ Performance Optimized**: API response caching (orderbook: 3s, portfolio: 10s, forecasts: 30m)
 - **📝 Professional Logging**: Structured logging with rotating file handlers and detailed audit trail
 - **🔄 Error Handling**: Comprehensive error handling with automatic retry logic and exponential backoff
@@ -259,9 +260,10 @@ Action: SELL → Lock in ~$1.80 profit
 ### Multi-Layer Protection
 
 1. **Position Limits**
-   - Per-market contract cap: 25 contracts
-   - Per-market dollar cap: $300
+   - Per-market contract cap: 25 contracts (tracks filled + resting orders)
+   - Per-market dollar cap: $300 (tracks total exposure per market)
    - Max position size: 10 contracts (base)
+   - **Per-Market Exposure Tracking**: Bot checks existing positions and resting orders before each trade to prevent exceeding limits across multiple orders
 
 2. **Daily Loss Limit**
    - Bot automatically stops trading if daily P&L < -$500
@@ -272,6 +274,7 @@ Action: SELL → Lock in ~$1.80 profit
    - Minimum volume: 50 contracts
    - Only trades "open" status markets
    - Excludes markets expiring in <24 hours
+   - **Outcome-Determined Check**: For today's markets, checks NWS observed high temperature and skips trades if outcome is already certain (prevents trading on predetermined results)
 
 4. **Forecast Quality Requirements**
    - Requires multiple data sources for high-confidence trades
@@ -474,6 +477,13 @@ python3 -c "from src.kalshi_client import KalshiClient; c=KalshiClient(); print(
 ```
 
 ### Recent Improvements
+
+✅ **v2.1.0 (January 2026)**
+- **Critical Fix**: Per-market position limit enforcement (prevents over-trading same market)
+- **Critical Fix**: Outcome-determined check using NWS observations (skips trades on already-known results)
+- Added outcome tracking and forecast learning system
+- Added support for range temperature markets (e.g., "51-52°F")
+- Improved scan completion logging
 
 ✅ **v2.0.0 (January 2026)**
 - Removed all Bitcoin/crypto logic (550+ lines)
