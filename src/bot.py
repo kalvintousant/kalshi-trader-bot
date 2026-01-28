@@ -436,6 +436,9 @@ class KalshiTradingBot:
                     self.scan_and_trade()
                     scan_duration = time.time() - scan_start
                     
+                    # Log scan completion
+                    logger.info(f"✅ Scan complete in {scan_duration:.1f}s. Next scan in {max(0, 30 - scan_duration):.0f}s")
+                    
                     # Check for filled orders and send notifications
                     self.check_filled_orders()
                     

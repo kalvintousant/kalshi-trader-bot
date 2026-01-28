@@ -6,7 +6,7 @@ import os
 import re
 import requests
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timedelta
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 # Compile regex patterns once at module level for performance
 TEMP_PATTERN = re.compile(r'(\d+(?:\.\d+)?)\s*°?F', re.IGNORECASE)
 THRESHOLD_PATTERN = re.compile(r'(?:above|below|>|<)\s*(\d+(?:\.\d+)?)', re.IGNORECASE)
+# Range format: "be 71-72°" or "71-72°" (strip markdown ** before matching)
+RANGE_TEMP_PATTERN = re.compile(r'(\d+)-(\d+)\s*°', re.IGNORECASE)
 
 
 class WeatherDataAggregator:
@@ -612,18 +614,32 @@ class WeatherDataAggregator:
 
 
 # Helper function to extract temperature threshold from market title
-def extract_threshold_from_market(market: Dict) -> Optional[float]:
-    """Extract temperature threshold from Kalshi market title"""
+def extract_threshold_from_market(market: Dict) -> Optional[Union[float, Tuple[float, float]]]:
+    """
+    Extract temperature threshold from Kalshi market title.
+    Returns:
+        - float: single threshold for "above X°" / "below X°" markets
+        - (low, high): tuple for "be X-Y°" range markets (e.g. 71-72°)
+    """
     title = market.get('title', '')
-    
-    # Try to find number followed by °F or F
-    match = TEMP_PATTERN.search(title)
+    # Strip markdown bold so "**high temp in LA**" doesn't break number matching
+    title_clean = re.sub(r'\*\*[^*]*\*\*', '', title)
+
+    # Try range format first: "71-72°" or "be 71-72°"
+    match = RANGE_TEMP_PATTERN.search(title_clean)
+    if match:
+        low, high = int(match.group(1)), int(match.group(2))
+        if low <= high:
+            return (float(low), float(high))
+
+    # Try single number followed by °F or F
+    match = TEMP_PATTERN.search(title_clean)
     if match:
         return float(match.group(1))
-    
-    # Try to find "above X" or "below X"
-    match = THRESHOLD_PATTERN.search(title)
+
+    # Try "above X" or "below X"
+    match = THRESHOLD_PATTERN.search(title_clean)
     if match:
         return float(match.group(1))
-    
+
     return None

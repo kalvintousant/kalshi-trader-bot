@@ -293,7 +293,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 logger.warning(f"Market date {market_date} is too far from today ({days_diff} days), skipping")
                 return None
             
-            # Extract temperature threshold from market title
+            # Extract temperature threshold from market title (single float or (low, high) range)
             threshold = self.extract_threshold(market)
             if not threshold:
                 # Can't determine threshold, skip
@@ -328,27 +328,40 @@ class WeatherDailyStrategy(TradingStrategy):
                 return None
             
             # Calculate our probability for this market
-            # Determine if market is "above" or "below" threshold
             market_title = market.get('title', '').lower()
-            is_above_market = 'above' in market_title or '>' in market_title
-            
-            # Calculate probability based on distribution
-            our_prob = 0.0
-            for (temp_min, temp_max), prob in prob_dist.items():
-                if is_above_market:
-                    if temp_min >= threshold:
-                        our_prob += prob
-                    elif temp_max > threshold:
-                        # Partial overlap
-                        overlap = (temp_max - threshold) / (temp_max - temp_min) if (temp_max - temp_min) > 0 else 0
-                        our_prob += prob * overlap
-                else:  # below market
-                    if temp_max <= threshold:
-                        our_prob += prob
-                    elif temp_min < threshold:
-                        # Partial overlap
-                        overlap = (threshold - temp_min) / (temp_max - temp_min) if (temp_max - temp_min) > 0 else 0
-                        our_prob += prob * overlap
+            is_range_market = isinstance(threshold, tuple)
+            if is_range_market:
+                range_low, range_high = threshold
+                # "Will the temp be 71-72°?" -> P(71 <= temp < 72) = sum of prob * overlap per bracket
+                our_prob = 0.0
+                for (temp_min, temp_max), prob in prob_dist.items():
+                    # Overlap of bracket [temp_min, temp_max) with [range_low, range_high)
+                    overlap_min = max(temp_min, range_low)
+                    overlap_max = min(temp_max, range_high)
+                    if overlap_max > overlap_min:
+                        bracket_width = temp_max - temp_min
+                        overlap_frac = (overlap_max - overlap_min) / bracket_width if bracket_width > 0 else 0
+                        our_prob += prob * overlap_frac
+                is_above_market = True  # used only for CI; use midpoint for approximate CI
+                threshold_for_ci = (range_low + range_high) / 2.0
+            else:
+                is_above_market = 'above' in market_title or '>' in market_title
+                threshold_for_ci = threshold
+                # Single-threshold (above/below) probability
+                our_prob = 0.0
+                for (temp_min, temp_max), prob in prob_dist.items():
+                    if is_above_market:
+                        if temp_min >= threshold:
+                            our_prob += prob
+                        elif temp_max > threshold:
+                            overlap = (temp_max - threshold) / (temp_max - temp_min) if (temp_max - temp_min) > 0 else 0
+                            our_prob += prob * overlap
+                    else:  # below market
+                        if temp_max <= threshold:
+                            our_prob += prob
+                        elif temp_min < threshold:
+                            overlap = (threshold - temp_min) / (temp_max - temp_min) if (temp_max - temp_min) > 0 else 0
+                            our_prob += prob * overlap
             
             # Get market prices (reuse from earlier calculation if available)
             # Get orderbook data
@@ -385,10 +398,10 @@ class WeatherDailyStrategy(TradingStrategy):
             no_edge = self.weather_agg.calculate_edge(no_prob, int(best_no_ask))
             
             # Calculate confidence intervals for probability estimates
-            # For "above" markets, YES = temp > threshold
-            # For "below" markets, YES = temp < threshold
+            # For "above" markets, YES = temp > threshold; for "below", YES = temp < threshold
+            # For range markets we use midpoint for approximate CI
             prob_ci_yes, (ci_lower_yes, ci_upper_yes) = self.weather_agg.calculate_confidence_interval(
-                forecasts, threshold, is_above=is_above_market
+                forecasts, threshold_for_ci, is_above=is_above_market
             )
             prob_ci_no = 1.0 - prob_ci_yes
             ci_lower_no = 1.0 - ci_upper_yes
