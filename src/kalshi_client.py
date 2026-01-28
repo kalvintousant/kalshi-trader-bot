@@ -230,6 +230,18 @@ class KalshiClient:
         response = self._get('/portfolio/orders', params=params)
         return response.get('orders', [])
     
+    def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        """Get filled orders (past trades)"""
+        params = {'limit': limit}
+        if ticker:
+            params['ticker'] = ticker
+        response = self._get('/portfolio/fills', params=params)
+        return response.get('fills', [])
+    
+    def get_market(self, ticker: str) -> Dict:
+        """Get details for a specific market"""
+        return self._get(f'/markets/{ticker}')
+    
     # Trading Methods
     def create_order(self, ticker: str, action: str, side: str, 
                     count: int, order_type: str, yes_price: Optional[int] = None,

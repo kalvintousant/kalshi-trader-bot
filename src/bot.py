@@ -9,6 +9,7 @@ from src.kalshi_client import KalshiClient
 from src.strategies import StrategyManager
 from src.config import Config
 from src.logger import setup_logging
+from src.outcome_tracker import OutcomeTracker
 
 # Set up logging
 setup_logging()
@@ -40,6 +41,11 @@ class KalshiTradingBot:
         self.relevant_series: Set[str] = set()
         if 'weather_daily' in Config.ENABLED_STRATEGIES:
             self.relevant_series.update(Config.WEATHER_SERIES)
+        
+        # Outcome tracker for learning from results
+        weather_agg = self.strategy_manager.strategies[0].weather_agg if self.strategy_manager.strategies else None
+        self.outcome_tracker = OutcomeTracker(self.client, weather_agg) if weather_agg else None
+        self.last_outcome_check = 0  # Timestamp of last outcome check
     
     def reset_daily_stats(self):
         """Reset daily statistics"""
@@ -444,6 +450,15 @@ class KalshiTradingBot:
                     
                     # Check and cancel stale orders (edge/EV no longer valid)
                     self.check_and_cancel_stale_orders()
+                    
+                    # Check for settled positions and update forecast model (every hour)
+                    outcome_check_interval = 3600  # 1 hour
+                    if self.outcome_tracker and time.time() - self.last_outcome_check >= outcome_check_interval:
+                        try:
+                            self.outcome_tracker.run_outcome_check()
+                            self.last_outcome_check = time.time()
+                        except Exception as e:
+                            logger.error(f"Error checking outcomes: {e}", exc_info=True)
                     
                     # Heartbeat logging to confirm bot is alive
                     if time.time() - last_heartbeat >= heartbeat_interval:

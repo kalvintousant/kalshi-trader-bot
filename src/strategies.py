@@ -77,12 +77,16 @@ class TradingStrategy:
             return None
     
     def _log_trade(self, message: str, order: Optional[Dict], decision: Dict, market_ticker: str):
-        """Log trade to file"""
+        """Log trade to file (both human-readable and CSV for analysis)"""
         try:
             from datetime import datetime
-            log_file = "trades.log"
+            import csv
+            from pathlib import Path
+            
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
+            # Human-readable log
+            log_file = "trades.log"
             log_entry = f"[{timestamp}] {message}\n"
             if order:
                 log_entry += f"  Order Details: {order}\n"
@@ -91,6 +95,40 @@ class TradingStrategy:
             
             with open(log_file, 'a') as f:
                 f.write(log_entry)
+            
+            # Structured CSV for outcome tracking
+            csv_file = Path("data/trades.csv")
+            csv_file.parent.mkdir(exist_ok=True)
+            
+            # Create CSV with headers if it doesn't exist
+            if not csv_file.exists():
+                with open(csv_file, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        'timestamp', 'market_ticker', 'order_id', 'action', 'side', 'count', 
+                        'price', 'edge', 'ev', 'strategy_mode', 'our_probability', 
+                        'market_price', 'status'
+                    ])
+            
+            # Append trade details
+            if order:
+                with open(csv_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        datetime.now().isoformat(),
+                        market_ticker,
+                        order.get('order_id', ''),
+                        decision.get('action', ''),
+                        decision.get('side', ''),
+                        decision.get('count', 0),
+                        decision.get('price', 0),
+                        decision.get('edge', 0),
+                        decision.get('ev', 0),
+                        decision.get('strategy_mode', ''),
+                        '',  # our_probability - would need to pass from strategy
+                        decision.get('price', 0),  # market_price at time of trade
+                        order.get('status', 'unknown')
+                    ])
         except Exception as e:
             logger.error(f"Error logging trade: {e}")
     
