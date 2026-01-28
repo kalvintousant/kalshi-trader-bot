@@ -1,16 +1,20 @@
 import time
 import uuid
+import logging
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from .kalshi_client import KalshiClient
 from .config import Config
 from .weather_data import WeatherDataAggregator, extract_threshold_from_market
 
+logger = logging.getLogger(__name__)
+
 
 class TradingStrategy:
     """Base class for trading strategies"""
     
     def __init__(self, client: KalshiClient):
+        # Don't call super() - this is the base class
         self.client = client
         self.name = self.__class__.__name__
     
@@ -54,10 +58,10 @@ class TradingStrategy:
             
             trade_msg = f"🔄 TRADE EXECUTED: {action.upper()} {count} {side.upper()} @ {price}¢ | Order: {order_id} | Market: {market_ticker}"
             
-            # Print to console
-            print("="*70)
-            print(trade_msg)
-            print("="*70)
+            # Log to console and file
+            logger.info("="*70)
+            logger.info(trade_msg)
+            logger.info("="*70)
             
             # Log to file
             self._log_trade(trade_msg, order, decision, market_ticker)
@@ -67,8 +71,8 @@ class TradingStrategy:
             
             return order
         except Exception as e:
-            error_msg = f"[{self.name}] Error placing order: {e}"
-            print(error_msg)
+            error_msg = f"Error placing order: {e}"
+            logger.error(error_msg, exc_info=True)
             self._log_trade(error_msg, None, decision, market_ticker)
             return None
     
@@ -88,7 +92,7 @@ class TradingStrategy:
             with open(log_file, 'a') as f:
                 f.write(log_entry)
         except Exception as e:
-            print(f"[{self.name}] Error logging trade: {e}")
+            logger.error(f"Error logging trade: {e}")
     
     def _send_notification(self, title: str, message: str):
         """Send macOS notification"""
@@ -105,452 +109,7 @@ class TradingStrategy:
 
 
 # BTC strategies removed - focusing on weather markets only
-"""
-# BTC strategies removed - focusing on weather markets only
-"""
-class BTCHourlyStrategy(TradingStrategy):
-    # Latency Arbitrage Strategy for Hourly BTC markets - REMOVED
-    # Focusing on weather markets only
-    
-    def __init__(self, client: KalshiClient, btc_tracker=None):
-        super().__init__(client)
-        self.max_position_size = Config.MAX_POSITION_SIZE
-        
-        # Use provided BTC tracker or create new one (shared instance from bot)
-        self.btc_tracker = btc_tracker or BTCPriceTracker()
-        
-        # Strategy parameters
-        self.momentum_threshold = 0.3  # Minimum momentum % to trigger trade (0.3%)
-        self.volatility_threshold = 0.2  # Minimum volatility % to ensure real move
-        self.mispricing_threshold = 3  # Minimum price difference (cents) between Binance move and Kalshi pricing
-        
-        # Track active positions for exit logic
-        self.active_positions = {}  # {market_ticker: {'side': 'yes'/'no', 'entry_price': int, 'entry_time': datetime}}
-        
-        # Update BTC data on init if we created the tracker
-        if btc_tracker is None:
-            self.btc_tracker.update()
-    
-    def should_trade(self, market: Dict) -> bool:
-        """
-        Check if this is an hourly BTC market we should trade
-        
-        Contract Rules Compliance:
-        - Only trades markets with status='open' (respects Last Trading Date/Time)
-        - Kalshi API filters out expired markets automatically
-        - Minimum volume check ensures liquidity
-        """
-        series_ticker = market.get('series_ticker', '')
-        if series_ticker != Config.BTC_HOURLY_SERIES:
-            return False
-        
-        # Contract Rule: Respect Last Trading Date/Time - only trade open markets
-        if market.get('status') != 'open':
-            return False
-        
-        # Check if market has sufficient volume (liquidity requirement)
-        # Minimum volume threshold to ensure adequate liquidity
-        if market.get('volume', 0) < 20:
-            return False
-        
-        return True
-    
-    def get_trade_decision(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
-        """
-        Latency arbitrage strategy:
-        1. Read real-time BTC moves from Binance
-        2. Check Kalshi's delayed pricing
-        3. Enter during lag window if there's desynchronization
-        4. Exit once pricing catches up
-        """
-        try:
-            market_ticker = market.get('ticker', '')
-            
-            # Note: BTC data should be updated at bot level, not here for performance
-            # This check is just a safety fallback
-            if not self.btc_tracker.is_fresh(max_age_seconds=30):
-                self.btc_tracker.update()
-            
-            # Check if we have an active position to exit
-            if market_ticker in self.active_positions:
-                return self._check_exit(market, orderbook, market_ticker)
-            
-            # Detect significant BTC move
-            has_move, direction = self.btc_tracker.detect_significant_move(
-                momentum_threshold=self.momentum_threshold,
-                volatility_threshold=self.volatility_threshold
-            )
-            
-            if not has_move:
-                return None
-            
-            # Get current BTC price change over 1 hour (for hourly markets)
-            # Contract uses BRTI average for minute prior to expiration - we track hourly moves
-            btc_change_1h = self.btc_tracker.get_price_change_period(minutes=60)
-            
-            if btc_change_1h is None:
-                return None
-            
-            # Get Kalshi market pricing
-            yes_price = market.get('yes_price', 50)
-            no_price = market.get('no_price', 50)
-            
-            yes_bids = orderbook.get('orderbook', {}).get('yes', [])
-            no_bids = orderbook.get('orderbook', {}).get('no', [])
-            
-            if not yes_bids or not no_bids:
-                return None
-            
-            best_yes_bid = yes_bids[0][0] if yes_bids else yes_price
-            best_no_bid = no_bids[0][0] if no_bids else no_price
-            
-            # Calculate expected Kalshi price based on BTC move
-            # If BTC is up, YES should be higher priced
-            # If BTC is down, NO should be higher priced
-            
-            # Convert BTC change to expected probability
-            # Positive change = higher probability of YES
-            # Negative change = higher probability of NO
-            # Contract uses BRTI (we use Binance as proxy) - 1% hourly move = 10% prob change
-            expected_yes_prob = 50 + (btc_change_1h * 10)  # Scale: 1% BTC move = 10% prob change
-            expected_yes_prob = max(1, min(99, expected_yes_prob))  # Clamp to 1-99
-            
-            # Compare expected price to actual Kalshi price
-            price_mispricing = abs(expected_yes_prob - best_yes_bid)
-            
-            # Trade logic: If BTC pumped and YES is underpriced, buy YES
-            # If BTC dumped and NO is underpriced, buy NO
-            if direction == "up" and btc_change_1h > 0:
-                # BTC pumped, check if YES is mispriced
-                if expected_yes_prob > best_yes_bid + self.mispricing_threshold:
-                    print(f"[BTCStrategy] BTC PUMP detected: {btc_change_1h:.2f}% move (1h), YES expected {expected_yes_prob:.1f}¢, market {best_yes_bid}¢, mispricing {price_mispricing:.1f}¢")
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'yes',
-                        'entry_price': best_yes_bid + 1,
-                        'entry_time': datetime.now(),
-                        'expected_prob': expected_yes_prob
-                    }
-                    return {
-                        'action': 'buy',
-                        'side': 'yes',
-                        'count': min(1, self.max_position_size),
-                        'price': best_yes_bid + 1,
-                        'btc_move': btc_change_1h,
-                        'mispricing': price_mispricing
-                    }
-            
-            elif direction == "down" and btc_change_1h < 0:
-                # BTC dumped, check if NO is mispriced
-                expected_no_prob = 100 - expected_yes_prob
-                if expected_no_prob > best_no_bid + self.mispricing_threshold:
-                    print(f"[BTCStrategy] BTC DUMP detected: {btc_change_1h:.2f}% move (1h), NO expected {expected_no_prob:.1f}¢, market {best_no_bid}¢, mispricing {price_mispricing:.1f}¢")
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'no',
-                        'entry_price': best_no_bid + 1,
-                        'entry_time': datetime.now(),
-                        'expected_prob': expected_no_prob
-                    }
-                    return {
-                        'action': 'buy',
-                        'side': 'no',
-                        'count': min(1, self.max_position_size),
-                        'price': best_no_bid + 1,
-                        'btc_move': btc_change_1h,
-                        'mispricing': price_mispricing
-                    }
-            
-            return None
-            
-        except Exception as e:
-            print(f"[BTCHourlyStrategy] Error in get_trade_decision: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
-    def _check_exit(self, market: Dict, orderbook: Dict, market_ticker: str) -> Optional[Dict]:
-        """
-        Check if we should exit an active position
-        Exit when pricing catches up (mispricing closes)
-        """
-        try:
-            position = self.active_positions[market_ticker]
-            side = position['side']
-            entry_price = position['entry_price']
-            entry_time = position['entry_time']
-            
-            # Check if enough time has passed (at least 30 seconds)
-            if (datetime.now() - entry_time).total_seconds() < 30:
-                return None  # Too soon to exit
-            
-            # Get current market prices
-            yes_price = market.get('yes_price', 50)
-            no_price = market.get('no_price', 50)
-            
-            yes_bids = orderbook.get('orderbook', {}).get('yes', [])
-            no_bids = orderbook.get('orderbook', {}).get('no', [])
-            
-            if not yes_bids or not no_bids:
-                return None
-            
-            current_yes = yes_bids[0][0] if yes_bids else yes_price
-            current_no = no_bids[0][0] if no_bids else no_price
-            
-            # Check if pricing has caught up (mispricing closed)
-            if side == 'yes':
-                current_price = current_yes
-                # Exit if price moved towards expected (caught up) or we're profitable
-                if current_price >= position['expected_prob'] - 2 or current_price > entry_price + 2:
-                    print(f"[BTCHourlyStrategy] Exiting YES position: entry {entry_price}¢, current {current_price}¢, expected {position['expected_prob']:.1f}¢")
-                    del self.active_positions[market_ticker]
-                    return {
-                        'action': 'sell',
-                        'side': 'yes',
-                        'count': 1,
-                        'price': current_yes - 1  # Slightly below best bid to exit quickly
-                    }
-            
-            elif side == 'no':
-                current_price = current_no
-                # Exit if price moved towards expected (caught up) or we're profitable
-                if current_price >= position['expected_prob'] - 2 or current_price > entry_price + 2:
-                    print(f"[BTCHourlyStrategy] Exiting NO position: entry {entry_price}¢, current {current_price}¢, expected {position['expected_prob']:.1f}¢")
-                    del self.active_positions[market_ticker]
-                    return {
-                        'action': 'sell',
-                        'side': 'no',
-                        'count': 1,
-                        'price': current_no - 1
-                    }
-            
-            return None
-            
-        except Exception as e:
-            print(f"[BTCHourlyStrategy] Error in _check_exit: {e}")
-            return None
-
-
-# BTC strategies removed - focusing on weather markets only
-"""
-# BTC strategies removed - focusing on weather markets only
-"""
-class BTC15MinStrategy(TradingStrategy):
-    # Latency Arbitrage Strategy for 15-minute BTC markets - REMOVED
-    # Focusing on weather markets only
-    
-    def __init__(self, client: KalshiClient, btc_tracker=None):
-        super().__init__(client)
-        self.max_position_size = Config.MAX_POSITION_SIZE
-        
-        # Use provided BTC tracker or create new one (shared instance from bot)
-        self.btc_tracker = btc_tracker or BTCPriceTracker()
-        
-        # Strategy parameters (tuned for 15-minute markets - more sensitive)
-        self.momentum_threshold = 0.2  # Lower threshold for 15-min moves (0.2%)
-        self.volatility_threshold = 0.15  # Lower volatility threshold (0.15%)
-        self.mispricing_threshold = 2  # Lower mispricing threshold (2 cents) for faster reaction
-        
-        # Track active positions for exit logic
-        self.active_positions = {}  # {market_ticker: {'side': 'yes'/'no', 'entry_price': int, 'entry_time': datetime}}
-        
-        # Update BTC data on init if we created the tracker
-        if btc_tracker is None:
-            self.btc_tracker.update()
-    
-    def should_trade(self, market: Dict) -> bool:
-        """
-        Check if this is a 15-minute BTC market we should trade
-        
-        Contract Rules Compliance (CRYPTO15M):
-        - Only trades markets with status='open' (respects Last Trading Date/Time per contract rules)
-        - Kalshi API filters out expired markets automatically
-        - Minimum volume check ensures liquidity
-        - Position Accountability Level: $25,000 per strike (enforced via MAX_POSITION_SIZE)
-        """
-        series_ticker = market.get('series_ticker', '')
-        if series_ticker != Config.BTC_15M_SERIES:
-            return False
-        
-        # Contract Rule: Respect Last Trading Date/Time - only trade open markets
-        if market.get('status') != 'open':
-            return False
-        
-        # Check if market has sufficient volume (liquidity requirement)
-        # Minimum volume threshold to ensure adequate liquidity
-        if market.get('volume', 0) < 20:
-            return False
-        
-        return True
-    
-    def get_trade_decision(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
-        """
-        Latency arbitrage strategy for 15-minute markets:
-        Compares current BTC price to strike price to determine which side (higher/lower) has better probability.
-        Trades when Kalshi pricing lags behind real-time BTC price movements.
-        """
-        try:
-            market_ticker = market.get('ticker', '')
-            
-            # Update BTC data if stale (1 second refresh for fast reaction)
-            if not self.btc_tracker.is_fresh(max_age_seconds=1):
-                self.btc_tracker.update()
-            
-            # Check if we have an active position to exit
-            if market_ticker in self.active_positions:
-                return self._check_exit(market, orderbook, market_ticker)
-            
-            # Get strike price from market (market is "BTC higher or lower than strike price")
-            strike_price = market.get('floor_strike')
-            if strike_price is None:
-                return None
-            
-            # Get current BTC price
-            current_btc = self.btc_tracker.get_current_price()
-            if current_btc is None:
-                return None
-            
-            # Get Kalshi market pricing
-            yes_bids = orderbook.get('orderbook', {}).get('yes', [])
-            no_bids = orderbook.get('orderbook', {}).get('no', [])
-            
-            if not yes_bids or not no_bids:
-                return None
-            
-            best_yes_bid = yes_bids[0][0]
-            best_no_bid = no_bids[0][0]
-            
-            # Calculate distance from strike price (percentage difference)
-            # YES = BTC >= strike, NO = BTC < strike
-            distance_pct = ((current_btc - strike_price) / strike_price) * 100
-            
-            # Calculate expected probability based on distance from strike
-            # Scale: 1% distance = 10% probability change
-            # If BTC is 1% above strike, YES should be ~60%
-            # If BTC is 1% below strike, YES should be ~40%
-            expected_yes_prob = 50 + (distance_pct * 10)
-            expected_yes_prob = max(1, min(99, expected_yes_prob))  # Clamp to 1-99
-            expected_no_prob = 100 - expected_yes_prob
-            
-            # Calculate mispricing for both sides
-            yes_mispricing = abs(expected_yes_prob - best_yes_bid)
-            no_mispricing = abs(expected_no_prob - best_no_bid)
-            
-            # Determine which side has better edge
-            # Trade YES if BTC is above strike AND YES is underpriced
-            if current_btc >= strike_price and expected_yes_prob > best_yes_bid + self.mispricing_threshold:
-                print(f"[BTC15MinStrategy] BTC ABOVE STRIKE: ${current_btc:,.2f} >= ${strike_price:,.2f}, YES expected {expected_yes_prob:.1f}¢, market {best_yes_bid}¢, mispricing {yes_mispricing:.1f}¢")
-                self.active_positions[market_ticker] = {
-                    'side': 'yes',
-                    'entry_price': best_yes_bid + 1,
-                    'entry_time': datetime.now(),
-                    'expected_prob': expected_yes_prob,
-                    'strike_price': strike_price,
-                    'btc_price': current_btc
-                }
-                return {
-                    'action': 'buy',
-                    'side': 'yes',
-                    'count': min(1, self.max_position_size),
-                    'price': best_yes_bid + 1,
-                    'btc_price': current_btc,
-                    'strike_price': strike_price,
-                    'mispricing': yes_mispricing
-                }
-            
-            # Trade NO if BTC is below strike AND NO is underpriced
-            elif current_btc < strike_price and expected_no_prob > best_no_bid + self.mispricing_threshold:
-                print(f"[BTC15MinStrategy] BTC BELOW STRIKE: ${current_btc:,.2f} < ${strike_price:,.2f}, NO expected {expected_no_prob:.1f}¢, market {best_no_bid}¢, mispricing {no_mispricing:.1f}¢")
-                self.active_positions[market_ticker] = {
-                    'side': 'no',
-                    'entry_price': best_no_bid + 1,
-                    'entry_time': datetime.now(),
-                    'expected_prob': expected_no_prob,
-                    'strike_price': strike_price,
-                    'btc_price': current_btc
-                }
-                return {
-                    'action': 'buy',
-                    'side': 'no',
-                    'count': min(1, self.max_position_size),
-                    'price': best_no_bid + 1,
-                    'btc_price': current_btc,
-                    'strike_price': strike_price,
-                    'mispricing': no_mispricing
-                }
-            
-            return None
-            
-        except Exception as e:
-            print(f"[BTC15MinStrategy] Error in get_trade_decision: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    def _check_exit(self, market: Dict, orderbook: Dict, market_ticker: str) -> Optional[Dict]:
-        """
-        Check if we should exit an active position
-        Exit when pricing catches up (mispricing closes)
-        For 15-min markets, exits are faster (15 seconds minimum hold)
-        """
-        try:
-            position = self.active_positions[market_ticker]
-            side = position['side']
-            entry_price = position['entry_price']
-            entry_time = position['entry_time']
-            
-            # Check if enough time has passed (at least 15 seconds for 15-min markets)
-            if (datetime.now() - entry_time).total_seconds() < 15:
-                return None  # Too soon to exit
-            
-            # Get current market prices
-            yes_price = market.get('yes_price', 50)
-            no_price = market.get('no_price', 50)
-            
-            yes_bids = orderbook.get('orderbook', {}).get('yes', [])
-            no_bids = orderbook.get('orderbook', {}).get('no', [])
-            
-            if not yes_bids or not no_bids:
-                return None
-            
-            current_yes = yes_bids[0][0] if yes_bids else yes_price
-            current_no = no_bids[0][0] if no_bids else no_price
-            
-            # Check if pricing has caught up (mispricing closed)
-            if side == 'yes':
-                current_price = current_yes
-                # Exit if price moved towards expected (caught up) or we're profitable
-                if current_price >= position['expected_prob'] - 2 or current_price > entry_price + 2:
-                    print(f"[BTC15MinStrategy] Exiting YES position: entry {entry_price}¢, current {current_price}¢, expected {position['expected_prob']:.1f}¢")
-                    del self.active_positions[market_ticker]
-                    return {
-                        'action': 'sell',
-                        'side': 'yes',
-                        'count': 1,
-                        'price': current_yes - 1  # Slightly below best bid to exit quickly
-                    }
-            
-            elif side == 'no':
-                current_price = current_no
-                # Exit if price moved towards expected (caught up) or we're profitable
-                if current_price >= position['expected_prob'] - 2 or current_price > entry_price + 2:
-                    print(f"[BTC15MinStrategy] Exiting NO position: entry {entry_price}¢, current {current_price}¢, expected {position['expected_prob']:.1f}¢")
-                    del self.active_positions[market_ticker]
-                    return {
-                        'action': 'sell',
-                        'side': 'no',
-                        'count': 1,
-                        'price': current_no - 1
-                    }
-            
-            return None
-            
-        except Exception as e:
-            print(f"[BTC15MinStrategy] Error in _check_exit: {e}")
-            return None
-"""
-
-
-"""
+# (Removed ~550 lines of commented BTC code for cleaner codebase)
 
 class WeatherDailyStrategy(TradingStrategy):
     """
@@ -562,17 +121,16 @@ class WeatherDailyStrategy(TradingStrategy):
         super().__init__(client)
         self.max_position_size = Config.MAX_POSITION_SIZE
         
-        # Conservative strategy parameters (high win rate)
-        self.min_edge_threshold = 5.0  # Minimum edge % to trade (5% ensures quality)
-        self.min_ev_threshold = 0.01  # Minimum EV in dollars ($0.01 for better ROI)
+        # Conservative strategy parameters (from Config)
+        self.min_edge_threshold = Config.MIN_EDGE_THRESHOLD
+        self.min_ev_threshold = Config.MIN_EV_THRESHOLD
         
-        # Longshot strategy parameters (asymmetric payouts)
-        # Inspired by successful Polymarket weather bot: buy cheap certainty
-        self.longshot_enabled = True  # Enable longshot mode
-        self.longshot_max_price = 10  # Only consider if market price ≤ 10¢ (10%)
-        self.longshot_min_edge = 30.0  # Require massive edge (30%+)
-        self.longshot_min_prob = 50.0  # Our probability must be ≥ 50% (forecast certainty)
-        self.longshot_position_multiplier = 3  # Trade 3x normal size for longshots
+        # Longshot strategy parameters (from Config)
+        self.longshot_enabled = Config.LONGSHOT_ENABLED
+        self.longshot_max_price = Config.LONGSHOT_MAX_PRICE
+        self.longshot_min_edge = Config.LONGSHOT_MIN_EDGE
+        self.longshot_min_prob = Config.LONGSHOT_MIN_PROB
+        self.longshot_position_multiplier = Config.LONGSHOT_POSITION_MULTIPLIER
         
         # Weather data aggregator (shared instance)
         self.weather_agg = WeatherDataAggregator()
@@ -580,6 +138,9 @@ class WeatherDailyStrategy(TradingStrategy):
         
         # Cache for probability distributions (keyed by series_ticker + date)
         self.prob_cache = {}
+        
+        # Track active positions for exit logic
+        self.active_positions: Dict[str, Dict] = {}  # {market_ticker: position_info}
     
     def _extract_market_date(self, market: Dict) -> Optional[datetime]:
         """Extract the target date from market ticker or title"""
@@ -651,7 +212,7 @@ class WeatherDailyStrategy(TradingStrategy):
             return today + timedelta(days=1)
         
         # Fallback: assume tomorrow (original behavior)
-        print(f"[WeatherStrategy] ⚠️  Could not parse date from market, defaulting to tomorrow")
+        logger.warning(f"Could not parse date from market, defaulting to tomorrow")
         return today + timedelta(days=1)
     
     def should_trade(self, market: Dict) -> bool:
@@ -676,8 +237,7 @@ class WeatherDailyStrategy(TradingStrategy):
             return False
         
         # Check if market has sufficient volume (liquidity requirement)
-        # Increased from 5 to 15 for better liquidity and fill rates
-        if market.get('volume', 0) < 15:
+        if market.get('volume', 0) < Config.MIN_MARKET_VOLUME:
             return False
         
         return True
@@ -689,8 +249,17 @@ class WeatherDailyStrategy(TradingStrategy):
         2. Build probability distribution over temperature ranges
         3. Calculate edge and EV
         4. Trade when edge > threshold
+        
+        Also checks for existing positions and handles exit logic.
         """
         try:
+            market_ticker = market.get('ticker', '')
+            
+            # Check if we have an active position to exit
+            if market_ticker in self.active_positions:
+                exit_decision = self._check_exit(market, orderbook, market_ticker)
+                if exit_decision:
+                    return exit_decision
             # Get series ticker - try multiple fields, fallback to ticker prefix
             series_ticker = market.get('series_ticker') or market.get('series_ticker_symbol') or ''
             ticker = market.get('ticker', '')
@@ -703,7 +272,7 @@ class WeatherDailyStrategy(TradingStrategy):
                         break
             
             if not series_ticker:
-                print(f"[WeatherStrategy] ⚠️  Could not determine series for market: {ticker}")
+                logger.warning(f"Could not determine series for market: {ticker}")
                 return None
             
             # Extract target date from market ticker or title
@@ -711,7 +280,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # Title format: "Will the **high temp in NYC** be >26° on Jan 28, 2026?"
             target_date = self._extract_market_date(market)
             if not target_date:
-                print(f"[WeatherStrategy] ⚠️  Could not extract date from market: {ticker}")
+                logger.warning(f"Could not extract date from market: {ticker}")
                 return None
             
             # Verify date is reasonable (not too far in past/future)
@@ -719,15 +288,16 @@ class WeatherDailyStrategy(TradingStrategy):
             market_date = target_date.date()
             days_diff = (market_date - today).days
             
-            if days_diff < -1 or days_diff > 7:  # Allow -1 (yesterday) to +7 days
-                print(f"[WeatherStrategy] ⚠️  Market date {market_date} is too far from today ({days_diff} days), skipping")
+            max_days = Config.MAX_MARKET_DATE_DAYS
+            if days_diff < -1 or days_diff > max_days:  # Allow -1 (yesterday) to max_days
+                logger.warning(f"Market date {market_date} is too far from today ({days_diff} days), skipping")
                 return None
             
             # Extract temperature threshold from market title
             threshold = self.extract_threshold(market)
             if not threshold:
                 # Can't determine threshold, skip
-                print(f"[WeatherStrategy] ⚠️  Could not extract threshold from market: {market.get('title', 'unknown')}")
+                logger.warning(f"Could not extract threshold from market: {market.get('title', 'unknown')}")
                 return None
             
             # Get forecasts from all available sources
@@ -735,7 +305,7 @@ class WeatherDailyStrategy(TradingStrategy):
             
             if not forecasts:
                 # No forecasts available, skip
-                print(f"[WeatherStrategy] ⚠️  No forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
+                logger.warning(f"No forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
                 return None
             
             # Build temperature ranges (2-degree brackets as mentioned in guide)
@@ -782,9 +352,10 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # Get market prices (reuse from earlier calculation if available)
             # Get orderbook data
-            # Kalshi orderbook format: [[price, quantity], ...] sorted by price descending
-            # First entries = highest bids (buyers paying most)
-            # Last entries = lowest asks (sellers wanting least)
+            # Kalshi orderbook format: [[price, quantity], ...] sorted by price ASCENDING
+            # First entries [0] = lowest bids (buyers paying least)
+            # Last entries [-1] = highest bids (buyers paying most) = best bid
+            # For asks: YES ask = 100 - NO bid, NO ask = 100 - YES bid
             yes_orders = orderbook.get('orderbook', {}).get('yes', [])
             no_orders = orderbook.get('orderbook', {}).get('no', [])
             
@@ -802,8 +373,9 @@ class WeatherDailyStrategy(TradingStrategy):
             best_no_ask = no_orders[-1][0] if len(no_orders) > 0 else no_market_price    # Lowest NO ask
             
             # Also get bids for reference (what other buyers are paying)
-            best_yes_bid = yes_orders[0][0] if yes_orders else yes_market_price
-            best_no_bid = no_orders[0][0] if no_orders else no_market_price
+            # Arrays are sorted ASCENDING, so best bid (highest) is LAST element [-1]
+            best_yes_bid = yes_orders[-1][0] if yes_orders else yes_market_price
+            best_no_bid = no_orders[-1][0] if no_orders else no_market_price
             
             # Calculate edge for YES side using ASK price (what we'd actually pay)
             yes_edge = self.weather_agg.calculate_edge(our_prob, int(best_yes_ask))
@@ -882,8 +454,20 @@ class WeatherDailyStrategy(TradingStrategy):
                     position_size = min(base_position, contract_cap, dollar_cap_contracts)
                     
                     confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
-                    print(f"[WeatherStrategy] 🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
-                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
+                    logger.info(f"🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
+                    logger.info(f"💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
+                    
+                    # Record position for exit logic
+                    self.active_positions[market_ticker] = {
+                        'side': 'yes',
+                        'entry_price': best_yes_ask,
+                        'entry_time': datetime.now(),
+                        'count': position_size,
+                        'edge': yes_edge,
+                        'ev': yes_ev,
+                        'strategy_mode': 'longshot'
+                    }
+                    
                     return {
                         'action': 'buy',
                         'side': 'yes',
@@ -925,8 +509,20 @@ class WeatherDailyStrategy(TradingStrategy):
                     position_size = min(base_position, contract_cap, dollar_cap_contracts)
                     
                     confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
-                    print(f"[WeatherStrategy] 🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
-                    print(f"[WeatherStrategy] 💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
+                    logger.info(f"🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
+                    logger.info(f"💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
+                    
+                    # Record position for exit logic
+                    self.active_positions[market_ticker] = {
+                        'side': 'no',
+                        'entry_price': best_no_ask,
+                        'entry_time': datetime.now(),
+                        'count': position_size,
+                        'edge': no_edge,
+                        'ev': no_ev,
+                        'strategy_mode': 'longshot'
+                    }
+                    
                     return {
                         'action': 'buy',
                         'side': 'no',
@@ -959,7 +555,19 @@ class WeatherDailyStrategy(TradingStrategy):
                 dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_yes_ask) if best_yes_ask > 0 else contract_cap
                 position_size = min(base_position, contract_cap, dollar_cap_contracts)
                 
-                print(f"[WeatherStrategy] ✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
+                logger.info(f"✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
+                
+                # Record position for exit logic
+                self.active_positions[market_ticker] = {
+                    'side': 'yes',
+                    'entry_price': best_yes_ask,
+                    'entry_time': datetime.now(),
+                    'count': position_size,
+                    'edge': yes_edge,
+                    'ev': yes_ev,
+                    'strategy_mode': 'conservative'
+                }
+                
                 return {
                     'action': 'buy',
                     'side': 'yes',
@@ -986,7 +594,19 @@ class WeatherDailyStrategy(TradingStrategy):
                 dollar_cap_contracts = int(Config.MAX_DOLLARS_PER_MARKET * 100 / best_no_ask) if best_no_ask > 0 else contract_cap
                 position_size = min(base_position, contract_cap, dollar_cap_contracts)
                 
-                print(f"[WeatherStrategy] ✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
+                logger.info(f"✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
+                
+                # Record position for exit logic
+                self.active_positions[market_ticker] = {
+                    'side': 'no',
+                    'entry_price': best_no_ask,
+                    'entry_time': datetime.now(),
+                    'count': position_size,
+                    'edge': no_edge,
+                    'ev': no_ev,
+                    'strategy_mode': 'conservative'
+                }
+                
                 return {
                     'action': 'buy',
                     'side': 'no',
@@ -1000,9 +620,127 @@ class WeatherDailyStrategy(TradingStrategy):
             return None
             
         except Exception as e:
-            print(f"[WeatherStrategy] Error in get_trade_decision: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Error in get_trade_decision: {e}", exc_info=True)
+            return None
+    
+    def _check_exit(self, market: Dict, orderbook: Dict, market_ticker: str) -> Optional[Dict]:
+        """
+        Check if we should exit an active weather position
+        
+        Exit conditions:
+        - Edge disappears (re-evaluate and edge < threshold)
+        - Take profit (price moved significantly in our favor)
+        - Stop loss (price moved significantly against us)
+        
+        Args:
+            market: Market data from Kalshi
+            orderbook: Current orderbook data
+            market_ticker: Market ticker symbol
+            
+        Returns:
+            Exit decision dict or None
+        """
+        try:
+            position = self.active_positions.get(market_ticker)
+            if not position:
+                return None
+            
+            side = position['side']
+            entry_price = position.get('entry_price', 0)
+            entry_time = position.get('entry_time')
+            entry_edge = position.get('edge', 0)
+            
+            # Don't exit too quickly (at least 5 minutes for daily markets)
+            if entry_time and (datetime.now() - entry_time).total_seconds() < 300:
+                return None
+            
+            # Get current market prices
+            yes_orders = orderbook.get('orderbook', {}).get('yes', [])
+            no_orders = orderbook.get('orderbook', {}).get('no', [])
+            
+            if not yes_orders or not no_orders:
+                return None
+            
+            # Calculate current ask prices
+            best_no_bid = no_orders[-1][0] if no_orders else 50
+            best_yes_bid = yes_orders[-1][0] if yes_orders else 50
+            current_yes_ask = 100 - best_no_bid
+            current_no_ask = 100 - best_yes_bid
+            
+            current_ask = current_yes_ask if side == 'yes' else current_no_ask
+            
+            # Calculate current profit/loss
+            if side == 'yes':
+                # If YES wins, we get $1 per contract
+                # Current value = current_yes_ask / 100
+                current_value = current_ask / 100.0
+                entry_cost = entry_price / 100.0
+                profit_pct = ((current_value - entry_cost) / entry_cost) * 100 if entry_cost > 0 else 0
+            else:
+                # If NO wins, we get $1 per contract
+                current_value = current_ask / 100.0
+                entry_cost = entry_price / 100.0
+                profit_pct = ((current_value - entry_cost) / entry_cost) * 100 if entry_cost > 0 else 0
+            
+            # Exit condition 1: Take profit (price moved 20%+ in our favor)
+            if profit_pct >= 20:
+                logger.info(f"Taking profit on {market_ticker}: {side.upper()} entry {entry_price}¢ -> current {current_ask}¢ ({profit_pct:.1f}% profit)")
+                del self.active_positions[market_ticker]
+                return {
+                    'action': 'sell',
+                    'side': side,
+                    'count': position.get('count', 1),
+                    'price': int(current_ask - 1),  # Slightly below ask to exit quickly
+                    'reason': 'take_profit'
+                }
+            
+            # Exit condition 2: Stop loss (price moved 30%+ against us)
+            if profit_pct <= -30:
+                logger.warning(f"Stop loss triggered on {market_ticker}: {side.upper()} entry {entry_price}¢ -> current {current_ask}¢ ({profit_pct:.1f}% loss)")
+                del self.active_positions[market_ticker]
+                return {
+                    'action': 'sell',
+                    'side': side,
+                    'count': position.get('count', 1),
+                    'price': int(current_ask - 1),
+                    'reason': 'stop_loss'
+                }
+            
+            # Exit condition 3: Edge disappeared (re-evaluate market)
+            # Re-run strategy evaluation to check if edge still exists
+            try:
+                decisions = self.get_trade_decision(market, orderbook)
+                # If we get a decision for the same side, edge still exists
+                # If no decision or different side, edge is gone
+                edge_still_exists = False
+                if decisions:
+                    for decision in decisions if isinstance(decisions, list) else [decisions]:
+                        if decision and decision.get('side') == side:
+                            current_edge = decision.get('edge', 0)
+                            # Edge must still meet minimum threshold
+                            if decision.get('strategy_mode') == 'longshot':
+                                edge_still_exists = current_edge >= self.longshot_min_edge
+                            else:
+                                edge_still_exists = current_edge >= self.min_edge_threshold
+                            break
+                
+                if not edge_still_exists and entry_edge > 0:
+                    logger.info(f"Edge disappeared on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), exiting")
+                    del self.active_positions[market_ticker]
+                    return {
+                        'action': 'sell',
+                        'side': side,
+                        'count': position.get('count', 1),
+                        'price': int(current_ask - 1),
+                        'reason': 'edge_gone'
+                    }
+            except Exception as e:
+                logger.debug(f"Could not re-evaluate edge for {market_ticker}: {e}")
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in _check_exit for {market_ticker}: {e}", exc_info=True)
             return None
 
 

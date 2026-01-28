@@ -15,11 +15,30 @@ class Config:
     MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '10'))  # $10 max daily loss limit
     MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '25'))  # Max contracts per market
     MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '3.0'))  # Max dollars per market ($3.00)
-    ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'btc_15m,weather_daily').split(',')
+    ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'weather_daily').split(',')
+    
+    # Weather Strategy Parameters
+    # Conservative strategy
+    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '5.0'))  # Minimum edge % to trade
+    MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.01'))  # Minimum EV in dollars
+    
+    # Longshot strategy
+    LONGSHOT_ENABLED = os.getenv('LONGSHOT_ENABLED', 'true').lower() == 'true'
+    LONGSHOT_MAX_PRICE = int(os.getenv('LONGSHOT_MAX_PRICE', '10'))  # Only consider if market price ≤ 10¢
+    LONGSHOT_MIN_EDGE = float(os.getenv('LONGSHOT_MIN_EDGE', '30.0'))  # Require massive edge (30%+)
+    LONGSHOT_MIN_PROB = float(os.getenv('LONGSHOT_MIN_PROB', '50.0'))  # Our probability must be ≥ 50%
+    LONGSHOT_POSITION_MULTIPLIER = int(os.getenv('LONGSHOT_POSITION_MULTIPLIER', '3'))  # Trade 3x normal size
+    
+    # Market filtering
+    MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
+    MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '3'))  # Max days in future for forecasts
+    
+    # Caching
+    ORDERBOOK_CACHE_TTL = int(os.getenv('ORDERBOOK_CACHE_TTL', '3'))  # 3 seconds
+    PORTFOLIO_CACHE_TTL = int(os.getenv('PORTFOLIO_CACHE_TTL', '10'))  # 10 seconds
+    FORECAST_CACHE_TTL = int(os.getenv('FORECAST_CACHE_TTL', '1800'))  # 30 minutes
     
     # Market Tickers
-    BTC_15M_SERIES = 'KXBTC15M'  # 15-minute BTC markets (up/down)
-    BTC_HOURLY_SERIES = 'KXBTC'  # Hourly BTC markets (price ranges)
     # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles, Denver
     WEATHER_SERIES = [
         'KXHIGHNY', 'KXLOWNY',      # New York City

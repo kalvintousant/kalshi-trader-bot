@@ -5,6 +5,7 @@ Based on the weather trading edge strategy guide
 import os
 import re
 import requests
+import logging
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -14,6 +15,8 @@ from scipy import stats
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Compile regex patterns once at module level for performance
 TEMP_PATTERN = re.compile(r'(\d+(?:\.\d+)?)\s*°?F', re.IGNORECASE)
@@ -53,12 +56,13 @@ class WeatherDataAggregator:
         self.accuweather_api_key = os.getenv('ACCUWEATHER_API_KEY', '')
         self.weatherbit_api_key = os.getenv('WEATHERBIT_API_KEY', '')
         
-        # Cache for forecasts (refresh every 30 minutes)
+        # Cache for forecasts (from Config)
         # Based on AUSHIGH contract rules: daily markets, forecasts update 2-4x/day
-        # 30 min cache balances freshness with API rate limits
+        # Cache TTL balances freshness with API rate limits
         self.forecast_cache = {}
         self.cache_timestamp = {}
-        self.cache_ttl = 1800  # 30 minutes in seconds (forecasts update hourly at most)
+        from .config import Config
+        self.cache_ttl = Config.FORECAST_CACHE_TTL
         
         # Forecast metadata cache (stores source and timestamp for each forecast)
         self.forecast_metadata = {}  # {cache_key: [(temp, source, timestamp), ...]}
@@ -105,7 +109,7 @@ class WeatherDataAggregator:
                                 # Return temp, source, and current timestamp
                                 return (temp, 'tomorrowio', datetime.now())
         except Exception as e:
-            print(f"[Weather] Tomorrow.io API error: {e}")
+            logger.debug(f"Tomorrow.io API error: {e}")
         return None
     
     def get_forecast_nws(self, lat: float, lon: float, date: datetime) -> Optional[Tuple[float, str, datetime]]:
@@ -130,7 +134,7 @@ class WeatherDataAggregator:
                                 # Return temp, source, and current timestamp
                                 return (temp, 'nws', datetime.now())
         except Exception as e:
-            print(f"[Weather] NWS API error: {e}")
+            logger.debug(f"NWS API error: {e}")
         return None
     
     def get_forecast_weatherbit(self, lat: float, lon: float, date: datetime, series_ticker: str = '') -> Optional[Tuple[float, str, datetime]]:
@@ -163,7 +167,7 @@ class WeatherDataAggregator:
                             # Return temp, source, and current timestamp
                             return (temp, 'weatherbit', datetime.now())
         except Exception as e:
-            print(f"[Weather] Weatherbit API error: {e}")
+            logger.debug(f"Weatherbit API error: {e}")
         return None
     
     def detect_outliers(self, forecasts: List[float]) -> List[float]:
@@ -188,7 +192,7 @@ class WeatherDataAggregator:
         
         if len(valid_forecasts) < len(forecasts):
             outliers = [f for f in forecasts if f not in valid_forecasts]
-            print(f"[Weather] ⚠️  Detected {len(forecasts) - len(valid_forecasts)} outlier(s): {outliers}")
+            logger.warning(f"Detected {len(forecasts) - len(valid_forecasts)} outlier(s): {outliers}")
         
         return valid_forecasts if valid_forecasts else forecasts  # Keep all if filtering removes everything
     
@@ -239,12 +243,12 @@ class WeatherDataAggregator:
                 weatherbit_result = self.get_forecast_weatherbit(lat, lon, target_date, series_ticker)
                 if weatherbit_result is not None:
                     forecast_data.append(weatherbit_result)
-                    print(f"[Weather] Using Weatherbit fallback for {series_ticker} (NWS/Tomorrow.io unavailable)")
+                    logger.info(f"Using Weatherbit fallback for {series_ticker} (NWS/Tomorrow.io unavailable)")
             except Exception as e:
-                print(f"[Weather] Error fetching from weatherbit (fallback): {e}")
+                logger.debug(f"Error fetching from weatherbit (fallback): {e}")
         
         if not forecast_data:
-            print(f"[Weather] No forecasts available for {city['name']}, using fallback")
+            logger.warning(f"No forecasts available for {city['name']}, using fallback")
             return []
         
         # Extract temperatures for outlier detection
@@ -399,7 +403,7 @@ class WeatherDataAggregator:
         if len(errors) > 100:
             errors.pop(0)  # Keep only most recent 100
         
-        print(f"[Weather] 📊 Updated forecast error for {series_ticker} (month {month}): {error:.2f}°F")
+        logger.info(f"📊 Updated forecast error for {series_ticker} (month {month}): {error:.2f}°F")
     
     def get_market_probability(self, market: Dict, threshold: float, 
                               probability_dist: Dict[Tuple[float, float], float]) -> float:
@@ -544,26 +548,43 @@ class WeatherDataAggregator:
         
         Returns:
             Estimated average fill price in cents
+        
+        Note: Kalshi orderbook arrays are sorted ASCENDING (lowest to highest).
+        To buy, we need to pay the ASK price, which is calculated as:
+        - YES ask = 100 - NO bid (highest NO bid)
+        - NO ask = 100 - YES bid (highest YES bid)
         """
-        orders = orderbook.get('orderbook', {}).get(side, [])
-        if not orders:
-            return 100  # Worst case: market price
+        # Get opposite side to calculate ask price
+        opposite_side = 'no' if side == 'yes' else 'yes'
+        opposite_orders = orderbook.get('orderbook', {}).get(opposite_side, [])
         
-        total_cost = 0
-        remaining = quantity
+        if not opposite_orders:
+            # Fallback: use market price
+            return 50  # Default to 50¢ if no orderbook data
         
-        for price, size in orders:
-            if remaining <= 0:
-                break
-            fill_size = min(remaining, size)
-            total_cost += price * fill_size
-            remaining -= fill_size
+        # Best ask = 100 - best opposite bid
+        # Arrays are ascending, so best bid (highest) is last element [-1]
+        best_opposite_bid = opposite_orders[-1][0]  # Highest bid
+        best_ask = 100 - best_opposite_bid
         
-        if remaining > 0:
-            # Not enough liquidity, use worst-case price (last entry = lowest ask)
-            return orders[-1][0] if orders else 100
+        # For small quantities, we'll likely fill at best ask
+        # For larger quantities, estimate slippage based on orderbook depth
+        if quantity <= 5:
+            return best_ask
         
-        return total_cost / quantity if quantity > 0 else orders[-1][0]
+        # Estimate slippage: check if there's enough depth at best ask
+        same_side_orders = orderbook.get('orderbook', {}).get(side, [])
+        if not same_side_orders:
+            return best_ask
+        
+        # Calculate total available at best ask and nearby prices
+        # Since we're buying, we need to pay ask prices (calculated from opposite bids)
+        # For simplicity, assume we fill at best ask for small orders
+        # For larger orders, add small slippage estimate
+        slippage_estimate = max(0, (quantity - 5) * 0.1)  # 0.1¢ per contract beyond 5
+        estimated_price = min(best_ask + slippage_estimate, 100)
+        
+        return estimated_price
     
     def kelly_fraction(self, win_prob: float, payout_ratio: float, fractional: float = 0.5) -> float:
         """

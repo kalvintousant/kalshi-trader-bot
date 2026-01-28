@@ -4,11 +4,14 @@ import time
 import asyncio
 import requests
 import websockets
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from .config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class KalshiClient:
@@ -24,10 +27,15 @@ class KalshiClient:
         # Use session for connection pooling and better performance
         self.session = requests.Session()
         
-        # Cache for orderbooks (5 second TTL)
+        # Cache for orderbooks (from Config)
         self.orderbook_cache = {}
         self.orderbook_cache_timestamp = {}
-        self.orderbook_cache_ttl = 5  # 5 seconds
+        self.orderbook_cache_ttl = Config.ORDERBOOK_CACHE_TTL
+        
+        # Cache for portfolio (from Config)
+        self.portfolio_cache = None
+        self.portfolio_cache_timestamp = 0
+        self.portfolio_cache_ttl = Config.PORTFOLIO_CACHE_TTL
     
     def _load_private_key(self):
         """Load the private key from file"""
@@ -122,7 +130,7 @@ class KalshiClient:
                     if hasattr(e.response, 'status_code') and e.response.status_code == 429:
                         # Rate limited - use longer backoff
                         wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
-                        print(f"[API] Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
                     time.sleep(wait_time)
@@ -146,7 +154,7 @@ class KalshiClient:
                     if hasattr(e.response, 'status_code') and e.response.status_code == 429:
                         # Rate limited - use longer backoff
                         wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
-                        print(f"[API] Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
                     time.sleep(wait_time)
@@ -170,7 +178,7 @@ class KalshiClient:
                     if hasattr(e.response, 'status_code') and e.response.status_code == 429:
                         # Rate limited - use longer backoff
                         wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
-                        print(f"[API] Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
                     time.sleep(wait_time)
@@ -196,9 +204,23 @@ class KalshiClient:
         """Get orderbook for a specific market with caching"""
         return self._get(f"/markets/{market_ticker}/orderbook", use_cache=use_cache)
     
-    def get_portfolio(self) -> Dict:
-        """Get portfolio information"""
-        return self._get('/portfolio/balance')
+    def get_portfolio(self, use_cache: bool = True) -> Dict:
+        """Get portfolio information with caching"""
+        # Check cache first
+        if use_cache:
+            cache_age = time.time() - self.portfolio_cache_timestamp
+            if self.portfolio_cache and cache_age < self.portfolio_cache_ttl:
+                return self.portfolio_cache
+        
+        # Fetch fresh portfolio data
+        portfolio = self._get('/portfolio/balance')
+        
+        # Update cache
+        if use_cache:
+            self.portfolio_cache = portfolio
+            self.portfolio_cache_timestamp = time.time()
+        
+        return portfolio
     
     def get_orders(self, status: Optional[str] = None) -> List[Dict]:
         """Get orders, optionally filtered by status"""

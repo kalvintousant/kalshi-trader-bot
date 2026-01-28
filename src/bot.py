@@ -2,11 +2,17 @@ import asyncio
 import json
 import time
 import requests
+import logging
 from datetime import datetime
 from typing import Dict, List, Set
 from src.kalshi_client import KalshiClient
 from src.strategies import StrategyManager
 from src.config import Config
+from src.logger import setup_logging
+
+# Set up logging
+setup_logging()
+logger = logging.getLogger(__name__)
 
 
 class KalshiTradingBot:
@@ -16,7 +22,7 @@ class KalshiTradingBot:
         Config.validate()
         self.client = KalshiClient()
         
-        # Weather markets only - no BTC tracker needed
+        # Weather markets only
         self.strategy_manager = StrategyManager(self.client)
         self.running = False
         self.markets_being_tracked = set()
@@ -30,12 +36,8 @@ class KalshiTradingBot:
         # Track orders we've already notified about (to avoid duplicate notifications)
         self.notified_orders: Set[str] = set()
         
-        # Track relevant series for filtering
+        # Track relevant series for filtering (weather markets only)
         self.relevant_series: Set[str] = set()
-        if 'btc_15m' in Config.ENABLED_STRATEGIES:
-            self.relevant_series.add(Config.BTC_15M_SERIES)
-        if 'btc_hourly' in Config.ENABLED_STRATEGIES:
-            self.relevant_series.add(Config.BTC_HOURLY_SERIES)
         if 'weather_daily' in Config.ENABLED_STRATEGIES:
             self.relevant_series.update(Config.WEATHER_SERIES)
     
@@ -44,21 +46,21 @@ class KalshiTradingBot:
         today = datetime.now().date()
         if today > self.last_reset_date:
             # Get starting account value (balance + portfolio_value) for the day
-            portfolio = self.client.get_portfolio()
+            portfolio = self.client.get_portfolio(use_cache=False)  # Force fresh data for daily reset
             balance = portfolio.get('balance', 0) / 100.0  # Convert cents to dollars
             portfolio_value = portfolio.get('portfolio_value', 0) / 100.0
             self.starting_account_value = balance + portfolio_value
             self.daily_pnl = 0
             self.last_reset_date = today
-            print(f"[Bot] Daily stats reset for {today}")
-            print(f"[Bot] Starting account value: ${self.starting_account_value:.2f}")
+            logger.info(f"Daily stats reset for {today}")
+            logger.info(f"Starting account value: ${self.starting_account_value:.2f}")
     
     def check_daily_loss_limit(self):
         """Check if we've hit daily loss limit based on total portfolio P&L"""
         self.reset_daily_stats()
         
         # Get current account value (cash balance + portfolio value)
-        portfolio = self.client.get_portfolio()
+        portfolio = self.client.get_portfolio()  # Uses cache
         balance = portfolio.get('balance', 0) / 100.0  # Convert cents to dollars
         portfolio_value = portfolio.get('portfolio_value', 0) / 100.0
         current_account_value = balance + portfolio_value
@@ -73,10 +75,10 @@ class KalshiTradingBot:
         
         # Check if we've hit the loss limit
         if self.daily_pnl <= -Config.MAX_DAILY_LOSS:
-            print(f"[Bot] ⛔ Daily loss limit reached!")
-            print(f"[Bot] Starting value: ${self.starting_account_value:.2f}")
-            print(f"[Bot] Current value: ${current_account_value:.2f}")
-            print(f"[Bot] Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+            logger.critical(f"⛔ Daily loss limit reached!")
+            logger.critical(f"Starting value: ${self.starting_account_value:.2f}")
+            logger.critical(f"Current value: ${current_account_value:.2f}")
+            logger.critical(f"Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
             return True
         return False
     
@@ -102,8 +104,9 @@ class KalshiTradingBot:
                         now = datetime.now(timezone.utc)
                         if (now - update_time).total_seconds() > 300:  # 5 minutes
                             continue
-                    except:
-                        pass  # If we can't parse time, check anyway
+                    except (ValueError, AttributeError, KeyError, TypeError):
+                        # If we can't parse time, skip this order (likely old)
+                        pass
                 
                 # Mark as notified
                 self.notified_orders.add(order_id)
@@ -125,10 +128,10 @@ class KalshiTradingBot:
                         f"✅ Trade Filled: {action} {side}",
                         f"{fill_count} contract(s) @ {fill_price}¢\nMarket: {ticker}"
                     )
-                    print(f"[Bot] 📬 Notification sent: {action} {fill_count} {side} @ {fill_price}¢ filled for {ticker}")
+                    logger.info(f"📬 Notification sent: {action} {fill_count} {side} @ {fill_price}¢ filled for {ticker}")
         
         except Exception as e:
-            print(f"[Bot] Error checking filled orders: {e}")
+            logger.error(f"Error checking filled orders: {e}", exc_info=True)
     
     def check_and_cancel_stale_orders(self):
         """Check resting orders and cancel if edge/EV no longer meets strategy thresholds"""
@@ -155,7 +158,7 @@ class KalshiTradingBot:
                     
                     if not market:
                         # Market might have closed, cancel order
-                        print(f"[Bot] 🗑️  Canceling order {order_id}: Market {ticker} not found (likely closed)")
+                        logger.info(f"🗑️  Canceling order {order_id}: Market {ticker} not found (likely closed)")
                         self.client.cancel_order(order_id)
                         continue
                     
@@ -179,8 +182,12 @@ class KalshiTradingBot:
                     # Get current ask prices
                     yes_orders = orderbook.get('orderbook', {}).get('yes', [])
                     no_orders = orderbook.get('orderbook', {}).get('no', [])
-                    current_yes_ask = yes_orders[-1][0] if yes_orders else market.get('yes_price', 50)
-                    current_no_ask = no_orders[-1][0] if no_orders else market.get('no_price', 50)
+                    # Arrays are ascending, so calculate asks from opposite bids
+                    # YES ask = 100 - NO bid (highest), NO ask = 100 - YES bid (highest)
+                    best_no_bid = no_orders[-1][0] if no_orders else market.get('no_price', 50)
+                    best_yes_bid = yes_orders[-1][0] if yes_orders else market.get('yes_price', 50)
+                    current_yes_ask = 100 - best_no_bid
+                    current_no_ask = 100 - best_yes_bid
                     current_ask = current_yes_ask if side == 'yes' else current_no_ask
                     
                     for decision in decisions:
@@ -207,20 +214,20 @@ class KalshiTradingBot:
                     
                     # If no matching decision found, or decision doesn't meet thresholds, cancel
                     if not order_still_valid:
-                        print(f"[Bot] 🗑️  Canceling order {order_id}: Edge/EV no longer meets strategy thresholds")
-                        print(f"     Market: {ticker}, Side: {side.upper()}, Order Price: {order_price}¢, Current Ask: {current_ask}¢")
+                        logger.info(f"🗑️  Canceling order {order_id}: Edge/EV no longer meets strategy thresholds")
+                        logger.debug(f"Market: {ticker}, Side: {side.upper()}, Order Price: {order_price}¢, Current Ask: {current_ask}¢")
                         try:
                             self.client.cancel_order(order_id)
-                            print(f"[Bot] ✅ Order {order_id} canceled successfully")
+                            logger.info(f"✅ Order {order_id} canceled successfully")
                         except Exception as e:
-                            print(f"[Bot] ⚠️  Error canceling order {order_id}: {e}")
+                            logger.warning(f"Error canceling order {order_id}: {e}")
                 
                 except Exception as e:
-                    print(f"[Bot] ⚠️  Error evaluating order {order_id} for cancellation: {e}")
+                    logger.warning(f"Error evaluating order {order_id} for cancellation: {e}")
                     continue
         
         except Exception as e:
-            print(f"[Bot] Error checking stale orders: {e}")
+            logger.error(f"Error checking stale orders: {e}", exc_info=True)
     
     def _send_notification(self, title: str, message: str):
         """Send macOS notification"""
@@ -237,12 +244,10 @@ class KalshiTradingBot:
     def scan_and_trade(self):
         """Scan markets and execute trades"""
         if self.check_daily_loss_limit():
-            print("[Bot] Pausing trading due to daily loss limit")
+            logger.warning("Pausing trading due to daily loss limit")
             return
         
-        print(f"[Bot] Scanning markets at {datetime.now()}")
-        
-        # Weather markets only - no BTC data needed
+        logger.debug(f"Scanning markets at {datetime.now()}")
         
         try:
             # Filter markets by relevant series FIRST to reduce API calls
@@ -254,7 +259,7 @@ class KalshiTradingBot:
                 try:
                     open_markets = self.client.get_markets(series_ticker=series_ticker, status='open', limit=200)
                 except Exception as e:
-                    print(f"[Bot] ⚠️  Error fetching open markets for {series_ticker}: {e}")
+                    logger.warning(f"Error fetching open markets for {series_ticker}: {e}")
                     open_markets = []
                 
                 # Try to get active markets (some series may not support this status)
@@ -286,16 +291,16 @@ class KalshiTradingBot:
             
             # Process new markets FIRST (critical for early entry)
             if new_markets:
-                print(f"[Bot] 🆕 Found {len(new_markets)} NEW markets! Processing immediately...")
+                logger.info(f"🆕 Found {len(new_markets)} NEW markets! Processing immediately...")
             
             # Combine: new markets first, then existing
             markets_to_process = new_markets + existing_markets
-            print(f"[Bot] Found {len(markets_to_process)} relevant markets ({len(new_markets)} new, {len(existing_markets)} existing)")
+            logger.debug(f"Found {len(markets_to_process)} relevant markets ({len(new_markets)} new, {len(existing_markets)} existing)")
             
             # Debug: show market details
             if markets_to_process:
                 sample = markets_to_process[0]
-                print(f"[Bot] Sample market: {sample.get('ticker')} | Series: {sample.get('series_ticker')} | Volume: {sample.get('volume', 0)} | Status: {sample.get('status')}")
+                logger.debug(f"Sample market: {sample.get('ticker')} | Series: {sample.get('series_ticker')} | Volume: {sample.get('volume', 0)} | Status: {sample.get('status')}")
             
             markets_evaluated = 0
             for market in markets_to_process:
@@ -310,20 +315,18 @@ class KalshiTradingBot:
                         continue  # Not a weather market, skip silently
                     if status != 'open':
                         continue  # Not open, skip silently
-                    if volume < 15:
-                        print(f"[Bot] ⚠️  Market {market.get('ticker', 'unknown')} skipped: volume {volume} < 15")
+                    if volume < Config.MIN_MARKET_VOLUME:
+                        logger.debug(f"Market {market.get('ticker', 'unknown')} skipped: volume {volume} < {Config.MIN_MARKET_VOLUME}")
                     continue
                 
                 markets_evaluated += 1
-                print(f"[Bot] Evaluating market: {market.get('ticker', 'unknown')} - {market.get('title', 'unknown')[:50]}")
+                logger.debug(f"Evaluating market: {market.get('ticker', 'unknown')} - {market.get('title', 'unknown')[:50]}")
                 
                 # Evaluate market with all strategies
                 try:
                     decisions = self.strategy_manager.evaluate_market(market)
                 except Exception as e:
-                    print(f"[Bot] ⚠️  Error evaluating market {market.get('ticker', 'unknown')}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    logger.warning(f"Error evaluating market {market.get('ticker', 'unknown')}: {e}", exc_info=True)
                     continue
                 
                 for decision in decisions:
@@ -338,12 +341,12 @@ class KalshiTradingBot:
                         self.markets_being_tracked.add(market_ticker)
                         
                         # Log trade summary
-                        print(f"[Bot] Trade executed successfully - Market: {market_ticker}")
-                        print(f"[Bot] Active positions being tracked: {len(self.markets_being_tracked)}")
+                        logger.info(f"Trade executed successfully - Market: {market_ticker}")
+                        logger.debug(f"Active positions being tracked: {len(self.markets_being_tracked)}")
                         
                         time.sleep(0.3)  # Reduced rate limiting delay
         except Exception as e:
-            print(f"[Bot] Error in scan_and_trade: {e}")
+            logger.error(f"Error in scan_and_trade: {e}", exc_info=True)
     
     async def handle_websocket_messages(self, websocket):
         """Handle incoming WebSocket messages"""
@@ -394,39 +397,37 @@ class KalshiTradingBot:
             try:
                 await self.client.connect_websocket(self.handle_websocket_messages)
             except Exception as e:
-                print(f"[Bot] WebSocket error: {e}, reconnecting in 5 seconds...")
+                logger.warning(f"WebSocket error: {e}, reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
     
     def run(self, use_websocket: bool = False):
         """Run the trading bot"""
         self.running = True
-        print("[Bot] Starting Kalshi Trading Bot...")
-        print(f"[Bot] Enabled strategies: {', '.join(Config.ENABLED_STRATEGIES)}")
+        logger.info("Starting Kalshi Trading Bot...")
+        logger.info(f"Enabled strategies: {', '.join(Config.ENABLED_STRATEGIES)}")
         
         # Get initial portfolio balance
         try:
             portfolio = self.client.get_portfolio()
-            print(f"[Bot] Portfolio balance: ${portfolio.get('balance', 0) / 100}")
+            balance = portfolio.get('balance', 0) / 100
+            portfolio_value = portfolio.get('portfolio_value', 0) / 100
+            logger.info(f"Portfolio balance: ${balance:.2f}, Portfolio value: ${portfolio_value:.2f}")
         except Exception as e:
-            print(f"[Bot] Could not fetch portfolio: {e}")
+            logger.error(f"Could not fetch portfolio: {e}", exc_info=True)
         
         if use_websocket:
             # Run with WebSocket for real-time updates
-            print("[Bot] Starting WebSocket connection...")
+            logger.info("Starting WebSocket connection...")
             asyncio.run(self.run_websocket())
         else:
             # Run polling mode
-            print("[Bot] Running in polling mode...")
-            if 'btc_15m' in Config.ENABLED_STRATEGIES:
-                print("[Bot] Scan interval: 0.5 seconds (ultra-fast for new market detection and latency arbitrage)")
-            elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
-                print("[Bot] Scan interval: 10 seconds (optimized for hourly BTC markets)")
-            elif 'weather_daily' in Config.ENABLED_STRATEGIES:
-                print("[Bot] Scan interval: 30 seconds (Kalshi odds check) | Weather forecast cache: 30 minutes")
+            logger.info("Running in polling mode...")
+            if 'weather_daily' in Config.ENABLED_STRATEGIES:
+                logger.info(f"Scan interval: 30 seconds (Kalshi odds check) | Weather forecast cache: {Config.FORECAST_CACHE_TTL/60} minutes")
             else:
-                print("[Bot] Scan interval: 15 seconds")
-            # Heartbeat interval (log every 30 minutes for weather, every hour for BTC)
-            heartbeat_interval = 1800 if 'weather_daily' in Config.ENABLED_STRATEGIES else 3600
+                logger.info("Scan interval: 15 seconds")
+            # Heartbeat interval (log every 30 minutes for weather markets)
+            heartbeat_interval = 1800
             last_heartbeat = time.time()
             
             while self.running:
@@ -452,21 +453,15 @@ class KalshiTradingBot:
                         if self.starting_account_value is not None:
                             self.daily_pnl = total_value - self.starting_account_value
                         
-                        print(f"[Bot] ❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h")
-                        print(f"[Bot]    Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
-                        print(f"[Bot]    Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+                        logger.info(f"❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h")
+                        logger.info(f"   Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
+                        logger.info(f"   Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
                         last_heartbeat = time.time()
                     
                     # Adaptive scan intervals based on market type
-                    # BTC 15-min: 0.5s (ultra-fast for new market detection)
-                    # BTC hourly: 10s (moderate speed)
-                    # Weather daily: 30s (frequent Kalshi odds check, weather forecasts cached for 30 min)
-                    if 'btc_15m' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 0.5 - scan_duration)  # 0.5 second interval
-                    elif 'btc_hourly' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 10 - scan_duration)  # 10 second interval
-                    elif 'weather_daily' in Config.ENABLED_STRATEGIES:
-                        sleep_time = max(0, 30 - scan_duration)  # 30 seconds - frequent Kalshi odds check (forecasts cached 30 min)
+                    # Weather daily: 30s (frequent Kalshi odds check, weather forecasts cached)
+                    if 'weather_daily' in Config.ENABLED_STRATEGIES:
+                        sleep_time = max(0, 30 - scan_duration)  # 30 seconds - frequent Kalshi odds check (forecasts cached)
                     else:
                         sleep_time = max(0, 15 - scan_duration)  # 15 second default
                     
@@ -474,25 +469,23 @@ class KalshiTradingBot:
                         time.sleep(sleep_time)
                         
                 except KeyboardInterrupt:
-                    print("\n[Bot] Shutting down...")
+                    logger.info("\nShutting down...")
                     self.running = False
                 except ConnectionError as e:
-                    print(f"[Bot] ⚠️  Connection error: {e}. Retrying in 30 seconds...")
+                    logger.warning(f"Connection error: {e}. Retrying in 30 seconds...")
                     time.sleep(30)
                 except requests.exceptions.RequestException as e:
-                    print(f"[Bot] ⚠️  Network error: {e}. Retrying in 30 seconds...")
+                    logger.warning(f"Network error: {e}. Retrying in 30 seconds...")
                     time.sleep(30)
                 except Exception as e:
-                    print(f"[Bot] ⚠️  Unexpected error in main loop: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    print("[Bot] Continuing in 60 seconds...")
+                    logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+                    logger.info("Continuing in 60 seconds...")
                     time.sleep(60)
     
     def stop(self):
         """Stop the bot"""
         self.running = False
-        print("[Bot] Bot stopped")
+        logger.info("Bot stopped")
 
 
 if __name__ == '__main__':
