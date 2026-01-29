@@ -47,6 +47,7 @@ This bot implements a dual-strategy approach combining conservative edge-based t
 
 ---
 
+<a id="installation"></a>
 ## 🚀 Installation
 
 ### Prerequisites
@@ -84,6 +85,7 @@ This bot implements a dual-strategy approach combining conservative edge-based t
 
 ---
 
+<a id="configuration"></a>
 ## ⚙️ Configuration
 
 ### Environment Variables
@@ -142,6 +144,7 @@ LOG_FILE=bot.log
 
 ---
 
+<a id="quick-start"></a>
 ## 🏃 Quick Start
 
 ### Option 1: Clean Start Script (Recommended)
@@ -192,6 +195,7 @@ crontab -e
 
 ---
 
+<a id="trading-strategies"></a>
 ## 🎯 Trading Strategies
 
 ### Conservative Strategy
@@ -285,6 +289,7 @@ Action: SELL → Lock in ~$1.80 profit
 
 ---
 
+<a id="risk-management"></a>
 ## 🛡️ Risk Management
 
 ### Multi-Layer Protection
@@ -323,6 +328,7 @@ Action: SELL → Lock in ~$1.80 profit
 
 ---
 
+<a id="architecture"></a>
 ## 🏗️ Architecture
 
 ### Project Structure
@@ -397,6 +403,7 @@ Structured logging:
 
 ---
 
+<a id="monitoring"></a>
 ## 📊 Monitoring
 
 ### Real-Time Monitoring
@@ -447,6 +454,7 @@ If no heartbeat for >45 minutes, the bot may have crashed.
 
 ---
 
+<a id="troubleshooting"></a>
 ## 🔧 Troubleshooting
 
 ### Bot Won't Start
@@ -489,6 +497,7 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for more details.
 
 ---
 
+<a id="development"></a>
 ## 👨‍💻 Development
 
 ### Code Quality
@@ -560,6 +569,7 @@ python3 -c "from src.kalshi_client import KalshiClient; c=KalshiClient(); print(
 
 ---
 
+<a id="license"></a>
 ## 📜 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
