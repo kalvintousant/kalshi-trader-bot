@@ -293,10 +293,16 @@ class KalshiTradingBot:
                         relevant_markets.append(market)
             
             # Detect new markets (prioritize them for early entry)
+            # Also filter out markets with determined outcomes
             new_markets = []
             existing_markets = []
             for market in relevant_markets:
                 market_ticker = market.get('ticker', '')
+                
+                # Skip markets with determined outcomes
+                if market_ticker in self.determined_outcome_markets:
+                    continue
+                
                 if market_ticker not in self.seen_markets:
                     new_markets.append(market)
                     self.seen_markets.add(market_ticker)

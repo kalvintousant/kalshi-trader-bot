@@ -487,6 +487,11 @@ class WeatherDailyStrategy(TradingStrategy):
                     if outcome_determined:
                         logger.info(f"⏭️  Skipping {market_ticker}: Outcome already determined - {reason}")
                         
+                        # Mark this market for exclusion from future scans
+                        if hasattr(self, '_bot_ref') and self._bot_ref:
+                            self._bot_ref.determined_outcome_markets.add(market_ticker)
+                            logger.debug(f"🚫 Added {market_ticker} to exclusion list (will skip in future scans)")
+                        
                         # Cancel any resting orders for this market since outcome is certain
                         try:
                             all_orders = self.client.get_orders(status='resting')
