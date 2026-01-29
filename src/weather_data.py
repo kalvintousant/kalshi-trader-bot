@@ -8,6 +8,7 @@ import requests
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
@@ -221,13 +222,21 @@ class WeatherDataAggregator:
         This is critical for avoiding trades on already-determined outcomes.
         For example, if the market is "Denver high >50°F" and we've already 
         observed 55°F today, the outcome is certain (YES will win).
+        
+        Uses local timezone to determine "today" and checks ALL observations
+        to ensure we capture the complete daily maximum.
         """
         if series_ticker not in self.CITY_COORDS:
             logger.debug(f"Unknown series ticker: {series_ticker}")
             return None
         
+        if series_ticker not in self.CITY_TIMEZONES:
+            logger.debug(f"No timezone defined for {series_ticker}")
+            return None
+        
         city = self.CITY_COORDS[series_ticker]
         lat, lon = city['lat'], city['lon']
+        tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
         
         try:
             # Get NWS observation station for this location
@@ -261,7 +270,7 @@ class WeatherDataAggregator:
             
             station_id = features[0]['id']
             
-            # Get recent observations from this station
+            # Get ALL observations from this station (NWS API returns up to 500)
             obs_url = f"{station_id}/observations"
             obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
             
@@ -276,23 +285,25 @@ class WeatherDataAggregator:
                 logger.debug(f"No observations available for {series_ticker}")
                 return None
             
-            # Filter for today's observations and find the maximum
-            from datetime import timezone
-            today = datetime.now(timezone.utc).date()
+            # Use LOCAL timezone to determine "today" (critical for accuracy)
+            today_local = datetime.now(tz).date()
             today_temps = []
             
-            for obs in observations[:100]:  # Check last 100 observations (should cover >24 hours)
+            # Check ALL observations (not just first 100) to ensure we get complete daily data
+            for obs in observations:
                 props = obs['properties']
                 timestamp_str = props.get('timestamp')
                 
                 if not timestamp_str:
                     continue
                 
-                # Parse timestamp
-                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                # Parse timestamp (NWS returns UTC)
+                timestamp_utc = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                # Convert to local timezone
+                timestamp_local = timestamp_utc.astimezone(tz)
                 
-                # Only include today's observations
-                if timestamp.date() != today:
+                # Only include today's observations (in local time)
+                if timestamp_local.date() != today_local:
                     continue
                 
                 # Get temperature
@@ -303,16 +314,16 @@ class WeatherDataAggregator:
                 
                 # Convert to Fahrenheit
                 temp_f = (temp_c * 9/5) + 32
-                today_temps.append((temp_f, timestamp))
+                today_temps.append((temp_f, timestamp_local))
             
             if not today_temps:
-                logger.debug(f"No observations for today found for {series_ticker}")
+                logger.debug(f"No observations for today ({today_local}) found for {series_ticker}")
                 return None
             
             # Find the maximum temperature observed today
             max_temp, max_time = max(today_temps, key=lambda x: x[0])
             
-            logger.debug(f"Today's observed high for {series_ticker}: {max_temp:.1f}°F (at {max_time.strftime('%H:%M')})")
+            logger.debug(f"Today's observed high for {series_ticker}: {max_temp:.1f}°F (at {max_time.strftime('%H:%M %Z')})")
             return (max_temp, max_time)
         
         except Exception as e:
@@ -325,13 +336,20 @@ class WeatherDataAggregator:
         Returns (low_temp_f, timestamp) or None if unavailable.
         
         Similar to get_todays_observed_high but finds the minimum temperature.
+        Uses local timezone to determine "today" and checks ALL observations
+        to ensure we capture the complete daily minimum.
         """
         if series_ticker not in self.CITY_COORDS:
             logger.debug(f"Unknown series ticker: {series_ticker}")
             return None
         
+        if series_ticker not in self.CITY_TIMEZONES:
+            logger.debug(f"No timezone defined for {series_ticker}")
+            return None
+        
         city = self.CITY_COORDS[series_ticker]
         lat, lon = city['lat'], city['lon']
+        tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
         
         try:
             # Get NWS observation station for this location
@@ -365,7 +383,7 @@ class WeatherDataAggregator:
             
             station_id = features[0]['id']
             
-            # Get recent observations from this station
+            # Get ALL observations from this station (NWS API returns up to 500)
             obs_url = f"{station_id}/observations"
             obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
             
@@ -380,23 +398,25 @@ class WeatherDataAggregator:
                 logger.debug(f"No observations available for {series_ticker}")
                 return None
             
-            # Filter for today's observations and find the minimum
-            from datetime import timezone
-            today = datetime.now(timezone.utc).date()
+            # Use LOCAL timezone to determine "today" (critical for accuracy)
+            today_local = datetime.now(tz).date()
             today_temps = []
             
-            for obs in observations[:100]:  # Check last 100 observations (should cover >24 hours)
+            # Check ALL observations (not just first 100) to ensure we get complete daily data
+            for obs in observations:
                 props = obs['properties']
                 timestamp_str = props.get('timestamp')
                 
                 if not timestamp_str:
                     continue
                 
-                # Parse timestamp
-                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                # Parse timestamp (NWS returns UTC)
+                timestamp_utc = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                # Convert to local timezone
+                timestamp_local = timestamp_utc.astimezone(tz)
                 
-                # Only include today's observations
-                if timestamp.date() != today:
+                # Only include today's observations (in local time)
+                if timestamp_local.date() != today_local:
                     continue
                 
                 # Get temperature
@@ -407,16 +427,16 @@ class WeatherDataAggregator:
                 
                 # Convert to Fahrenheit
                 temp_f = (temp_c * 9/5) + 32
-                today_temps.append((temp_f, timestamp))
+                today_temps.append((temp_f, timestamp_local))
             
             if not today_temps:
-                logger.debug(f"No observations for today found for {series_ticker}")
+                logger.debug(f"No observations for today ({today_local}) found for {series_ticker}")
                 return None
             
             # Find the minimum temperature observed today
             min_temp, min_time = min(today_temps, key=lambda x: x[0])
             
-            logger.debug(f"Today's observed low for {series_ticker}: {min_temp:.1f}°F (at {min_time.strftime('%H:%M')})")
+            logger.debug(f"Today's observed low for {series_ticker}: {min_temp:.1f}°F (at {min_time.strftime('%H:%M %Z')})")
             return (min_temp, min_time)
         
         except Exception as e:
@@ -453,7 +473,6 @@ class WeatherDataAggregator:
             return False
         
         try:
-            from zoneinfo import ZoneInfo
             tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
             local_now = datetime.now(tz)
             local_hour = local_now.hour + local_now.minute / 60.0
