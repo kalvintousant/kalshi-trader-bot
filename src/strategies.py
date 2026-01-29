@@ -423,12 +423,21 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # CRITICAL: Check if outcome is already determined by today's observations
             # Only check if this is a market for TODAY (not future dates)
+            observed_today = None  # Used later for "past extreme of day" longshot cutoff
+            is_high_market = series_ticker.startswith('KXHIGH')
+            is_low_market = series_ticker.startswith('KXLOW')
+            
             if target_date.date() == datetime.now().date():
                 # This market is for today - check if outcome already determined
-                observed = self.weather_agg.get_todays_observed_high(series_ticker)
+                if is_high_market:
+                    observed_today = self.weather_agg.get_todays_observed_high(series_ticker)
+                elif is_low_market:
+                    observed_today = self.weather_agg.get_todays_observed_low(series_ticker)
+                
+                observed = observed_today
                 
                 if observed:
-                    observed_high, obs_time = observed
+                    observed_extreme, obs_time = observed
                     is_range_market = isinstance(threshold, tuple)
                     
                     # Check if outcome is already certain based on observations
@@ -437,27 +446,43 @@ class WeatherDailyStrategy(TradingStrategy):
                     
                     if is_range_market:
                         range_low, range_high = threshold
-                        # For range markets like "51-52°", if we've already seen temp outside range, outcome is NO
-                        if observed_high >= range_high:
-                            outcome_determined = True
-                            reason = f"Observed high {observed_high:.1f}°F already exceeds range [{range_low}-{range_high}°F)"
-                        # If observed high is already in range, YES is likely but not certain (could go higher)
-                        # So we only skip if outcome is definitely NO
+                        if is_high_market:
+                            # For HIGH range markets: if observed high already exceeds range, outcome is NO
+                            if observed_extreme >= range_high:
+                                outcome_determined = True
+                                reason = f"Observed high {observed_extreme:.1f}°F already exceeds range [{range_low}-{range_high}°F)"
+                        elif is_low_market:
+                            # For LOW range markets: if observed low already below range, outcome is NO
+                            if observed_extreme <= range_low:
+                                outcome_determined = True
+                                reason = f"Observed low {observed_extreme:.1f}°F already below range [{range_low}-{range_high}°F)"
                     else:
                         # Single threshold market
                         market_title = market.get('title', '').lower()
                         is_above_market = 'above' in market_title or '>' in market_title
                         
-                        if is_above_market:
-                            # Market is "Will high be >X°?"
-                            if observed_high > threshold:
-                                outcome_determined = True
-                                reason = f"Observed high {observed_high:.1f}°F already exceeds threshold {threshold}°F (YES certain)"
-                        else:
-                            # Market is "Will high be <X°?"
-                            if observed_high >= threshold:
-                                outcome_determined = True
-                                reason = f"Observed high {observed_high:.1f}°F already reached threshold {threshold}°F (NO certain)"
+                        if is_high_market:
+                            if is_above_market:
+                                # Market is "Will high be >X°?"
+                                if observed_extreme > threshold:
+                                    outcome_determined = True
+                                    reason = f"Observed high {observed_extreme:.1f}°F already exceeds threshold {threshold}°F (YES certain)"
+                            else:
+                                # Market is "Will high be <X°?"
+                                if observed_extreme >= threshold:
+                                    outcome_determined = True
+                                    reason = f"Observed high {observed_extreme:.1f}°F already reached threshold {threshold}°F (NO certain)"
+                        elif is_low_market:
+                            if is_above_market:
+                                # Market is "Will low be >X°?"
+                                if observed_extreme > threshold:
+                                    outcome_determined = True
+                                    reason = f"Observed low {observed_extreme:.1f}°F already exceeds threshold {threshold}°F (YES certain)"
+                            else:
+                                # Market is "Will low be <X°?"
+                                if observed_extreme <= threshold:
+                                    outcome_determined = True
+                                    reason = f"Observed low {observed_extreme:.1f}°F already below threshold {threshold}°F (NO certain)"
                     
                     if outcome_determined:
                         logger.info(f"⏭️  Skipping {market_ticker}: Outcome already determined - {reason}")
@@ -611,11 +636,27 @@ class WeatherDailyStrategy(TradingStrategy):
             
             logger.info(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
             
+            # Skip longshots for today's markets once the extreme (high/low) has likely occurred
+            # Longshot value is in the morning/early day when uncertainty is highest
+            skip_longshots_past_extreme = (
+                target_date.date() == datetime.now().date()
+                and self.weather_agg.is_likely_past_extreme_of_day(
+                    series_ticker,
+                    target_date,
+                    observed_extreme=observed_today[0] if observed_today else None,
+                    forecasted_extreme=mean_forecast,
+                )
+            )
+            if skip_longshots_past_extreme:
+                market_type = "high" if is_high_market else "low" if is_low_market else "temperature"
+                logger.info(f"⏸️  Skipping longshots for {market_ticker}: {market_type.capitalize()} of day likely already occurred (local time or observed ≈ forecast)")
+            
             # DUAL STRATEGY: Check both conservative and longshot modes
             
             # LONGSHOT MODE: Hunt for extreme mispricings (0.1-10% odds with massive edges)
             # Inspired by successful Polymarket bot: buy cheap certainty
-            if self.longshot_enabled:
+            # Disabled after extreme has occurred for today's markets — longshot value is in early-day uncertainty
+            if self.longshot_enabled and not skip_longshots_past_extreme:
                 # Check YES side for longshot opportunity
                 # Use ASK price to check if it's cheap enough
                 if (best_yes_ask <= self.longshot_max_price and 

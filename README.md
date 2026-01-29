@@ -16,15 +16,16 @@ This bot implements a dual-strategy approach combining conservative edge-based t
 
 ### Key Features
 
-- **🌦️ Weather Markets Only**: Specialized focus on daily weather prediction markets
-- **📊 Multi-Source Data Aggregation**: Combines forecasts from NWS, Tomorrow.io, and Weatherbit
+- **🌦️ Weather Markets Only**: Specialized focus on daily weather prediction markets (HIGH and LOW temperature)
+- **📊 Multi-Source Data Aggregation**: Combines forecasts from NWS, Tomorrow.io, and Weatherbit with outlier detection
 - **🎲 Dual Trading Strategies**:
   - **Conservative**: High-confidence trades with >5% edge and positive EV
   - **Longshot**: Undervalued low-probability events (≤10¢, ≥50% estimated probability, ≥30% edge)
+- **⏰ Smart Timing**: Longshots disabled after extreme (high/low) likely occurred - value is in early-day uncertainty
 - **💰 Position Management**: Automatic exit logic with take-profit (20%), stop-loss (30%), and edge monitoring
 - **📈 Kelly Criterion Sizing**: Intelligent position sizing for high-confidence trades
 - **🔒 Risk Controls**: Daily loss limits, position caps, and per-market exposure tracking (prevents over-trading)
-- **✅ Outcome Validation**: Checks NWS observations to skip trades on already-determined outcomes
+- **✅ Outcome Validation**: Checks NWS observations to skip trades on already-determined outcomes (HIGH and LOW)
 - **⚡ Performance Optimized**: API response caching (orderbook: 3s, portfolio: 10s, forecasts: 30m)
 - **📝 Professional Logging**: Structured logging with rotating file handlers and detailed audit trail
 - **🔄 Error Handling**: Comprehensive error handling with automatic retry logic and exponential backoff
@@ -223,6 +224,10 @@ Identifies undervalued low-probability events where the market significantly und
 - Market price ≤ 10¢
 - Our estimated probability ≥ 50%
 - Edge ≥ 30%
+- **Timing**: Only trades before the extreme (high/low) has likely occurred
+  - HIGH markets: Disabled after 4 PM local or when observed high ≈ forecasted high
+  - LOW markets: Disabled after 8 AM local or when observed low ≈ forecasted low
+  - Longshot value is in early-day uncertainty; after the extreme occurs, uncertainty collapses
 
 **Position Sizing:**
 - 1.5x standard position size (higher upside justifies risk)
@@ -230,12 +235,17 @@ Identifies undervalued low-probability events where the market significantly und
 
 **Example:**
 ```
-Market: "Will Boston get >8 inches of snow tomorrow?"
-Our Probability: 60% (unusual storm pattern detected)
+Market: "Will Denver high be >50°F today?"
+Time: 10:00 AM (before 4 PM cutoff)
+Our Probability: 60% (unusual warm pattern detected)
 Market Price: 8¢ (implies 8% probability)
 Edge: 52% → TRADE YES (Longshot)
 Position: 22 contracts @ 8¢ = $1.76 risk
 Potential Profit: 22 × (100¢ - 8¢) = $20.24 (+1150%)
+
+Later at 5:00 PM:
+Observed high: 52°F (already exceeded threshold)
+Action: ⏸️ Longshots disabled (high already occurred, outcome certain)
 ```
 
 ### Position Exit Logic
@@ -274,7 +284,11 @@ Action: SELL → Lock in ~$1.80 profit
    - Minimum volume: 50 contracts
    - Only trades "open" status markets
    - Excludes markets expiring in <24 hours
-   - **Outcome-Determined Check**: For today's markets, checks NWS observed high temperature and skips trades if outcome is already certain (prevents trading on predetermined results)
+   - **Outcome-Determined Check**: For today's markets, checks NWS observed high/low temperature and skips trades if outcome is already certain (prevents trading on predetermined results)
+   - **Longshot Timing Cutoff**: 
+     - HIGH markets: Disables longshots after 4 PM local (high typically occurs 2-5 PM) or when observed high ≈ forecasted high
+     - LOW markets: Disables longshots after 8 AM local (low typically occurs 4-7 AM) or when observed low ≈ forecasted low
+     - Longshot value is in early-day uncertainty; after the extreme occurs, uncertainty collapses
 
 4. **Forecast Quality Requirements**
    - Requires multiple data sources for high-confidence trades
@@ -344,6 +358,8 @@ Forecast aggregation featuring:
 - Outlier detection
 - Source weighting by age and reliability
 - Confidence interval calculation
+- **Real-time observation tracking**: Gets today's observed high/low from NWS stations
+- **Smart timing logic**: Determines if extreme (high/low) has likely occurred for longshot cutoff
 
 #### 5. Configuration (`src/config.py`)
 Centralized configuration:
@@ -477,6 +493,15 @@ python3 -c "from src.kalshi_client import KalshiClient; c=KalshiClient(); print(
 ```
 
 ### Recent Improvements
+
+✅ **v2.2.0 (January 2026)**
+- **Smart Longshot Timing**: Disables longshots after extreme (high/low) likely occurred
+  - HIGH markets: After 4 PM local or when observed high ≈ forecasted high
+  - LOW markets: After 8 AM local or when observed low ≈ forecasted low
+  - Prevents wasting capital on near-certain outcomes late in the day
+- **LOW Temperature Market Support**: Full support for low temperature markets with outcome validation
+- Added `get_todays_observed_low()` for tracking low temperature observations
+- Enhanced outcome-determined check to handle both HIGH and LOW markets
 
 ✅ **v2.1.0 (January 2026)**
 - **Critical Fix**: Per-market position limit enforcement (prevents over-trading same market)

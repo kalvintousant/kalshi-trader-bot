@@ -51,6 +51,21 @@ class WeatherDataAggregator:
         'KXLOWDEN': {'lat': 39.8561, 'lon': -104.6737, 'name': 'Denver International Airport'},
     }
     
+    # IANA timezones for each city (used to determine "local time" for high-of-day cutoff)
+    CITY_TIMEZONES = {
+        'KXHIGHNY': 'America/New_York', 'KXLOWNY': 'America/New_York',
+        'KXHIGHCHI': 'America/Chicago', 'KXLOWCHI': 'America/Chicago',
+        'KXHIGHMIA': 'America/New_York', 'KXLOWMIA': 'America/New_York',
+        'KXHIGHAUS': 'America/Chicago', 'KXLOWAUS': 'America/Chicago',
+        'KXHIGHLAX': 'America/Los_Angeles', 'KXLOWLAX': 'America/Los_Angeles',
+        'KXHIGHDEN': 'America/Denver', 'KXLOWDEN': 'America/Denver',
+    }
+    
+    # Local hour (24h) after which we assume the high of the day has occurred (longshot value is minimal)
+    LONGSHOT_HIGH_CUTOFF_HOUR = 16  # 4 PM local (high typically occurs 2-5 PM)
+    # Local hour (24h) after which we assume the low of the day has occurred (longshot value is minimal)
+    LONGSHOT_LOW_CUTOFF_HOUR = 8  # 8 AM local (low typically occurs 4-7 AM)
+    
     def __init__(self):
         # API keys from environment (optional - will use free tiers where possible)
         # OpenWeather removed per user request
@@ -303,6 +318,172 @@ class WeatherDataAggregator:
         except Exception as e:
             logger.debug(f"Error getting today's observed high for {series_ticker}: {e}")
             return None
+    
+    def get_todays_observed_low(self, series_ticker: str) -> Optional[Tuple[float, datetime]]:
+        """
+        Get today's observed low temperature from NWS station observations.
+        Returns (low_temp_f, timestamp) or None if unavailable.
+        
+        Similar to get_todays_observed_high but finds the minimum temperature.
+        """
+        if series_ticker not in self.CITY_COORDS:
+            logger.debug(f"Unknown series ticker: {series_ticker}")
+            return None
+        
+        city = self.CITY_COORDS[series_ticker]
+        lat, lon = city['lat'], city['lon']
+        
+        try:
+            # Get NWS observation station for this location
+            points_url = f"https://api.weather.gov/points/{lat},{lon}"
+            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            
+            if resp.status_code != 200:
+                logger.debug(f"NWS points API failed for {series_ticker}: {resp.status_code}")
+                return None
+            
+            points_data = resp.json()
+            obs_stations_url = points_data['properties'].get('observationStations')
+            
+            if not obs_stations_url:
+                logger.debug(f"No observation stations URL for {series_ticker}")
+                return None
+            
+            # Get the nearest observation station
+            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            
+            if stations_resp.status_code != 200:
+                logger.debug(f"NWS stations API failed: {stations_resp.status_code}")
+                return None
+            
+            stations_data = stations_resp.json()
+            features = stations_data.get('features', [])
+            
+            if not features:
+                logger.debug(f"No observation stations found for {series_ticker}")
+                return None
+            
+            station_id = features[0]['id']
+            
+            # Get recent observations from this station
+            obs_url = f"{station_id}/observations"
+            obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            
+            if obs_resp.status_code != 200:
+                logger.debug(f"NWS observations API failed: {obs_resp.status_code}")
+                return None
+            
+            obs_data = obs_resp.json()
+            observations = obs_data.get('features', [])
+            
+            if not observations:
+                logger.debug(f"No observations available for {series_ticker}")
+                return None
+            
+            # Filter for today's observations and find the minimum
+            from datetime import timezone
+            today = datetime.now(timezone.utc).date()
+            today_temps = []
+            
+            for obs in observations[:100]:  # Check last 100 observations (should cover >24 hours)
+                props = obs['properties']
+                timestamp_str = props.get('timestamp')
+                
+                if not timestamp_str:
+                    continue
+                
+                # Parse timestamp
+                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                
+                # Only include today's observations
+                if timestamp.date() != today:
+                    continue
+                
+                # Get temperature
+                temp_c = props.get('temperature', {}).get('value')
+                
+                if temp_c is None:
+                    continue
+                
+                # Convert to Fahrenheit
+                temp_f = (temp_c * 9/5) + 32
+                today_temps.append((temp_f, timestamp))
+            
+            if not today_temps:
+                logger.debug(f"No observations for today found for {series_ticker}")
+                return None
+            
+            # Find the minimum temperature observed today
+            min_temp, min_time = min(today_temps, key=lambda x: x[0])
+            
+            logger.debug(f"Today's observed low for {series_ticker}: {min_temp:.1f}°F (at {min_time.strftime('%H:%M')})")
+            return (min_temp, min_time)
+        
+        except Exception as e:
+            logger.debug(f"Error getting today's observed low for {series_ticker}: {e}")
+            return None
+    
+    def is_likely_past_extreme_of_day(
+        self,
+        series_ticker: str,
+        target_date: datetime,
+        observed_extreme: Optional[float] = None,
+        forecasted_extreme: Optional[float] = None,
+    ) -> bool:
+        """
+        Return True if the extreme (high or low) of the day has likely already occurred.
+        Used to skip longshot trades when uncertainty has collapsed.
+        
+        For HIGH markets: Longshot value is in the morning when the high hasn't happened yet;
+        after ~4 PM local or when observed high ≈ forecasted high, skip longshots.
+        
+        For LOW markets: Low typically occurs early morning (4-7 AM). After ~8 AM local or
+        when observed low ≈ forecasted low, skip longshots.
+        """
+        if target_date.date() != datetime.now().date():
+            return False  # Future date: extreme hasn't happened yet
+        if series_ticker not in self.CITY_TIMEZONES:
+            return False
+        
+        # Determine if this is a HIGH or LOW market
+        is_high_market = series_ticker.startswith('KXHIGH')
+        is_low_market = series_ticker.startswith('KXLOW')
+        
+        if not (is_high_market or is_low_market):
+            return False
+        
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
+            local_now = datetime.now(tz)
+            local_hour = local_now.hour + local_now.minute / 60.0
+            
+            if is_high_market:
+                # HIGH markets: cutoff after 4 PM local
+                if local_hour >= self.LONGSHOT_HIGH_CUTOFF_HOUR:
+                    logger.debug(f"Past high-of-day cutoff for {series_ticker}: local time {local_hour:.1f}h >= {self.LONGSHOT_HIGH_CUTOFF_HOUR}")
+                    return True
+                # Also check if observed high is close to forecasted high
+                if observed_extreme is not None and forecasted_extreme is not None:
+                    if observed_extreme >= forecasted_extreme - 2.0:
+                        logger.debug(f"Observed high {observed_extreme:.1f}°F within 2°F of forecast {forecasted_extreme:.1f}°F for {series_ticker} — likely past high")
+                        return True
+            
+            elif is_low_market:
+                # LOW markets: cutoff after 8 AM local (low typically happens 4-7 AM)
+                if local_hour >= self.LONGSHOT_LOW_CUTOFF_HOUR:
+                    logger.debug(f"Past low-of-day cutoff for {series_ticker}: local time {local_hour:.1f}h >= {self.LONGSHOT_LOW_CUTOFF_HOUR}")
+                    return True
+                # Also check if observed low is close to forecasted low
+                if observed_extreme is not None and forecasted_extreme is not None:
+                    if observed_extreme <= forecasted_extreme + 2.0:
+                        logger.debug(f"Observed low {observed_extreme:.1f}°F within 2°F of forecast {forecasted_extreme:.1f}°F for {series_ticker} — likely past low")
+                        return True
+            
+            return False
+        except Exception as e:
+            logger.debug(f"Error in is_likely_past_extreme_of_day for {series_ticker}: {e}")
+            return False
     
     def get_all_forecasts(self, series_ticker: str, target_date: datetime) -> List[float]:
         """
