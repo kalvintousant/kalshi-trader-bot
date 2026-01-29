@@ -36,6 +36,10 @@ class KalshiClient:
         self.portfolio_cache = None
         self.portfolio_cache_timestamp = 0
         self.portfolio_cache_ttl = Config.PORTFOLIO_CACHE_TTL
+        
+        # Cache for orders (reduces 429 rate limit hits - portfolio/orders is called often)
+        self.orders_cache = {}  # {status: (orders_list, timestamp)}
+        self.orders_cache_ttl = 45  # seconds
     
     def _load_private_key(self):
         """Load the private key from file"""
@@ -90,8 +94,8 @@ class KalshiClient:
         url = f"{self.base_url}{path}"
         headers = self._create_headers('GET', path)
         
-        # Retry logic with exponential backoff
-        max_retries = 3
+        # Retry logic with exponential backoff (longer for 429 Too Many Requests)
+        max_retries = 4
         for attempt in range(max_retries):
             try:
                 response = self.session.get(url, headers=headers, params=params, timeout=10)
@@ -105,6 +109,16 @@ class KalshiClient:
                     self.orderbook_cache_timestamp[market_ticker] = time.time()
                 
                 return result
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        # Rate limited: use longer backoff, respect Retry-After if present
+                        retry_after = e.response.headers.get('Retry-After')
+                        wait_time = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * (2 ** attempt))
+                        logger.warning(f"Rate limited (429), waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        time.sleep(wait_time)
+                        continue
+                raise
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
@@ -223,12 +237,19 @@ class KalshiClient:
         return portfolio
     
     def get_orders(self, status: Optional[str] = None) -> List[Dict]:
-        """Get orders, optionally filtered by status"""
+        """Get orders, optionally filtered by status. Cached briefly to avoid 429 rate limits."""
+        cache_key = status or 'all'
+        if cache_key in self.orders_cache:
+            cached_orders, cached_time = self.orders_cache[cache_key]
+            if (time.time() - cached_time) < self.orders_cache_ttl:
+                return cached_orders
         params = {}
         if status:
             params['status'] = status
         response = self._get('/portfolio/orders', params=params)
-        return response.get('orders', [])
+        orders = response.get('orders', [])
+        self.orders_cache[cache_key] = (orders, time.time())
+        return orders
     
     def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> List[Dict]:
         """Get filled orders (past trades)"""

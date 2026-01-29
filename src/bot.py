@@ -91,7 +91,12 @@ class KalshiTradingBot:
     def check_filled_orders(self):
         """Check for filled orders and send notifications"""
         try:
-            filled_orders = self.client.get_orders(status='filled')
+            try:
+                filled_orders = self.client.get_orders(status='filled')
+            except Exception as e:
+                # Don't crash on 429 or other API errors - log and skip this cycle
+                logger.warning(f"Could not fetch filled orders (will retry next cycle): {e}")
+                return
             
             for order in filled_orders:
                 order_id = order.get('order_id')
@@ -142,8 +147,11 @@ class KalshiTradingBot:
     def check_and_cancel_stale_orders(self):
         """Check resting orders and cancel if edge/EV no longer meets strategy thresholds"""
         try:
-            resting_orders = self.client.get_orders(status='resting')
-            
+            try:
+                resting_orders = self.client.get_orders(status='resting')
+            except Exception as e:
+                logger.warning(f"Could not fetch resting orders (will retry next cycle): {e}")
+                return
             if not resting_orders:
                 return
             
