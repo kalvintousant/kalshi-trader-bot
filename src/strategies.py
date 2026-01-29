@@ -486,6 +486,25 @@ class WeatherDailyStrategy(TradingStrategy):
                     
                     if outcome_determined:
                         logger.info(f"⏭️  Skipping {market_ticker}: Outcome already determined - {reason}")
+                        
+                        # Cancel any resting orders for this market since outcome is certain
+                        try:
+                            all_orders = self.client.get_orders(status='resting')
+                            market_orders = [o for o in all_orders if o.get('ticker') == market_ticker]
+                            
+                            if market_orders:
+                                logger.info(f"🚫 Cancelling {len(market_orders)} resting order(s) for {market_ticker} (outcome determined)")
+                                for order in market_orders:
+                                    order_id = order.get('order_id')
+                                    if order_id:
+                                        try:
+                                            self.client.cancel_order(order_id)
+                                            logger.info(f"   ✅ Cancelled order {order_id}")
+                                        except Exception as cancel_error:
+                                            logger.warning(f"   ⚠️  Failed to cancel order {order_id}: {cancel_error}")
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch/cancel orders for {market_ticker}: {e}")
+                        
                         return None
             
             # Get forecasts from all available sources
