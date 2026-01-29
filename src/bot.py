@@ -317,7 +317,11 @@ class KalshiTradingBot:
                 logger.debug(f"Sample market: {sample.get('ticker')} | Series: {sample.get('series_ticker')} | Volume: {sample.get('volume', 0)} | Status: {sample.get('status')}")
             
             markets_evaluated = 0
-            for market in markets_to_process:
+            for i, market in enumerate(markets_to_process):
+                # Small delay every 10 markets to avoid overwhelming the API
+                if i > 0 and i % 10 == 0:
+                    time.sleep(0.5)  # 500ms pause every 10 markets
+                
                 # Quick filter check before expensive orderbook call
                 should_trade = any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies)
                 if not should_trade:

@@ -1,0 +1,1 @@
+timestamp,market_ticker,city,date,threshold,threshold_type,our_probability,market_price,edge,ev,strategy_mode,side,contracts,entry_price,outcome,actual_temp,predicted_temp,forecast_error,won,profit_loss

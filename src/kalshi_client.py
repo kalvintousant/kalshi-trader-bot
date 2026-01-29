@@ -39,7 +39,7 @@ class KalshiClient:
         
         # Cache for orders (reduces 429 rate limit hits - portfolio/orders is called often)
         self.orders_cache = {}  # {status: (orders_list, timestamp)}
-        self.orders_cache_ttl = 45  # seconds
+        self.orders_cache_ttl = 90  # seconds (increased from 45s to reduce API calls)
     
     def _load_private_key(self):
         """Load the private key from file"""
