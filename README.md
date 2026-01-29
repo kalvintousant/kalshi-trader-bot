@@ -23,7 +23,7 @@ This bot implements a dual-strategy approach combining conservative edge-based t
   - **Longshot**: Undervalued low-probability events (≤10¢, ≥50% estimated probability, ≥30% edge)
 - **⏰ Smart Timing**: Longshots disabled after extreme (high/low) likely occurred - value is in early-day uncertainty
 - **💰 Position Management**: Automatic exit logic with take-profit (20%), stop-loss (30%), and edge monitoring
-- **📈 Kelly Criterion Sizing**: Intelligent position sizing for high-confidence trades
+- **🧮 Hybrid Position Sizing**: Automatically switches between Kelly Criterion (high confidence) and confidence scoring (lower confidence) for optimal bet sizing
 - **🔒 Risk Controls**: Daily loss limits, position caps, and per-market exposure tracking (prevents over-trading)
 - **✅ Outcome Validation**: Checks NWS observations to skip trades on already-determined outcomes (HIGH and LOW)
 - **⚡ Performance Optimized**: API response caching (orderbook: 3s, portfolio: 10s, forecasts: 30m)
@@ -201,10 +201,19 @@ crontab -e
 - Expected Value ≥ $0.01 (after fees)
 - High confidence (multiple sources agree)
 
-**Position Sizing:**
-- Kelly Criterion for high-confidence trades (>70% probability, 2+ sources)
-- Standard position size otherwise
-- Capped at MIN(MAX_CONTRACTS_PER_MARKET, MAX_DOLLARS_PER_MARKET / price)
+**Position Sizing (Hybrid Approach):**
+
+*Path 1: HIGH CONFIDENCE (2+ sources, 70%+ probability, CI outside market price)*
+- **Kelly Criterion** with fractional=0.25 (quarter Kelly, ultra-safe)
+- Formula: `position = 0.25 × kelly_fraction × portfolio_value / price`
+- Range: 10-20 contracts (1x-2x base)
+
+*Path 2: LOWER CONFIDENCE (1 source, <70% probability, or CI overlaps price)*
+- **Confidence Scoring** based on edge, CI width, forecast agreement, and EV
+- Formula: `multiplier = 0.5 + (confidence × 1.0)`, position = 10 × multiplier
+- Range: 5-15 contracts (0.5x-1.5x base)
+
+*Always capped at MIN(25 contracts, $3.00 / price)*
 
 **Example:**
 ```
@@ -229,10 +238,20 @@ Identifies undervalued low-probability events where the market significantly und
   - LOW markets: Disabled after 8 AM local or when observed low ≈ forecasted low
   - Longshot value is in early-day uncertainty; after the extreme occurs, uncertainty collapses
 
-**Position Sizing:**
-- 3x standard position size (default, configurable via `LONGSHOT_POSITION_MULTIPLIER`)
-- Kelly Criterion for high-confidence longshots (when CI doesn't overlap with market price)
-- Capped at position limits
+**Position Sizing (Hybrid Approach):**
+
+*Path 1: HIGH CONFIDENCE (2+ sources, CI doesn't overlap market price)*
+- **Kelly Criterion** with fractional=0.5 (half Kelly)
+- Formula: `position = 0.5 × kelly_fraction × portfolio_value / price`
+- Range: Up to 50 contracts (5x base)
+
+*Path 2: LOWER CONFIDENCE (1 source or CI overlaps price)*
+- **Confidence Scoring** based on edge, CI width, forecast agreement, and EV
+- Formula: `multiplier = 1 + (confidence × 4)`, position = 10 × multiplier
+- Range: 10-50 contracts (1x-5x base)
+- Emphasizes edge (40%) and EV (20%) for aggressive longshot plays
+
+*Always capped at MIN(25 contracts, $3.00 / price)*
 
 **Example:**
 ```
@@ -494,6 +513,16 @@ python3 -c "from src.kalshi_client import KalshiClient; c=KalshiClient(); print(
 ```
 
 ### Recent Improvements
+
+✅ **v2.3.0 (January 2026)**
+- **🧮 Hybrid Position Sizing**: Automatic selection between Kelly Criterion and confidence scoring
+  - Kelly Criterion (math-based optimal) for high confidence: 2+ sources, CI doesn't overlap market
+  - Confidence scoring (heuristic) for lower confidence: considers edge, CI width, forecast agreement, EV
+  - Longshot: Kelly@50% or confidence (1x-5x base), Conservative: Kelly@25% or confidence (0.5x-1.5x base)
+- **🚫 Determined Outcome Exclusion**: Markets with determined outcomes are added to exclusion list
+  - Skipped in all future scans for performance and API rate limit reduction
+  - Automatically cancels resting orders when outcome is detected
+- **Enhanced Logging**: Debug logs show which sizing method (Kelly vs Confidence) was used and why
 
 ✅ **v2.2.0 (January 2026)**
 - **Smart Longshot Timing**: Disables longshots after extreme (high/low) likely occurred
