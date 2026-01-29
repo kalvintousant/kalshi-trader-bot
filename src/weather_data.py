@@ -917,6 +917,48 @@ class WeatherDataAggregator:
         # Use fractional Kelly and cap at 25% of bankroll for safety
         fractional_kelly = fractional * max(0, full_kelly)
         return min(fractional_kelly, 0.25)  # Cap at 25%
+    
+    def calculate_confidence_score(self, edge: float, ci_width: float, num_forecasts: int, 
+                                   ev: float, is_longshot: bool = False) -> float:
+        """
+        Calculate a confidence score (0-1) for position sizing.
+        Higher score = higher confidence = larger position.
+        
+        Args:
+            edge: Edge percentage (e.g., 15.0 for 15%)
+            ci_width: Width of confidence interval (e.g., 0.2 for 20% width)
+            num_forecasts: Number of forecast sources agreeing
+            ev: Expected value in dollars
+            is_longshot: Whether this is a longshot trade
+            
+        Returns:
+            Confidence score between 0 and 1
+        """
+        # Start with base confidence from edge (normalized to 0-1)
+        # Edge of 30% = 0.6 confidence, 60% = 1.0
+        edge_score = min(1.0, edge / 50.0)
+        
+        # CI width penalty: narrower CI = higher confidence
+        # CI width of 0.1 = 1.0, 0.4 = 0.5
+        ci_score = max(0.2, 1.0 - (ci_width * 2.0))
+        
+        # Number of forecasts: more sources = higher confidence
+        # 1 source = 0.5, 2 = 0.7, 3+ = 1.0
+        forecast_score = min(1.0, 0.3 + (num_forecasts * 0.2))
+        
+        # EV contribution: higher EV = higher confidence
+        # $0.50+ EV = 1.0, $0.01 = 0.2
+        ev_score = min(1.0, 0.2 + (ev * 1.6))
+        
+        # Combine scores with weights
+        if is_longshot:
+            # Longshots: emphasize edge and EV more (riskier, need strong signals)
+            confidence = (edge_score * 0.4) + (ci_score * 0.2) + (forecast_score * 0.2) + (ev_score * 0.2)
+        else:
+            # Conservative: balanced weights
+            confidence = (edge_score * 0.3) + (ci_score * 0.3) + (forecast_score * 0.2) + (ev_score * 0.2)
+        
+        return min(1.0, max(0.1, confidence))  # Clamp between 0.1 and 1.0
 
 
 # Helper function to extract temperature threshold from market title
