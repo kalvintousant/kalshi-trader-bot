@@ -827,17 +827,34 @@ class WeatherDailyStrategy(TradingStrategy):
             high_confidence_no = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
             
             if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold and high_confidence_yes:
-                # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
-                # Optionally use Kelly Criterion for conservative trades with very high confidence
-                if len(forecasts) >= 2 and our_prob > 0.7:  # Only for high-probability trades
+                # HYBRID POSITION SIZING for conservative trades
+                # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
+                use_kelly = len(forecasts) >= 2 and our_prob > 0.7 and (ci_lower_yes > best_yes_ask / 100.0)
+                
+                if use_kelly:
+                    # HIGH CONFIDENCE: Kelly Criterion with very conservative fractional (0.25)
                     payout_ratio = 1.0 / (best_yes_ask / 100.0)
-                    kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.25)  # Very conservative
+                    kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.25)
                     portfolio = self.client.get_portfolio()
                     portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
                     kelly_position = int(kelly_fraction * portfolio_value / (best_yes_ask / 100.0))
                     base_position = min(max(kelly_position, self.max_position_size), self.max_position_size * 2)
+                    logger.debug(f"Conservative Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
                 else:
-                    base_position = self.max_position_size
+                    # LOWER CONFIDENCE: Use confidence scoring
+                    ci_width = ci_upper_yes - ci_lower_yes
+                    confidence = self.weather_agg.calculate_confidence_score(
+                        edge=yes_edge,
+                        ci_width=ci_width,
+                        num_forecasts=len(forecasts),
+                        ev=yes_ev,
+                        is_longshot=False
+                    )
+                    # Conservative: 0.5 confidence = 1x, 1.0 confidence = 1.5x
+                    confidence_multiplier = 0.5 + (confidence * 1.0)  # 0.5x to 1.5x
+                    base_position = int(self.max_position_size * confidence_multiplier)
+                    base_position = max(1, min(base_position, self.max_position_size * 2))
+                    logger.debug(f"Conservative Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
                 
                 # Cap by REMAINING capacity, not absolute limits
                 dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
@@ -871,17 +888,34 @@ class WeatherDailyStrategy(TradingStrategy):
                     'strategy_mode': 'conservative'
                 }
             elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and high_confidence_no:
-                # Calculate position size with dual cap: $3 OR 25 contracts, whichever is hit first
-                # Optionally use Kelly Criterion for conservative trades with very high confidence
-                if len(forecasts) >= 2 and no_prob > 0.7:  # Only for high-probability trades
+                # HYBRID POSITION SIZING for conservative trades
+                # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
+                use_kelly = len(forecasts) >= 2 and no_prob > 0.7 and (ci_lower_no > best_no_ask / 100.0)
+                
+                if use_kelly:
+                    # HIGH CONFIDENCE: Kelly Criterion with very conservative fractional (0.25)
                     payout_ratio = 1.0 / (best_no_ask / 100.0)
-                    kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.25)  # Very conservative
+                    kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.25)
                     portfolio = self.client.get_portfolio()
                     portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
                     kelly_position = int(kelly_fraction * portfolio_value / (best_no_ask / 100.0))
                     base_position = min(max(kelly_position, self.max_position_size), self.max_position_size * 2)
+                    logger.debug(f"Conservative Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
                 else:
-                    base_position = self.max_position_size
+                    # LOWER CONFIDENCE: Use confidence scoring
+                    ci_width = ci_upper_no - ci_lower_no
+                    confidence = self.weather_agg.calculate_confidence_score(
+                        edge=no_edge,
+                        ci_width=ci_width,
+                        num_forecasts=len(forecasts),
+                        ev=no_ev,
+                        is_longshot=False
+                    )
+                    # Conservative: 0.5 confidence = 1x, 1.0 confidence = 1.5x
+                    confidence_multiplier = 0.5 + (confidence * 1.0)  # 0.5x to 1.5x
+                    base_position = int(self.max_position_size * confidence_multiplier)
+                    base_position = max(1, min(base_position, self.max_position_size * 2))
+                    logger.debug(f"Conservative Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
                 
                 # Cap by REMAINING capacity, not absolute limits
                 dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
