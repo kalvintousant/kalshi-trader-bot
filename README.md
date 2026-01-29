@@ -135,7 +135,7 @@ LOG_FILE=bot.log
 | `MIN_EDGE_THRESHOLD` | Minimum edge (market mispricing) to trigger trade | 5.0% | 3-10% |
 | `MIN_EV_THRESHOLD` | Minimum expected value after fees | $0.01 | $0.01-$0.10 |
 | `MAX_CONTRACTS_PER_MARKET` | Hard cap on contracts per market | 25 | 10-50 |
-| `MAX_DOLLARS_PER_MARKET` | Hard cap on dollars per market | $300 | $100-$500 |
+| `MAX_DOLLARS_PER_MARKET` | Hard cap on dollars per market | $3.00 | $1-$10 |
 | `MAX_DAILY_LOSS` | Daily loss limit (bot stops trading) | $500 | $200-$1000 |
 | `LONGSHOT_MAX_PRICE` | Max price to consider longshot | 10¢ | 5-15¢ |
 | `LONGSHOT_MIN_EDGE` | Min edge for longshot trades | 30% | 25-40% |
@@ -230,7 +230,8 @@ Identifies undervalued low-probability events where the market significantly und
   - Longshot value is in early-day uncertainty; after the extreme occurs, uncertainty collapses
 
 **Position Sizing:**
-- 1.5x standard position size (higher upside justifies risk)
+- 3x standard position size (default, configurable via `LONGSHOT_POSITION_MULTIPLIER`)
+- Kelly Criterion for high-confidence longshots (when CI doesn't overlap with market price)
 - Capped at position limits
 
 **Example:**
@@ -271,7 +272,7 @@ Action: SELL → Lock in ~$1.80 profit
 
 1. **Position Limits**
    - Per-market contract cap: 25 contracts (tracks filled + resting orders)
-   - Per-market dollar cap: $300 (tracks total exposure per market)
+   - Per-market dollar cap: $3.00 (tracks total exposure per market)
    - Max position size: 10 contracts (base)
    - **Per-Market Exposure Tracking**: Bot checks existing positions and resting orders before each trade to prevent exceeding limits across multiple orders
 
@@ -281,9 +282,9 @@ Action: SELL → Lock in ~$1.80 profit
    - Sends notification on limit hit
 
 3. **Market Quality Filters**
-   - Minimum volume: 50 contracts
-   - Only trades "open" status markets
-   - Excludes markets expiring in <24 hours
+   - Minimum volume: 15 contracts (default, configurable via `MIN_MARKET_VOLUME`)
+   - Only trades "open" or "active" status markets
+   - Markets are filtered by volume and status before evaluation
    - **Outcome-Determined Check**: For today's markets, checks NWS observed high/low temperature and skips trades if outcome is already certain (prevents trading on predetermined results)
    - **Longshot Timing Cutoff**: 
      - HIGH markets: Disables longshots after 4 PM local (high typically occurs 2-5 PM) or when observed high ≈ forecasted high
