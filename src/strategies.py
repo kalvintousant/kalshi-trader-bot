@@ -687,12 +687,12 @@ class WeatherDailyStrategy(TradingStrategy):
                     our_prob >= (self.longshot_min_prob / 100.0) and 
                     yes_edge >= self.longshot_min_edge):
                     
-                    # Calculate position size using Kelly Criterion (if high confidence) or fixed multiplier
+                    # HYBRID POSITION SIZING: Kelly for high confidence, confidence scoring otherwise
                     # Check confidence: only use Kelly if CI doesn't overlap with market price
                     use_kelly = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
                     
                     if use_kelly and len(forecasts) >= 2:
-                        # Use Kelly Criterion for optimal position sizing
+                        # HIGH CONFIDENCE: Use Kelly Criterion for optimal position sizing
                         payout_ratio = 1.0 / (best_yes_ask / 100.0)  # Payout / Stake
                         kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.5)
                         # Get portfolio value for Kelly calculation
@@ -700,10 +700,22 @@ class WeatherDailyStrategy(TradingStrategy):
                         portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
                         kelly_position = int(kelly_fraction * portfolio_value / (best_yes_ask / 100.0))
                         base_position = min(kelly_position, self.max_position_size * 5)
+                        logger.debug(f"Using Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
                     else:
-                        # Use fixed multiplier for longshot
-                        base_position = min(self.max_position_size * self.longshot_position_multiplier, 
-                                           self.max_position_size * 5)  # Cap at 5x
+                        # LOWER CONFIDENCE: Use confidence scoring for conservative sizing
+                        ci_width = ci_upper_yes - ci_lower_yes
+                        confidence = self.weather_agg.calculate_confidence_score(
+                            edge=yes_edge,
+                            ci_width=ci_width,
+                            num_forecasts=len(forecasts),
+                            ev=yes_ev,
+                            is_longshot=True
+                        )
+                        # Scale by confidence: 0.1 confidence = 1x base, 1.0 confidence = 5x base
+                        confidence_multiplier = 1 + (confidence * 4)  # 1x to 5x
+                        base_position = int(self.max_position_size * confidence_multiplier)
+                        base_position = min(base_position, self.max_position_size * 5)  # Cap at 5x
+                        logger.debug(f"Using Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
                     
                     # Cap by REMAINING contract count and dollars (not absolute limits)
                     dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
@@ -745,12 +757,12 @@ class WeatherDailyStrategy(TradingStrategy):
                     no_prob >= (self.longshot_min_prob / 100.0) and 
                     no_edge >= self.longshot_min_edge):
                     
-                    # Calculate position size using Kelly Criterion (if high confidence) or fixed multiplier
+                    # HYBRID POSITION SIZING: Kelly for high confidence, confidence scoring otherwise
                     # Check confidence: only use Kelly if CI doesn't overlap with market price
                     use_kelly = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
                     
                     if use_kelly and len(forecasts) >= 2:
-                        # Use Kelly Criterion for optimal position sizing
+                        # HIGH CONFIDENCE: Use Kelly Criterion for optimal position sizing
                         payout_ratio = 1.0 / (best_no_ask / 100.0)  # Payout / Stake
                         kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.5)
                         # Get portfolio value for Kelly calculation
@@ -758,10 +770,22 @@ class WeatherDailyStrategy(TradingStrategy):
                         portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
                         kelly_position = int(kelly_fraction * portfolio_value / (best_no_ask / 100.0))
                         base_position = min(kelly_position, self.max_position_size * 5)
+                        logger.debug(f"Using Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
                     else:
-                        # Use fixed multiplier for longshot
-                        base_position = min(self.max_position_size * self.longshot_position_multiplier, 
-                                           self.max_position_size * 5)  # Cap at 5x
+                        # LOWER CONFIDENCE: Use confidence scoring for conservative sizing
+                        ci_width = ci_upper_no - ci_lower_no
+                        confidence = self.weather_agg.calculate_confidence_score(
+                            edge=no_edge,
+                            ci_width=ci_width,
+                            num_forecasts=len(forecasts),
+                            ev=no_ev,
+                            is_longshot=True
+                        )
+                        # Scale by confidence: 0.1 confidence = 1x base, 1.0 confidence = 5x base
+                        confidence_multiplier = 1 + (confidence * 4)  # 1x to 5x
+                        base_position = int(self.max_position_size * confidence_multiplier)
+                        base_position = min(base_position, self.max_position_size * 5)  # Cap at 5x
+                        logger.debug(f"Using Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
                     
                     # Cap by REMAINING contract count and dollars (not absolute limits)
                     dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
