@@ -34,6 +34,9 @@ class KalshiTradingBot:
         # Track seen markets to detect new ones quickly
         self.seen_markets: Set[str] = set()
         
+        # Track markets with determined outcomes (skip these in future scans)
+        self.determined_outcome_markets: Set[str] = set()
+        
         # Track orders we've already notified about (to avoid duplicate notifications)
         self.notified_orders: Set[str] = set()
         
