@@ -100,16 +100,20 @@ class WeatherDataAggregator:
         # Use session for connection pooling
         self.session = requests.Session()
     
-    def get_forecast_tomorrowio(self, lat: float, lon: float, date: datetime) -> Optional[Tuple[float, str, datetime]]:
-        """Get forecast from Tomorrow.io API - returns (temp, source, timestamp)"""
+    def get_forecast_tomorrowio(self, lat: float, lon: float, date: datetime, series_ticker: str = '') -> Optional[Tuple[float, str, datetime]]:
+        """Get forecast from Tomorrow.io API - returns (temp, source, timestamp) for HIGH/LOW markets"""
         if not self.tomorrowio_api_key:
             return None
         
         try:
+            # Request both temperatureMax and temperatureMin
+            is_low_market = 'LOW' in series_ticker
+            temp_field = 'temperatureMin' if is_low_market else 'temperatureMax'
+            
             url = f"https://api.tomorrow.io/v4/timelines"
             params = {
                 'location': f"{lat},{lon}",
-                'fields': 'temperatureMax',
+                'fields': temp_field,
                 'timesteps': 'daily',
                 'apikey': self.tomorrowio_api_key
             }
@@ -122,7 +126,7 @@ class WeatherDataAggregator:
                     for point in timeline.get('intervals', []):
                         point_date = point['startTime'][:10]
                         if point_date == target_date_str:
-                            temp = point['values'].get('temperatureMax')
+                            temp = point['values'].get(temp_field)
                             if temp is not None:
                                 # Return temp, source, and current timestamp
                                 return (temp, 'tomorrowio', datetime.now())
@@ -130,9 +134,11 @@ class WeatherDataAggregator:
             logger.debug(f"Tomorrow.io API error: {e}")
         return None
     
-    def get_forecast_nws(self, lat: float, lon: float, date: datetime) -> Optional[Tuple[float, str, datetime]]:
-        """Get forecast from National Weather Service (free, no API key needed) - returns (temp, source, timestamp)"""
+    def get_forecast_nws(self, lat: float, lon: float, date: datetime, series_ticker: str = '') -> Optional[Tuple[float, str, datetime]]:
+        """Get forecast from National Weather Service (free, no API key needed) - returns (temp, source, timestamp) for HIGH/LOW markets"""
         try:
+            is_low_market = 'LOW' in series_ticker
+            
             # NWS requires grid coordinates first
             grid_url = f"https://api.weather.gov/points/{lat},{lon}"
             response = self.session.get(grid_url, timeout=5, headers={'User-Agent': 'KalshiBot/1.0'})
@@ -145,8 +151,11 @@ class WeatherDataAggregator:
                     target_date_str = date.strftime('%Y-%m-%d')
                     for period in forecast_data.get('properties', {}).get('periods', []):
                         period_date = datetime.fromisoformat(period['startTime'].replace('Z', '+00:00')).date()
-                        if period_date == date.date() and period['isDaytime']:
-                            # Extract max temp from forecast text or use temp
+                        # For LOW markets: use nighttime period (has low temp)
+                        # For HIGH markets: use daytime period (has high temp)
+                        is_correct_period = (not period['isDaytime']) if is_low_market else period['isDaytime']
+                        if period_date == date.date() and is_correct_period:
+                            # Extract temp from forecast
                             temp = period.get('temperature')
                             if temp is not None:
                                 # Return temp, source, and current timestamp
@@ -630,6 +639,11 @@ class WeatherDataAggregator:
         city = self.CITY_COORDS[series_ticker]
         lat, lon = city['lat'], city['lon']
         
+        # Log market type for debugging LOW vs HIGH
+        is_low_market = 'LOW' in series_ticker
+        market_type = "LOW (min temp)" if is_low_market else "HIGH (max temp)"
+        logger.debug(f"Fetching {market_type} forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
+        
         # Fetch forecasts in parallel for better performance
         # Using NWS, Tomorrow.io, and Weatherbit (OpenWeather removed)
         # Weatherbit is used as fallback only to stay within free tier (50 requests/day)
@@ -638,8 +652,8 @@ class WeatherDataAggregator:
         # First, try NWS and Tomorrow.io (both have higher free tier limits)
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
-                executor.submit(self.get_forecast_nws, lat, lon, target_date): 'nws',
-                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date): 'tomorrowio'
+                executor.submit(self.get_forecast_nws, lat, lon, target_date, series_ticker): 'nws',
+                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date, series_ticker): 'tomorrowio'
             }
             
             for future in as_completed(futures):

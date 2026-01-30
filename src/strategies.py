@@ -531,6 +531,11 @@ class WeatherDailyStrategy(TradingStrategy):
                 logger.info(f"📊 SKIP {market_ticker}: no forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
                 return None
             
+            # Log market type for LOW vs HIGH debugging
+            market_type = "LOW temp" if is_low_market else "HIGH temp"
+            mean_forecast = sum(forecasts) / len(forecasts)
+            logger.debug(f"Evaluating {market_type} market {market_ticker}: {len(forecasts)} forecasts, mean={mean_forecast:.1f}°F, threshold={threshold}")
+            
             # Build temperature ranges (2-degree brackets as mentioned in guide)
             # Kalshi weather markets typically have 6 brackets
             # We'll create a fine-grained distribution first, then map to brackets
@@ -753,7 +758,7 @@ class WeatherDailyStrategy(TradingStrategy):
                         logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (YES ask {best_yes_ask}¢)")
                     else:
                         confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
-                        logger.info(f"🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
+                        logger.info(f"🎯 LONGSHOT YES {market_ticker}: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
                         logger.info(f"💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
                         
                         # Record position for exit logic
@@ -828,7 +833,7 @@ class WeatherDailyStrategy(TradingStrategy):
                         logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (NO ask {best_no_ask}¢)")
                     else:
                         confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
-                        logger.info(f"🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
+                        logger.info(f"🎯 LONGSHOT NO {market_ticker}: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
                         logger.info(f"💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
                         
                         # Record position for exit logic
@@ -901,7 +906,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
                     logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (YES ask {best_yes_ask}¢)")
                 else:
-                    logger.info(f"✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
+                    logger.info(f"✓ Conservative YES {market_ticker}: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
                     
                     # Record position for exit logic
                     self.active_positions[market_ticker] = {
@@ -967,7 +972,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
                     logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (NO ask {best_no_ask}¢)")
                 else:
-                    logger.info(f"✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
+                    logger.info(f"✓ Conservative NO {market_ticker}: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
                     
                     # Record position for exit logic
                     self.active_positions[market_ticker] = {
