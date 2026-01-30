@@ -21,6 +21,9 @@ class Config:
     # Conservative strategy
     MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '5.0'))  # Minimum edge % to trade
     MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.01'))  # Minimum EV in dollars
+    # If True, only trade when confidence interval does NOT overlap market price (stricter).
+    # If False (default), trade when edge/EV meet thresholds even if CI overlaps (more trades, higher risk).
+    REQUIRE_HIGH_CONFIDENCE = os.getenv('REQUIRE_HIGH_CONFIDENCE', 'false').lower() == 'true'
     
     # Longshot strategy
     LONGSHOT_ENABLED = os.getenv('LONGSHOT_ENABLED', 'true').lower() == 'true'

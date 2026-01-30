@@ -151,7 +151,8 @@ class KalshiTradingBot:
         """Check resting orders and cancel if edge/EV no longer meets strategy thresholds"""
         try:
             try:
-                resting_orders = self.client.get_orders(status='resting')
+                # Use fresh data (no cache) for accurate stale order detection
+                resting_orders = self.client.get_orders(status='resting', use_cache=False)
             except Exception as e:
                 logger.warning(f"Could not fetch resting orders (will retry next cycle): {e}")
                 return
@@ -177,6 +178,7 @@ class KalshiTradingBot:
                         # Market might have closed, cancel order
                         logger.info(f"🗑️  Canceling order {order_id}: Market {ticker} not found (likely closed)")
                         self.client.cancel_order(order_id)
+                        self.client.invalidate_orders_cache()
                         continue
                     
                     # Get current orderbook
@@ -235,6 +237,7 @@ class KalshiTradingBot:
                         logger.debug(f"Market: {ticker}, Side: {side.upper()}, Order Price: {order_price}¢, Current Ask: {current_ask}¢")
                         try:
                             self.client.cancel_order(order_id)
+                            self.client.invalidate_orders_cache()  # Ensure fresh data for next exposure check
                             logger.info(f"✅ Order {order_id} canceled successfully")
                         except Exception as e:
                             logger.warning(f"Error canceling order {order_id}: {e}")
@@ -334,16 +337,18 @@ class KalshiTradingBot:
                 # Quick filter check before expensive orderbook call
                 should_trade = any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies)
                 if not should_trade:
-                    # Debug: log why market was skipped
-                    series = market.get('series_ticker', 'unknown')
+                    ticker = market.get('ticker', 'unknown')
+                    series = market.get('series_ticker', '') or market.get('series_ticker_symbol', '')
                     status = market.get('status', 'unknown')
                     volume = market.get('volume', 0)
-                    if series not in Config.WEATHER_SERIES:
-                        continue  # Not a weather market, skip silently
-                    if status != 'open':
-                        continue  # Not open, skip silently
-                    if volume < Config.MIN_MARKET_VOLUME:
-                        logger.debug(f"Market {market.get('ticker', 'unknown')} skipped: volume {volume} < {Config.MIN_MARKET_VOLUME}")
+                    if series and series not in Config.WEATHER_SERIES and not any(ticker.startswith(p) for p in ['KXHIGH', 'KXLOW']):
+                        logger.info(f"📊 SKIP {ticker}: not a weather series ({series})")
+                    elif status not in ('open', 'active'):
+                        logger.info(f"📊 SKIP {ticker}: status={status} (need open/active)")
+                    elif volume < Config.MIN_MARKET_VOLUME:
+                        logger.info(f"📊 SKIP {ticker}: volume {volume} < {Config.MIN_MARKET_VOLUME}")
+                    else:
+                        logger.info(f"📊 SKIP {ticker}: filtered by strategy (should_trade=False)")
                     continue
                 
                 markets_evaluated += 1

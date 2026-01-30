@@ -20,39 +20,41 @@ class TradingStrategy:
     
     def _get_market_exposure(self, market_ticker: str) -> Dict:
         """
-        Calculate total exposure (contracts + dollars) on a specific market
-        Includes both filled positions and resting (open) orders
-        Base implementation - can be overridden by subclasses
+        Calculate total exposure (contracts + dollars) on a specific market.
+        Includes both current positions AND resting (open) orders.
+
+        IMPORTANT: Uses get_positions() for actual holdings (not get_fills which is historical).
+        Uses use_cache=False for resting orders to get fresh data for accurate limit checks.
         """
         try:
             total_contracts = 0
             total_dollars = 0.0
-            
-            # Get filled positions
+
+            # Get ACTUAL current positions (not historical fills)
+            # get_positions returns real holdings, accounting for buys AND sells
             try:
-                fills = self.client.get_fills(ticker=market_ticker, limit=100)
-                for fill in fills:
-                    if fill.get('ticker') == market_ticker:
-                        count = fill.get('count', 0)
-                        total_contracts += count
-                        
-                        side = fill.get('side', '')
-                        if side == 'yes':
-                            price = fill.get('yes_price', 0)
-                        else:
-                            price = fill.get('no_price', 0)
-                        total_dollars += (count * price) / 100.0
+                positions = self.client.get_positions(ticker=market_ticker)
+                for position in positions:
+                    if position.get('ticker') == market_ticker:
+                        # 'position' field is the net contract count (can be negative for short)
+                        contracts = abs(position.get('position', 0))
+                        total_contracts += contracts
+
+                        # 'market_exposure' is the dollar value at risk
+                        exposure = position.get('market_exposure', 0) / 100.0  # cents to dollars
+                        total_dollars += abs(exposure)
             except Exception as e:
-                logger.debug(f"Could not fetch fills for {market_ticker}: {e}")
-            
-            # Get resting (open) orders
+                logger.debug(f"Could not fetch positions for {market_ticker}: {e}")
+
+            # Get resting (open) orders - use_cache=False for fresh data!
+            # This is critical: stale cache was causing duplicate orders
             try:
-                orders = self.client.get_orders(status='resting')
+                orders = self.client.get_orders(status='resting', use_cache=False)
                 for order in orders:
                     if order.get('ticker') == market_ticker:
                         remaining = order.get('remaining_count', 0)
                         total_contracts += remaining
-                        
+
                         side = order.get('side', '')
                         if side == 'yes':
                             price = order.get('yes_price', 0)
@@ -61,12 +63,12 @@ class TradingStrategy:
                         total_dollars += (remaining * price) / 100.0
             except Exception as e:
                 logger.debug(f"Could not fetch orders for {market_ticker}: {e}")
-            
+
             return {
                 'total_contracts': total_contracts,
                 'total_dollars': total_dollars
             }
-        
+
         except Exception as e:
             logger.error(f"Error getting market exposure for {market_ticker}: {e}", exc_info=True)
             # Return safe defaults (assume at limit to prevent over-trading)
@@ -124,7 +126,10 @@ class TradingStrategy:
                 no_price=no_price,
                 client_order_id=str(uuid.uuid4())
             )
-            
+
+            # Invalidate orders cache so subsequent exposure checks see this order
+            self.client.invalidate_orders_cache()
+
             # Enhanced trade notification  
             order_id = order.get('order_id', 'N/A')
             action = decision['action']
@@ -245,6 +250,7 @@ class WeatherDailyStrategy(TradingStrategy):
         # Conservative strategy parameters (from Config)
         self.min_edge_threshold = Config.MIN_EDGE_THRESHOLD
         self.min_ev_threshold = Config.MIN_EV_THRESHOLD
+        self.require_high_confidence = getattr(Config, 'REQUIRE_HIGH_CONFIDENCE', True)
         
         # Longshot strategy parameters (from Config)
         self.longshot_enabled = Config.LONGSHOT_ENABLED
@@ -393,7 +399,7 @@ class WeatherDailyStrategy(TradingStrategy):
                         break
             
             if not series_ticker:
-                logger.warning(f"Could not determine series for market: {ticker}")
+                logger.info(f"📊 SKIP {market_ticker}: could not determine series")
                 return None
             
             # Extract target date from market ticker or title
@@ -401,7 +407,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # Title format: "Will the **high temp in NYC** be >26° on Jan 28, 2026?"
             target_date = self._extract_market_date(market)
             if not target_date:
-                logger.warning(f"Could not extract date from market: {ticker}")
+                logger.info(f"📊 SKIP {market_ticker}: could not extract date from ticker/title")
                 return None
             
             # Verify date is reasonable (not too far in past/future)
@@ -411,14 +417,13 @@ class WeatherDailyStrategy(TradingStrategy):
             
             max_days = Config.MAX_MARKET_DATE_DAYS
             if days_diff < -1 or days_diff > max_days:  # Allow -1 (yesterday) to max_days
-                logger.warning(f"Market date {market_date} is too far from today ({days_diff} days), skipping")
+                logger.info(f"📊 SKIP {market_ticker}: date too far (today ± {max_days}d, got {days_diff}d)")
                 return None
             
             # Extract temperature threshold from market title (single float or (low, high) range)
             threshold = self.extract_threshold(market)
             if not threshold:
-                # Can't determine threshold, skip
-                logger.warning(f"Could not extract threshold from market: {market.get('title', 'unknown')}")
+                logger.info(f"📊 SKIP {market_ticker}: could not extract temp threshold from title")
                 return None
             
             # CRITICAL: Check if outcome is already determined by today's observations
@@ -485,7 +490,7 @@ class WeatherDailyStrategy(TradingStrategy):
                                     reason = f"Observed low {observed_extreme:.1f}°F already below threshold {threshold}°F (NO certain)"
                     
                     if outcome_determined:
-                        logger.info(f"⏭️  Skipping {market_ticker}: Outcome already determined - {reason}")
+                        logger.info(f"📊 SKIP {market_ticker}: outcome already determined — {reason}")
                         
                         # Mark this market for exclusion from future scans
                         if hasattr(self, '_bot_ref') and self._bot_ref:
@@ -494,9 +499,9 @@ class WeatherDailyStrategy(TradingStrategy):
                         
                         # Cancel any resting orders for this market since outcome is certain
                         try:
-                            all_orders = self.client.get_orders(status='resting')
+                            all_orders = self.client.get_orders(status='resting', use_cache=False)
                             market_orders = [o for o in all_orders if o.get('ticker') == market_ticker]
-                            
+
                             if market_orders:
                                 logger.info(f"🚫 Cancelling {len(market_orders)} resting order(s) for {market_ticker} (outcome determined)")
                                 for order in market_orders:
@@ -507,6 +512,8 @@ class WeatherDailyStrategy(TradingStrategy):
                                             logger.info(f"   ✅ Cancelled order {order_id}")
                                         except Exception as cancel_error:
                                             logger.warning(f"   ⚠️  Failed to cancel order {order_id}: {cancel_error}")
+                                # Invalidate cache after cancellations
+                                self.client.invalidate_orders_cache()
                         except Exception as e:
                             logger.warning(f"Failed to fetch/cancel orders for {market_ticker}: {e}")
                         
@@ -516,8 +523,7 @@ class WeatherDailyStrategy(TradingStrategy):
             forecasts = self.weather_agg.get_all_forecasts(series_ticker, target_date)
             
             if not forecasts:
-                # No forecasts available, skip
-                logger.warning(f"No forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
+                logger.info(f"📊 SKIP {market_ticker}: no forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
                 return None
             
             # Build temperature ranges (2-degree brackets as mentioned in guide)
@@ -537,6 +543,7 @@ class WeatherDailyStrategy(TradingStrategy):
             )
             
             if not prob_dist:
+                logger.info(f"📊 SKIP {market_ticker}: could not build probability distribution")
                 return None
             
             # Calculate our probability for this market
@@ -585,6 +592,7 @@ class WeatherDailyStrategy(TradingStrategy):
             no_orders = orderbook.get('orderbook', {}).get('no', [])
             
             if not yes_orders or not no_orders:
+                logger.info(f"📊 SKIP {market_ticker}: empty orderbook (no yes/no orders)")
                 return None
             
             # Use market prices as fallback
@@ -655,10 +663,10 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # If we're at or over limits, skip this market
             if contracts_remaining == 0 or dollars_remaining < 0.01:
-                logger.info(f"⛔ Skipping {market_ticker}: At limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f})")
+                logger.info(f"📊 SKIP {market_ticker}: at position limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f})")
                 return None
             
-            logger.info(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
+            logger.debug(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
             
             # Skip longshots for today's markets once the extreme (high/low) has likely occurred
             # Longshot value is in the morning/early day when uncertainty is highest
@@ -673,7 +681,7 @@ class WeatherDailyStrategy(TradingStrategy):
             )
             if skip_longshots_past_extreme:
                 market_type = "high" if is_high_market else "low" if is_low_market else "temperature"
-                logger.info(f"⏸️  Skipping longshots for {market_ticker}: {market_type.capitalize()} of day likely already occurred (local time or observed ≈ forecast)")
+                logger.info(f"📊 SKIP {market_ticker}: longshots off — {market_type} of day likely already occurred")
             
             # DUAL STRATEGY: Check both conservative and longshot modes
             
@@ -723,7 +731,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     
                     # Skip if no room left after checking
                     if position_size <= 0:
-                        logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                        logger.info(f"📊 SKIP {market_ticker}: longshot YES ok but no capacity (position_size=0)")
                         return None
                     
                     confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
@@ -793,7 +801,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     
                     # Skip if no room left
                     if position_size <= 0:
-                        logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                        logger.info(f"📊 SKIP {market_ticker}: longshot NO ok but no capacity (position_size=0)")
                         return None
                     
                     confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
@@ -822,11 +830,11 @@ class WeatherDailyStrategy(TradingStrategy):
                     }
             
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
-            # Only trade if confidence interval doesn't overlap with market price (high confidence)
+            # Optionally require confidence interval to not overlap market price (REQUIRE_HIGH_CONFIDENCE)
             high_confidence_yes = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
             high_confidence_no = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
             
-            if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold and high_confidence_yes:
+            if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_yes):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and our_prob > 0.7 and (ci_lower_yes > best_yes_ask / 100.0)
@@ -862,7 +870,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 
                 # Skip if no room left
                 if position_size <= 0:
-                    logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                    logger.info(f"📊 SKIP {market_ticker}: conservative YES ok but no capacity (position_size=0)")
                     return None
                 
                 logger.info(f"✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
@@ -887,7 +895,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     'ev': yes_ev,
                     'strategy_mode': 'conservative'
                 }
-            elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and high_confidence_no:
+            elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_no):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and no_prob > 0.7 and (ci_lower_no > best_no_ask / 100.0)
@@ -923,7 +931,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 
                 # Skip if no room left
                 if position_size <= 0:
-                    logger.debug(f"No capacity for {market_ticker}: Would need more than remaining capacity")
+                    logger.info(f"📊 SKIP {market_ticker}: conservative NO ok but no capacity (position_size=0)")
                     return None
                 
                 logger.info(f"✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
@@ -949,6 +957,20 @@ class WeatherDailyStrategy(TradingStrategy):
                     'strategy_mode': 'conservative'
                 }
             
+            # Diagnostic: log why we didn't trade (helps debug "no purchases")
+            best_edge = max(yes_edge, no_edge)
+            best_ev = max(yes_ev, no_ev)
+            if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_yes:
+                reason = f"YES edge {yes_edge:.1f}% EV ${yes_ev:.4f} ok but CI overlaps ask (REQUIRE_HIGH_CONFIDENCE=false to allow)"
+            elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_no:
+                reason = f"NO edge {no_edge:.1f}% EV ${no_ev:.4f} ok but CI overlaps ask (REQUIRE_HIGH_CONFIDENCE=false to allow)"
+            elif best_edge < self.min_edge_threshold:
+                reason = f"best edge {best_edge:.1f}% < {self.min_edge_threshold}%"
+            elif best_ev < self.min_ev_threshold:
+                reason = f"edge ok, best EV ${best_ev:.4f} < ${self.min_ev_threshold}"
+            else:
+                reason = "no side met edge/EV/confidence"
+            logger.info(f"📊 SKIP {market_ticker}: {reason}")
             return None
             
         except Exception as e:
