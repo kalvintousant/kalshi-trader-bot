@@ -236,10 +236,15 @@ class KalshiClient:
         
         return portfolio
     
-    def get_orders(self, status: Optional[str] = None) -> List[Dict]:
-        """Get orders, optionally filtered by status. Cached briefly to avoid 429 rate limits."""
+    def get_orders(self, status: Optional[str] = None, use_cache: bool = True) -> List[Dict]:
+        """Get orders, optionally filtered by status. Cached briefly to avoid 429 rate limits.
+
+        Args:
+            status: Filter by order status ('resting', 'filled', etc.)
+            use_cache: If False, bypass cache and fetch fresh data (use for exposure checks)
+        """
         cache_key = status or 'all'
-        if cache_key in self.orders_cache:
+        if use_cache and cache_key in self.orders_cache:
             cached_orders, cached_time = self.orders_cache[cache_key]
             if (time.time() - cached_time) < self.orders_cache_ttl:
                 return cached_orders
@@ -250,6 +255,26 @@ class KalshiClient:
         orders = response.get('orders', [])
         self.orders_cache[cache_key] = (orders, time.time())
         return orders
+
+    def get_positions(self, ticker: Optional[str] = None) -> List[Dict]:
+        """Get current positions (actual holdings, not historical fills).
+
+        Args:
+            ticker: Optional ticker to filter positions
+
+        Returns:
+            List of position dicts with 'ticker', 'position' (contract count),
+            'market_exposure' (dollars at risk), etc.
+        """
+        params = {}
+        if ticker:
+            params['ticker'] = ticker
+        response = self._get('/portfolio/positions', params=params)
+        return response.get('market_positions', [])
+
+    def invalidate_orders_cache(self):
+        """Invalidate the orders cache. Call after placing/canceling orders."""
+        self.orders_cache.clear()
     
     def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> List[Dict]:
         """Get filled orders (past trades)"""
