@@ -330,6 +330,114 @@ class WeatherDataAggregator:
             logger.debug(f"Error getting today's observed high for {series_ticker}: {e}")
             return None
     
+    def get_observed_high_for_date(self, series_ticker: str, target_date) -> Optional[Tuple[float, datetime]]:
+        """
+        Get observed high temperature from NWS for a specific date (local time for that city).
+        target_date: date or datetime. Returns (high_temp_f, timestamp) or None.
+        """
+        if series_ticker not in self.CITY_COORDS or series_ticker not in self.CITY_TIMEZONES:
+            return None
+        tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
+        target_local = target_date.date() if hasattr(target_date, 'date') else target_date
+        city = self.CITY_COORDS[series_ticker]
+        lat, lon = city['lat'], city['lon']
+        try:
+            points_url = f"https://api.weather.gov/points/{lat},{lon}"
+            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if resp.status_code != 200:
+                return None
+            obs_stations_url = resp.json()['properties'].get('observationStations')
+            if not obs_stations_url:
+                return None
+            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if stations_resp.status_code != 200:
+                return None
+            features = stations_resp.json().get('features', [])
+            if not features:
+                return None
+            station_id = features[0]['id']
+            obs_url = f"{station_id}/observations"
+            obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if obs_resp.status_code != 200:
+                return None
+            observations = obs_resp.json().get('features', [])
+            temps = []
+            for obs in observations:
+                props = obs.get('properties', {})
+                ts_str = props.get('timestamp')
+                if not ts_str:
+                    continue
+                ts_utc = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                ts_local = ts_utc.astimezone(tz)
+                if ts_local.date() != target_local:
+                    continue
+                temp_c = props.get('temperature', {}).get('value')
+                if temp_c is None:
+                    continue
+                temp_f = (temp_c * 9/5) + 32
+                temps.append((temp_f, ts_local))
+            if not temps:
+                return None
+            max_temp, max_time = max(temps, key=lambda x: x[0])
+            return (max_temp, max_time)
+        except Exception as e:
+            logger.debug(f"Error getting observed high for {series_ticker} on {target_local}: {e}")
+            return None
+    
+    def get_observed_low_for_date(self, series_ticker: str, target_date) -> Optional[Tuple[float, datetime]]:
+        """
+        Get observed low temperature from NWS for a specific date (local time for that city).
+        target_date: date or datetime. Returns (low_temp_f, timestamp) or None.
+        """
+        if series_ticker not in self.CITY_COORDS or series_ticker not in self.CITY_TIMEZONES:
+            return None
+        tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
+        target_local = target_date.date() if hasattr(target_date, 'date') else target_date
+        city = self.CITY_COORDS[series_ticker]
+        lat, lon = city['lat'], city['lon']
+        try:
+            points_url = f"https://api.weather.gov/points/{lat},{lon}"
+            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if resp.status_code != 200:
+                return None
+            obs_stations_url = resp.json()['properties'].get('observationStations')
+            if not obs_stations_url:
+                return None
+            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if stations_resp.status_code != 200:
+                return None
+            features = stations_resp.json().get('features', [])
+            if not features:
+                return None
+            station_id = features[0]['id']
+            obs_url = f"{station_id}/observations"
+            obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if obs_resp.status_code != 200:
+                return None
+            observations = obs_resp.json().get('features', [])
+            temps = []
+            for obs in observations:
+                props = obs.get('properties', {})
+                ts_str = props.get('timestamp')
+                if not ts_str:
+                    continue
+                ts_utc = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                ts_local = ts_utc.astimezone(tz)
+                if ts_local.date() != target_local:
+                    continue
+                temp_c = props.get('temperature', {}).get('value')
+                if temp_c is None:
+                    continue
+                temp_f = (temp_c * 9/5) + 32
+                temps.append((temp_f, ts_local))
+            if not temps:
+                return None
+            min_temp, min_time = min(temps, key=lambda x: x[0])
+            return (min_temp, min_time)
+        except Exception as e:
+            logger.debug(f"Error getting observed low for {series_ticker} on {target_local}: {e}")
+            return None
+    
     def get_todays_observed_low(self, series_ticker: str) -> Optional[Tuple[float, datetime]]:
         """
         Get today's observed low temperature from NWS station observations.

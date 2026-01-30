@@ -15,6 +15,8 @@ class Config:
     MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '10'))  # $10 max daily loss limit
     MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '25'))  # Max contracts per market
     MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '3.0'))  # Max dollars per market ($3.00)
+    # Skip placing an order if computed size would be below this (avoids many 1-contract orders).
+    MIN_ORDER_CONTRACTS = int(os.getenv('MIN_ORDER_CONTRACTS', '1'))  # 1 = allow 1-contract orders; 2+ = require at least that many
     ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'weather_daily').split(',')
     
     # Weather Strategy Parameters
@@ -35,6 +37,11 @@ class Config:
     # Market filtering
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '3'))  # Max days in future for forecasts
+    # Never buy at or above this price (cents). 99 = no buys at 99¢ or 100¢ (no edge).
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '99'))
+    # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
+    # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
+    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '0'))
     
     # Caching
     ORDERBOOK_CACHE_TTL = int(os.getenv('ORDERBOOK_CACHE_TTL', '3'))  # 3 seconds

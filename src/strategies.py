@@ -99,6 +99,11 @@ class TradingStrategy:
             new_price = decision.get('price', 0)
             new_dollars = (new_count * new_price) / 100.0
             
+            # Never buy at 100¢ (no value)
+            if new_price > Config.MAX_BUY_PRICE_CENTS:
+                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: price {new_price}¢ > MAX_BUY_PRICE_CENTS ({Config.MAX_BUY_PRICE_CENTS})")
+                return None
+            
             if existing_contracts + new_count > Config.MAX_CONTRACTS_PER_MARKET:
                 logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed contract limit ({existing_contracts} + {new_count} > {Config.MAX_CONTRACTS_PER_MARKET})")
                 return None
@@ -531,6 +536,13 @@ class WeatherDailyStrategy(TradingStrategy):
             # We'll create a fine-grained distribution first, then map to brackets
             mean_forecast = sum(forecasts) / len(forecasts)
             
+            # Skip single-threshold markets when forecast is too close to threshold (high uncertainty)
+            min_deg = getattr(Config, 'MIN_DEGREES_FROM_THRESHOLD', 0)
+            if min_deg > 0 and not isinstance(threshold, tuple):
+                if abs(mean_forecast - threshold) < min_deg:
+                    logger.info(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° within {min_deg}° of threshold {threshold}° (reduce coin-flip losses)")
+                    return None
+            
             # Create temperature ranges around the forecast (2-degree brackets)
             temp_ranges = []
             base_temp = int(mean_forecast) - 10  # Start 10 degrees below
@@ -668,9 +680,9 @@ class WeatherDailyStrategy(TradingStrategy):
             
             logger.debug(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
             
-            # Skip longshots for today's markets once the extreme (high/low) has likely occurred
-            # Longshot value is in the morning/early day when uncertainty is highest
-            skip_longshots_past_extreme = (
+            # Skip ALL new trades on today's markets once the extreme (high/low) of day has likely occurred.
+            # Official report is typically in by afternoon; buying after that is bad (outcome known or soon known).
+            skip_todays_market_past_report = (
                 target_date.date() == datetime.now().date()
                 and self.weather_agg.is_likely_past_extreme_of_day(
                     series_ticker,
@@ -679,16 +691,16 @@ class WeatherDailyStrategy(TradingStrategy):
                     forecasted_extreme=mean_forecast,
                 )
             )
-            if skip_longshots_past_extreme:
+            if skip_todays_market_past_report:
                 market_type = "high" if is_high_market else "low" if is_low_market else "temperature"
-                logger.info(f"📊 SKIP {market_ticker}: longshots off — {market_type} of day likely already occurred")
+                logger.info(f"📊 SKIP {market_ticker}: today's market past report time — {market_type} of day likely already occurred (no new buys)")
+                return None
             
             # DUAL STRATEGY: Check both conservative and longshot modes
             
             # LONGSHOT MODE: Hunt for extreme mispricings (0.1-10% odds with massive edges)
             # Inspired by successful Polymarket bot: buy cheap certainty
-            # Disabled after extreme has occurred for today's markets — longshot value is in early-day uncertainty
-            if self.longshot_enabled and not skip_longshots_past_extreme:
+            if self.longshot_enabled:
                 # Check YES side for longshot opportunity
                 # Use ASK price to check if it's cheap enough
                 if (best_yes_ask <= self.longshot_max_price and 
@@ -729,35 +741,41 @@ class WeatherDailyStrategy(TradingStrategy):
                     dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
                     position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
                     
-                    # Skip if no room left after checking
+                    # Skip if no room or below minimum order size
                     if position_size <= 0:
                         logger.info(f"📊 SKIP {market_ticker}: longshot YES ok but no capacity (position_size=0)")
                         return None
+                    if position_size < Config.MIN_ORDER_CONTRACTS:
+                        logger.info(f"📊 SKIP {market_ticker}: longshot YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                        return None
                     
-                    confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
-                    logger.info(f"🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
-                    logger.info(f"💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
-                    
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'yes',
-                        'entry_price': best_yes_ask,
-                        'entry_time': datetime.now(),
-                        'count': position_size,
-                        'edge': yes_edge,
-                        'ev': yes_ev,
-                        'strategy_mode': 'longshot'
-                    }
-                    
-                    return {
-                        'action': 'buy',
-                        'side': 'yes',
-                        'count': position_size,
-                        'price': best_yes_ask,  # Pay the ask price to get filled
-                        'edge': yes_edge,
-                        'ev': yes_ev,
-                        'strategy_mode': 'longshot'
-                    }
+                    if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
+                        logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (YES ask {best_yes_ask}¢)")
+                    else:
+                        confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
+                        logger.info(f"🎯 LONGSHOT YES: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
+                        logger.info(f"💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
+                        
+                        # Record position for exit logic
+                        self.active_positions[market_ticker] = {
+                            'side': 'yes',
+                            'entry_price': best_yes_ask,
+                            'entry_time': datetime.now(),
+                            'count': position_size,
+                            'edge': yes_edge,
+                            'ev': yes_ev,
+                            'strategy_mode': 'longshot'
+                        }
+                        
+                        return {
+                            'action': 'buy',
+                            'side': 'yes',
+                            'count': position_size,
+                            'price': best_yes_ask,  # Pay the ask price to get filled
+                            'edge': yes_edge,
+                            'ev': yes_ev,
+                            'strategy_mode': 'longshot'
+                        }
                 
                 # Check NO side for longshot opportunity
                 # Use ASK price to check if it's cheap enough
@@ -799,35 +817,40 @@ class WeatherDailyStrategy(TradingStrategy):
                     dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
                     position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
                     
-                    # Skip if no room left
                     if position_size <= 0:
                         logger.info(f"📊 SKIP {market_ticker}: longshot NO ok but no capacity (position_size=0)")
                         return None
+                    if position_size < Config.MIN_ORDER_CONTRACTS:
+                        logger.info(f"📊 SKIP {market_ticker}: longshot NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                        return None
                     
-                    confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
-                    logger.info(f"🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
-                    logger.info(f"💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
-                    
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'no',
-                        'entry_price': best_no_ask,
-                        'entry_time': datetime.now(),
-                        'count': position_size,
-                        'edge': no_edge,
-                        'ev': no_ev,
-                        'strategy_mode': 'longshot'
-                    }
-                    
-                    return {
-                        'action': 'buy',
-                        'side': 'no',
-                        'count': position_size,
-                        'price': best_no_ask,  # Pay the ask price to get filled
-                        'edge': no_edge,
-                        'ev': no_ev,
-                        'strategy_mode': 'longshot'
-                    }
+                    if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
+                        logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (NO ask {best_no_ask}¢)")
+                    else:
+                        confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
+                        logger.info(f"🎯 LONGSHOT NO: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
+                        logger.info(f"💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
+                        
+                        # Record position for exit logic
+                        self.active_positions[market_ticker] = {
+                            'side': 'no',
+                            'entry_price': best_no_ask,
+                            'entry_time': datetime.now(),
+                            'count': position_size,
+                            'edge': no_edge,
+                            'ev': no_ev,
+                            'strategy_mode': 'longshot'
+                        }
+                        
+                        return {
+                            'action': 'buy',
+                            'side': 'no',
+                            'count': position_size,
+                            'price': best_no_ask,  # Pay the ask price to get filled
+                            'edge': no_edge,
+                            'ev': no_ev,
+                            'strategy_mode': 'longshot'
+                        }
             
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             # Optionally require confidence interval to not overlap market price (REQUIRE_HIGH_CONFIDENCE)
@@ -868,33 +891,38 @@ class WeatherDailyStrategy(TradingStrategy):
                 dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
                 position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
                 
-                # Skip if no room left
                 if position_size <= 0:
                     logger.info(f"📊 SKIP {market_ticker}: conservative YES ok but no capacity (position_size=0)")
                     return None
+                if position_size < Config.MIN_ORDER_CONTRACTS:
+                    logger.info(f"📊 SKIP {market_ticker}: conservative YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                    return None
                 
-                logger.info(f"✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
-                
-                # Record position for exit logic
-                self.active_positions[market_ticker] = {
-                    'side': 'yes',
-                    'entry_price': best_yes_ask,
-                    'entry_time': datetime.now(),
-                    'count': position_size,
-                    'edge': yes_edge,
-                    'ev': yes_ev,
-                    'strategy_mode': 'conservative'
-                }
-                
-                return {
-                    'action': 'buy',
-                    'side': 'yes',
-                    'count': position_size,
-                    'price': best_yes_ask,  # Pay the ask price to get filled
-                    'edge': yes_edge,
-                    'ev': yes_ev,
-                    'strategy_mode': 'conservative'
-                }
+                if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
+                    logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (YES ask {best_yes_ask}¢)")
+                else:
+                    logger.info(f"✓ Conservative YES: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
+                    
+                    # Record position for exit logic
+                    self.active_positions[market_ticker] = {
+                        'side': 'yes',
+                        'entry_price': best_yes_ask,
+                        'entry_time': datetime.now(),
+                        'count': position_size,
+                        'edge': yes_edge,
+                        'ev': yes_ev,
+                        'strategy_mode': 'conservative'
+                    }
+                    
+                    return {
+                        'action': 'buy',
+                        'side': 'yes',
+                        'count': position_size,
+                        'price': best_yes_ask,  # Pay the ask price to get filled
+                        'edge': yes_edge,
+                        'ev': yes_ev,
+                        'strategy_mode': 'conservative'
+                    }
             elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_no):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
@@ -929,33 +957,38 @@ class WeatherDailyStrategy(TradingStrategy):
                 dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
                 position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
                 
-                # Skip if no room left
                 if position_size <= 0:
                     logger.info(f"📊 SKIP {market_ticker}: conservative NO ok but no capacity (position_size=0)")
                     return None
+                if position_size < Config.MIN_ORDER_CONTRACTS:
+                    logger.info(f"📊 SKIP {market_ticker}: conservative NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                    return None
                 
-                logger.info(f"✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
-                
-                # Record position for exit logic
-                self.active_positions[market_ticker] = {
-                    'side': 'no',
-                    'entry_price': best_no_ask,
-                    'entry_time': datetime.now(),
-                    'count': position_size,
-                    'edge': no_edge,
-                    'ev': no_ev,
-                    'strategy_mode': 'conservative'
-                }
-                
-                return {
-                    'action': 'buy',
-                    'side': 'no',
-                    'count': position_size,
-                    'price': best_no_ask,  # Pay the ask price to get filled
-                    'edge': no_edge,
-                    'ev': no_ev,
-                    'strategy_mode': 'conservative'
-                }
+                if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
+                    logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (NO ask {best_no_ask}¢)")
+                else:
+                    logger.info(f"✓ Conservative NO: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
+                    
+                    # Record position for exit logic
+                    self.active_positions[market_ticker] = {
+                        'side': 'no',
+                        'entry_price': best_no_ask,
+                        'entry_time': datetime.now(),
+                        'count': position_size,
+                        'edge': no_edge,
+                        'ev': no_ev,
+                        'strategy_mode': 'conservative'
+                    }
+                    
+                    return {
+                        'action': 'buy',
+                        'side': 'no',
+                        'count': position_size,
+                        'price': best_no_ask,  # Pay the ask price to get filled
+                        'edge': no_edge,
+                        'ev': no_ev,
+                        'strategy_mode': 'conservative'
+                    }
             
             # Diagnostic: log why we didn't trade (helps debug "no purchases")
             best_edge = max(yes_edge, no_edge)
