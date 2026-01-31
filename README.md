@@ -17,7 +17,7 @@ This bot implements a dual-strategy approach combining conservative edge-based t
 ### Key Features
 
 - **🌦️ Weather Markets Only**: Specialized focus on daily weather prediction markets (HIGH and LOW temperature)
-- **📊 Multi-Source Data Aggregation**: Combines forecasts from NWS, Tomorrow.io, and Weatherbit with outlier detection
+- **📊 Multi-Source Data Aggregation**: Combines forecasts from 10+ weather sources including NWS, Open-Meteo, GEFS/ECMWF ensembles, Pirate Weather, Tomorrow.io, and more with outlier detection
 - **🎲 Dual Trading Strategies**:
   - **Conservative**: High-confidence trades with >5% edge and positive EV
   - **Longshot**: Undervalued low-probability events (≤10¢, ≥50% estimated probability, ≥30% edge)
@@ -55,9 +55,9 @@ This bot implements a dual-strategy approach combining conservative edge-based t
 - **Python 3.9+**
 - **macOS** (tested on macOS 12+)
 - **Kalshi API Credentials** ([Get API keys](https://kalshi.com/))
-- **Weather API Keys**:
-  - [Tomorrow.io API](https://www.tomorrow.io/) (optional)
-  - [Weatherbit API](https://www.weatherbit.io/) (optional)
+- **Weather API Keys** (optional - many sources are free):
+  - Free (no key): NWS, Open-Meteo, GEFS Ensemble (31 members), ECMWF Ensemble (51 members)
+  - Free tier (key required): [Tomorrow.io](https://www.tomorrow.io/), [Pirate Weather](https://pirateweather.net/), [Visual Crossing](https://www.visualcrossing.com/), [Weatherbit](https://www.weatherbit.io/)
 
 ### Setup
 
@@ -94,18 +94,22 @@ Create a `.env` file in the project root:
 
 ```bash
 # Kalshi API (Required)
-KALSHI_EMAIL=your-email@example.com
-KALSHI_PASSWORD=your-password
-KALSHI_API_BASE=https://trading-api.kalshi.com/trade-api/v2
+KALSHI_API_KEY_ID=your-api-key-id
+KALSHI_PRIVATE_KEY_PATH=/path/to/private_key.pem
+KALSHI_BASE_URL=https://api.elections.kalshi.com/trade-api/v2
 
-# Weather APIs (At least one recommended)
-TOMORROW_API_KEY=your-tomorrow-api-key       # Optional
-WEATHERBIT_API_KEY=your-weatherbit-api-key   # Optional
+# Weather APIs (Optional - many free sources work without keys)
+TOMORROWIO_API_KEY=your-tomorrow-api-key       # Optional (500 req/day free)
+PIRATE_WEATHER_API_KEY=your-pirate-key         # Optional (10k req/month free)
+VISUAL_CROSSING_API_KEY=your-vc-key            # Optional (1k records/day free)
+WEATHERBIT_API_KEY=your-weatherbit-api-key     # Optional (50 req/day free)
 
 # Trading Configuration
 ENABLED_STRATEGIES=weather_daily
-MAX_POSITION_SIZE=10
-MAX_DAILY_LOSS=500
+MAX_POSITION_SIZE=1                            # Contracts per order
+MAX_CONTRACTS_PER_MARKET=3                     # Max contracts per market
+MAX_DOLLARS_PER_MARKET=1.00                    # Max $ per market
+MAX_DAILY_LOSS=10                              # Daily loss limit
 
 # Strategy Parameters
 MIN_EDGE_THRESHOLD=5.0                # Minimum edge percentage (%)
@@ -379,11 +383,13 @@ API wrapper with:
 
 #### 4. Weather Data (`src/weather_data.py`)
 Forecast aggregation featuring:
-- Multi-source API integration (NWS, Tomorrow.io, Weatherbit)
-- Probability distribution modeling
-- Outlier detection
+- **10+ Weather Data Sources**: NWS, NWS MOS, Open-Meteo (GFS/ECMWF/ICON), GEFS Ensemble (31 members), ECMWF Ensemble (51 members), Pirate Weather (HRRR), Tomorrow.io, Visual Crossing, Weatherbit
+- **Ensemble-Based Uncertainty**: Real uncertainty from 82 physics-based weather models instead of synthetic estimates
+- **Model-Specific Bias Correction**: Learns from historical errors and auto-corrects model biases
+- Probability distribution modeling with dynamic standard deviation
+- Outlier detection and filtering
 - Source weighting by age and reliability
-- Confidence interval calculation
+- Confidence interval calculation via bootstrap sampling
 - **Real-time observation tracking**: Gets today's observed high/low from NWS stations
 - **Smart timing logic**: Determines if extreme (high/low) has likely occurred for longshot cutoff
 
@@ -523,6 +529,19 @@ python3 -c "from src.kalshi_client import KalshiClient; c=KalshiClient(); print(
 
 ### Recent Improvements
 
+✅ **v2.4.0 (January 2026)**
+- **🌐 Major Weather Data Expansion**: Added 7 new weather data sources
+  - Open-Meteo: Free multi-model support (GFS, ECMWF, ICON, GEM, JMA)
+  - Pirate Weather: HRRR-based, excellent for short-term US forecasts
+  - Visual Crossing: Historical data support
+  - NWS MOS: Model Output Statistics, bias-corrected forecasts
+  - GEFS Ensemble: 31 members for real uncertainty quantification
+  - ECMWF Ensemble: 51 members, world's most accurate model
+- **📊 Ensemble-Based Uncertainty**: Replaces synthetic time-based estimates with real ensemble spread from 82 weather models
+- **🎯 Model-Specific Bias Correction**: Learns from historical errors and auto-corrects model biases per city/month
+- **🚀 Parallel Fetching**: Fetches from multiple sources simultaneously for speed
+- **🔒 Enhanced Position Limits**: Added `MAX_CONTRACTS_PER_MARKET` and `MAX_DOLLARS_PER_MARKET` to prevent over-trading individual markets
+
 ✅ **v2.3.0 (January 2026)**
 - **🧮 Hybrid Position Sizing**: Automatic selection between Kelly Criterion and confidence scoring
   - Kelly Criterion (math-based optimal) for high confidence: 2+ sources, CI doesn't overlap market
@@ -595,7 +614,7 @@ Use at your own risk. Always understand your risk exposure and comply with appli
 ## 🙏 Acknowledgments
 
 - [Kalshi](https://kalshi.com/) for providing the prediction market platform and API
-- Weather data providers: NWS, Tomorrow.io, Weatherbit
+- Weather data providers: NWS, NOAA, Open-Meteo, Tomorrow.io, Pirate Weather, Visual Crossing, Weatherbit, ECMWF, and GEFS ensemble teams
 - Open source Python community
 
 ---
