@@ -20,6 +20,7 @@ import json
 from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
@@ -99,6 +100,10 @@ class WeatherDataAggregator:
 
         # Forecast metadata cache (stores source and timestamp for each forecast)
         self.forecast_metadata = {}  # {cache_key: [(temp, source, timestamp), ...]}
+        
+        # File to log individual source forecasts for later analysis
+        self.forecasts_log_file = Path("data/source_forecasts.csv")
+        self._init_forecasts_log()
 
         # Ensemble data cache (stores full ensemble for uncertainty calculation)
         self.ensemble_cache = {}  # {cache_key: {'forecasts': [...], 'std': float, 'timestamp': datetime}}
@@ -136,6 +141,37 @@ class WeatherDataAggregator:
 
         # Use session for connection pooling
         self.session = requests.Session()
+    
+    def _init_forecasts_log(self):
+        """Initialize source_forecasts.csv if it doesn't exist"""
+        if not self.forecasts_log_file.exists():
+            self.forecasts_log_file.parent.mkdir(exist_ok=True)
+            with open(self.forecasts_log_file, 'w', newline='') as f:
+                import csv
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'series_ticker', 'target_date', 'source', 
+                    'forecast_temp', 'market_type'
+                ])
+    
+    def _log_source_forecast(self, series_ticker: str, target_date: datetime, 
+                            source: str, forecast_temp: float):
+        """Log individual source forecast to CSV for later analysis"""
+        try:
+            import csv
+            market_type = 'low' if 'LOW' in series_ticker else 'high'
+            with open(self.forecasts_log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    series_ticker,
+                    target_date.date().isoformat(),
+                    source,
+                    f"{forecast_temp:.2f}",
+                    market_type
+                ])
+        except Exception as e:
+            logger.debug(f"Error logging source forecast: {e}")
     
     def get_forecast_tomorrowio(self, lat: float, lon: float, date: datetime, series_ticker: str = '') -> Optional[Tuple[float, str, datetime]]:
         """Get forecast from Tomorrow.io API - returns (temp, source, timestamp) for HIGH/LOW markets"""
@@ -1190,6 +1226,8 @@ class WeatherDataAggregator:
                     result = future.result()
                     if result is not None:
                         temp, source, timestamp = result
+                        # Log the raw forecast for later analysis
+                        self._log_source_forecast(series_ticker, target_date, source, temp)
                         # Apply bias correction
                         corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
                         forecast_data.append((corrected_temp, source, timestamp))
@@ -1204,6 +1242,8 @@ class WeatherDataAggregator:
                 weatherbit_result = self.get_forecast_weatherbit(lat, lon, target_date, series_ticker)
                 if weatherbit_result is not None:
                     temp, source, timestamp = weatherbit_result
+                    # Log the raw forecast
+                    self._log_source_forecast(series_ticker, target_date, source, temp)
                     corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
                     forecast_data.append((corrected_temp, source, timestamp))
                     logger.info(f"Using Weatherbit fallback for {series_ticker}")

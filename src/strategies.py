@@ -20,53 +20,77 @@ class TradingStrategy:
     
     def _get_market_exposure(self, market_ticker: str) -> Dict:
         """
-        Calculate total exposure (contracts + dollars) on a specific market.
+        Calculate total exposure (contracts + dollars) on a specific BASE MARKET.
         Includes both current positions AND resting (open) orders.
-
-        IMPORTANT: Uses get_positions() for actual holdings (not get_fills which is historical).
+        
+        IMPORTANT: Tracks at BASE MARKET level (e.g., KXHIGHMIA-26FEB01)
+        not per-threshold (e.g., KXHIGHMIA-26FEB01-B51.5).
+        This means all temperature thresholds for a market are combined.
+        
+        Uses get_positions() for actual holdings (not get_fills which is historical).
         Uses use_cache=False for resting orders to get fresh data for accurate limit checks.
         """
         try:
+            # Extract base market ticker (remove threshold suffix)
+            # e.g., KXHIGHMIA-26FEB01-B51.5 -> KXHIGHMIA-26FEB01
+            # e.g., KXHIGHMIA-26FEB01-T64 -> KXHIGHMIA-26FEB01
+            parts = market_ticker.split('-')
+            if len(parts) >= 3:
+                base_market = '-'.join(parts[:2])  # Take series + date
+            else:
+                base_market = market_ticker
+            
             total_contracts = 0
             total_dollars = 0.0
 
             # Get ACTUAL current positions (not historical fills)
-            # get_positions returns real holdings, accounting for buys AND sells
+            # Check ALL thresholds for this base market
             try:
-                positions = self.client.get_positions(ticker=market_ticker)
+                positions = self.client.get_positions()
                 for position in positions:
-                    if position.get('ticker') == market_ticker:
-                        # 'position' field is the net contract count (can be negative for short)
-                        contracts = abs(position.get('position', 0))
-                        total_contracts += contracts
+                    pos_ticker = position.get('ticker', '')
+                    # Check if this position belongs to our base market
+                    pos_parts = pos_ticker.split('-')
+                    if len(pos_parts) >= 2:
+                        pos_base = '-'.join(pos_parts[:2])
+                        if pos_base == base_market:
+                            # 'position' field is the net contract count (can be negative for short)
+                            contracts = abs(position.get('position', 0))
+                            total_contracts += contracts
 
-                        # 'market_exposure' is the dollar value at risk
-                        exposure = position.get('market_exposure', 0) / 100.0  # cents to dollars
-                        total_dollars += abs(exposure)
+                            # 'market_exposure' is the dollar value at risk
+                            exposure = position.get('market_exposure', 0) / 100.0  # cents to dollars
+                            total_dollars += abs(exposure)
             except Exception as e:
-                logger.debug(f"Could not fetch positions for {market_ticker}: {e}")
+                logger.debug(f"Could not fetch positions for {base_market}: {e}")
 
             # Get resting (open) orders - use_cache=False for fresh data!
             # This is critical: stale cache was causing duplicate orders
             try:
                 orders = self.client.get_orders(status='resting', use_cache=False)
                 for order in orders:
-                    if order.get('ticker') == market_ticker:
-                        remaining = order.get('remaining_count', 0)
-                        total_contracts += remaining
+                    order_ticker = order.get('ticker', '')
+                    # Check if this order belongs to our base market
+                    order_parts = order_ticker.split('-')
+                    if len(order_parts) >= 2:
+                        order_base = '-'.join(order_parts[:2])
+                        if order_base == base_market:
+                            remaining = order.get('remaining_count', 0)
+                            total_contracts += remaining
 
-                        side = order.get('side', '')
-                        if side == 'yes':
-                            price = order.get('yes_price', 0)
-                        else:
-                            price = order.get('no_price', 0)
-                        total_dollars += (remaining * price) / 100.0
+                            side = order.get('side', '')
+                            if side == 'yes':
+                                price = order.get('yes_price', 0)
+                            else:
+                                price = order.get('no_price', 0)
+                            total_dollars += (remaining * price) / 100.0
             except Exception as e:
-                logger.debug(f"Could not fetch orders for {market_ticker}: {e}")
+                logger.debug(f"Could not fetch orders for {base_market}: {e}")
 
             return {
                 'total_contracts': total_contracts,
-                'total_dollars': total_dollars
+                'total_dollars': total_dollars,
+                'base_market': base_market  # Include for logging
             }
 
         except Exception as e:
@@ -74,7 +98,8 @@ class TradingStrategy:
             # Return safe defaults (assume at limit to prevent over-trading)
             return {
                 'total_contracts': Config.MAX_CONTRACTS_PER_MARKET,
-                'total_dollars': Config.MAX_DOLLARS_PER_MARKET
+                'total_dollars': Config.MAX_DOLLARS_PER_MARKET,
+                'base_market': market_ticker
             }
     
     def should_trade(self, market: Dict) -> bool:
@@ -93,6 +118,7 @@ class TradingStrategy:
             existing_exposure = self._get_market_exposure(market_ticker)
             existing_contracts = existing_exposure['total_contracts']
             existing_dollars = existing_exposure['total_dollars']
+            base_market = existing_exposure.get('base_market', market_ticker)
             
             # Check if we would exceed limits with this trade
             new_count = decision.get('count', 0)
@@ -104,12 +130,17 @@ class TradingStrategy:
                 logger.warning(f"⛔ BLOCKED trade on {market_ticker}: price {new_price}¢ > MAX_BUY_PRICE_CENTS ({Config.MAX_BUY_PRICE_CENTS})")
                 return None
             
+            # Block if EITHER limit would be exceeded by this trade
+            # Uses > (not >=) to allow trading UP TO the limit (e.g., 3 contracts allowed, block 4th)
+            # NOTE: Limits apply to BASE MARKET (e.g., KXHIGHMIA-26FEB01) not per-threshold
             if existing_contracts + new_count > Config.MAX_CONTRACTS_PER_MARKET:
-                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed contract limit ({existing_contracts} + {new_count} > {Config.MAX_CONTRACTS_PER_MARKET})")
+                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed BASE MARKET contract limit")
+                logger.warning(f"   Base market {base_market}: {existing_contracts} + {new_count} = {existing_contracts + new_count} > {Config.MAX_CONTRACTS_PER_MARKET}")
                 return None
             
             if existing_dollars + new_dollars > Config.MAX_DOLLARS_PER_MARKET:
-                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed dollar limit (${existing_dollars:.2f} + ${new_dollars:.2f} > ${Config.MAX_DOLLARS_PER_MARKET:.2f})")
+                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed BASE MARKET dollar limit")
+                logger.warning(f"   Base market {base_market}: ${existing_dollars:.2f} + ${new_dollars:.2f} = ${existing_dollars + new_dollars:.2f} > ${Config.MAX_DOLLARS_PER_MARKET:.2f}")
                 return None
             
             # Set price for the side we're trading (YES or NO)
@@ -668,11 +699,12 @@ class WeatherDailyStrategy(TradingStrategy):
             no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake,
                                                   include_fees=True, fee_rate=0.05)
             
-            # Check existing exposure on this market BEFORE placing new orders
+            # Check existing exposure on this BASE MARKET BEFORE placing new orders
             # This prevents the bug where we place multiple orders on the same market
             existing_exposure = self._get_market_exposure(market_ticker)
             existing_contracts = existing_exposure['total_contracts']
             existing_dollars = existing_exposure['total_dollars']
+            base_market = existing_exposure.get('base_market', market_ticker)
             
             # Calculate remaining capacity
             contracts_remaining = max(0, Config.MAX_CONTRACTS_PER_MARKET - existing_contracts)
@@ -680,10 +712,10 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # If we're at or over limits, skip this market
             if contracts_remaining == 0 or dollars_remaining < 0.01:
-                logger.info(f"📊 SKIP {market_ticker}: at position limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f})")
+                logger.info(f"📊 SKIP {market_ticker}: at BASE MARKET position limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f}) for {base_market}")
                 return None
             
-            logger.debug(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
+            logger.debug(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining for BASE MARKET {base_market} (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
             
             # Skip ALL new trades on today's markets once the extreme (high/low) of day has likely occurred.
             # Official report is typically in by afternoon; buying after that is bad (outcome known or soon known).
