@@ -2,7 +2,7 @@
 """
 Performance Metrics Dashboard - Comprehensive trading analytics
 
-Usage: python3 performance_dashboard.py [--period=all|today|week|month]
+Usage: python3 performance_dashboard.py [--period=all|today|week|month] [--source=api|csv]
 
 Tracks and displays:
 - Win rate (overall and by city/strategy)
@@ -11,6 +11,10 @@ Tracks and displays:
 - P&L by strategy (longshot vs conservative)
 - Performance by city
 - Performance trends over time
+
+Data sources:
+- api (default): Real fills from Kalshi API with NWS-inferred outcomes
+- csv: Historical data from outcomes.csv (may contain stale/test data)
 """
 
 import csv
@@ -24,7 +28,178 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def load_outcomes(period: str = 'all') -> List[Dict]:
+def load_outcomes_from_api(period: str = 'all') -> List[Dict]:
+    """Load real outcomes from Kalshi API with NWS-inferred results."""
+    from src.config import Config
+    from src.kalshi_client import KalshiClient
+    from src.weather_data import WeatherDataAggregator, extract_threshold_from_market
+
+    try:
+        Config.validate()
+    except Exception as e:
+        print(f"Config error: {e}")
+        return []
+
+    client = KalshiClient()
+    weather_agg = WeatherDataAggregator()
+
+    # Get fills from API
+    fills = client.get_fills(limit=500)
+
+    now = datetime.now()
+    today = now.date()
+
+    # Period filter
+    if period == 'today':
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == 'week':
+        cutoff = now - timedelta(days=7)
+    elif period == 'month':
+        cutoff = now - timedelta(days=30)
+    else:
+        cutoff = None
+
+    # NWS cache for efficiency
+    nws_cache = {}
+
+    outcomes = []
+
+    for fill in fills:
+        # Parse fill time
+        created_time = fill.get('created_time', '')
+        if created_time:
+            try:
+                fill_dt = datetime.fromisoformat(created_time.replace('Z', '+00:00'))
+                if fill_dt.tzinfo:
+                    fill_dt = fill_dt.astimezone().replace(tzinfo=None)
+                if cutoff and fill_dt < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        # Only count buys
+        if (fill.get('action') or 'buy').lower() != 'buy':
+            continue
+
+        ticker = fill.get('ticker', '')
+        side = (fill.get('side') or 'yes').lower()
+        count = int(fill.get('count', 0))
+        price = int(fill.get('yes_price') or fill.get('no_price') or 0)
+
+        # Get market info
+        try:
+            market = client.get_market(ticker)
+        except:
+            continue
+
+        # Parse date from ticker
+        market_date = None
+        series_ticker = ''
+        if ticker and '-' in ticker:
+            parts = ticker.split('-')
+            series_ticker = parts[0]
+            if len(parts) >= 2:
+                date_str = parts[1].upper()
+                if len(date_str) >= 7:
+                    try:
+                        month_map = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                                    'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+                        year = 2000 + int(date_str[:2])
+                        month = month_map.get(date_str[2:5])
+                        day = int(date_str[5:])
+                        if month:
+                            market_date = datetime(year, month, day).date()
+                    except:
+                        pass
+
+        # Determine outcome
+        status = (market.get('status') or '').lower()
+        result = (market.get('result') or '').lower()
+
+        won = None
+        outcome_source = 'pending'
+
+        # Check API result first
+        if status in ('closed', 'finalized', 'settled') and result in ('yes', 'no'):
+            won = (side == result)
+            outcome_source = 'api'
+        # Use NWS for past/today markets
+        elif market_date and market_date <= today and series_ticker:
+            # Get observed temp from NWS
+            is_high = series_ticker.startswith('KXHIGH')
+            cache_key = (series_ticker, market_date, 'high' if is_high else 'low')
+
+            if cache_key not in nws_cache:
+                if is_high:
+                    obs = weather_agg.get_observed_high_for_date(series_ticker, market_date) if market_date != today else weather_agg.get_todays_observed_high(series_ticker)
+                else:
+                    obs = weather_agg.get_observed_low_for_date(series_ticker, market_date) if market_date != today else weather_agg.get_todays_observed_low(series_ticker)
+                nws_cache[cache_key] = obs
+
+            obs = nws_cache[cache_key]
+            if obs:
+                observed_temp = obs[0]
+                # Get threshold from market
+                threshold = extract_threshold_from_market(market)
+                if threshold is None:
+                    # Parse from ticker suffix
+                    if len(parts) >= 3:
+                        suf = parts[-1].upper()
+                        try:
+                            if suf.startswith('B'):
+                                threshold = float(suf[1:])
+                                is_above = False
+                            elif suf.startswith('T'):
+                                threshold = float(suf[1:])
+                                is_above = True
+                        except:
+                            pass
+                    else:
+                        threshold = None
+                        is_above = None
+                else:
+                    title = (market.get('title') or '').lower()
+                    is_above = 'above' in title or '>' in title
+
+                if threshold is not None:
+                    if isinstance(threshold, tuple):
+                        low, high = threshold
+                        nws_result = 'yes' if low <= observed_temp < high else 'no'
+                    elif is_above:
+                        nws_result = 'yes' if observed_temp > threshold else 'no'
+                    else:
+                        nws_result = 'yes' if observed_temp < threshold else 'no'
+
+                    won = (side == nws_result)
+                    outcome_source = 'nws'
+
+        # Skip pending trades for P&L calculation
+        if won is None:
+            continue
+
+        # Calculate P&L
+        if won:
+            pnl = count * (100 - price) / 100.0
+        else:
+            pnl = -count * price / 100.0
+
+        # Build outcome record
+        outcomes.append({
+            'timestamp': created_time,
+            'market_ticker': ticker,
+            'city': series_ticker,
+            'side': side,
+            'contracts': str(count),
+            'entry_price': str(price),
+            'won': 'YES' if won else 'NO',
+            'profit_loss': f"{pnl:.2f}",
+            'outcome_source': outcome_source,
+        })
+
+    return outcomes
+
+
+def load_outcomes_from_csv(period: str = 'all') -> List[Dict]:
     """Load outcomes from CSV, optionally filtered by time period."""
     path = Path("data/outcomes.csv")
     if not path.exists():
@@ -434,13 +609,22 @@ def main():
     parser.add_argument('--period', '-p', default='all',
                        choices=['all', 'today', 'week', 'month'],
                        help='Time period to analyze (default: all)')
+    parser.add_argument('--source', '-s', default='api',
+                       choices=['api', 'csv'],
+                       help='Data source: api (real Kalshi fills) or csv (outcomes.csv)')
     args = parser.parse_args()
 
-    outcomes = load_outcomes(args.period)
-
-    if not outcomes:
-        print(f"\n❌ No outcome data found in data/outcomes.csv\n")
-        return
+    if args.source == 'api':
+        print("\n📡 Loading data from Kalshi API (with NWS-inferred outcomes)...")
+        outcomes = load_outcomes_from_api(args.period)
+        if not outcomes:
+            print(f"\n❌ No fills found from Kalshi API\n")
+            return
+    else:
+        outcomes = load_outcomes_from_csv(args.period)
+        if not outcomes:
+            print(f"\n❌ No outcome data found in data/outcomes.csv\n")
+            return
 
     metrics = calculate_metrics(outcomes)
     print_dashboard(metrics, args.period)
