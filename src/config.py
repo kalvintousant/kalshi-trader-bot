@@ -21,7 +21,7 @@ class Config:
     
     # Weather Strategy Parameters
     # Conservative strategy
-    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '5.0'))  # Minimum edge % to trade
+    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '8.0'))  # Minimum edge % to trade (raised from 5% to filter marginal trades)
     MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.01'))  # Minimum EV in dollars
     # If True, only trade when confidence interval does NOT overlap market price (stricter).
     # If False (default), trade when edge/EV meet thresholds even if CI overlaps (more trades, higher risk).
@@ -33,20 +33,23 @@ class Config:
     LONGSHOT_MIN_EDGE = float(os.getenv('LONGSHOT_MIN_EDGE', '30.0'))  # Require massive edge (30%+)
     LONGSHOT_MIN_PROB = float(os.getenv('LONGSHOT_MIN_PROB', '50.0'))  # Our probability must be ≥ 50%
     LONGSHOT_POSITION_MULTIPLIER = int(os.getenv('LONGSHOT_POSITION_MULTIPLIER', '3'))  # Trade 3x normal size
+    # Local hour (24h) after which we skip today's LOW markets (low of day usually 4–7 AM). 8 = 8 AM; set 9 or 10 to extend window.
+    LONGSHOT_LOW_CUTOFF_HOUR = int(os.getenv('LONGSHOT_LOW_CUTOFF_HOUR', '8'))
     
     # Market filtering
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '3'))  # Max days in future for forecasts
     # Never buy at or above this price (cents). 99 = no buys at 99¢ or 100¢ (no edge).
-    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '99'))
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '65'))  # Cap at 65¢ to avoid expensive losing positions (was 99¢)
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
-    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '0'))
+    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '2.0'))  # Skip trades within 2°F of threshold (reduces coin-flip losses)
     
     # Caching
     ORDERBOOK_CACHE_TTL = int(os.getenv('ORDERBOOK_CACHE_TTL', '3'))  # 3 seconds
     PORTFOLIO_CACHE_TTL = int(os.getenv('PORTFOLIO_CACHE_TTL', '10'))  # 10 seconds
-    FORECAST_CACHE_TTL = int(os.getenv('FORECAST_CACHE_TTL', '1800'))  # 30 minutes
+    # 24/7 free-tier: Pirate Weather 10k/month (no daily reset) → need ~333/day → TTL ≥ 156 min. Default 3h (10800) keeps all APIs in free tier.
+    FORECAST_CACHE_TTL = int(os.getenv('FORECAST_CACHE_TTL', '10800'))  # 3 hours (was 30 min)
     ENSEMBLE_CACHE_TTL = int(os.getenv('ENSEMBLE_CACHE_TTL', '3600'))  # 1 hour for ensemble data
 
     # Weather Data Source Configuration
