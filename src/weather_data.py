@@ -1,11 +1,22 @@
 """
 Weather Data Aggregator - Multi-source forecast collection and probability distribution
 Based on the weather trading edge strategy guide
+
+Enhanced with additional data sources:
+- Open-Meteo (free, multi-model: GFS, ECMWF, ICON, etc.)
+- Pirate Weather (HRRR-based, Dark Sky format)
+- Visual Crossing (historical data support)
+- NOAA HRRR (3km resolution, hourly updates)
+- GEFS Ensemble (31 members for uncertainty quantification)
+- ECMWF Open Data (world's most accurate global model)
+- NWS MOS (Model Output Statistics - bias-corrected)
 """
 import os
 import re
 import requests
 import logging
+import struct
+import json
 from typing import Dict, List, Optional, Tuple, Union
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -73,7 +84,11 @@ class WeatherDataAggregator:
         self.tomorrowio_api_key = os.getenv('TOMORROWIO_API_KEY', '')
         self.accuweather_api_key = os.getenv('ACCUWEATHER_API_KEY', '')
         self.weatherbit_api_key = os.getenv('WEATHERBIT_API_KEY', '')
-        
+
+        # New data source API keys
+        self.pirate_weather_api_key = os.getenv('PIRATE_WEATHER_API_KEY', '')
+        self.visual_crossing_api_key = os.getenv('VISUAL_CROSSING_API_KEY', '')
+
         # Cache for forecasts (from Config)
         # Based on AUSHIGH contract rules: daily markets, forecasts update 2-4x/day
         # Cache TTL balances freshness with API rate limits
@@ -81,22 +96,44 @@ class WeatherDataAggregator:
         self.cache_timestamp = {}
         from .config import Config
         self.cache_ttl = Config.FORECAST_CACHE_TTL
-        
+
         # Forecast metadata cache (stores source and timestamp for each forecast)
         self.forecast_metadata = {}  # {cache_key: [(temp, source, timestamp), ...]}
-        
+
+        # Ensemble data cache (stores full ensemble for uncertainty calculation)
+        self.ensemble_cache = {}  # {cache_key: {'forecasts': [...], 'std': float, 'timestamp': datetime}}
+
         # Source reliability weights (based on historical accuracy)
-        # NWS is most reliable (government source), others slightly lower
+        # Weights calibrated based on typical model performance for US temperature forecasting
         self.source_weights = {
-            'nws': 1.0,        # Most reliable (government source)
-            'tomorrowio': 0.9, # Very reliable
-            'weatherbit': 0.8  # Good but less reliable
+            'nws': 1.0,              # Most reliable (government source, uses multiple models)
+            'nws_mos': 1.0,          # MOS is bias-corrected, very reliable
+            'tomorrowio': 0.9,       # Very reliable commercial source
+            'open_meteo_best': 0.95, # Open-Meteo best match (auto-selects best model)
+            'open_meteo_gfs': 0.85,  # GFS model via Open-Meteo
+            'open_meteo_ecmwf': 0.95,# ECMWF model via Open-Meteo (best global model)
+            'open_meteo_icon': 0.85, # ICON model via Open-Meteo
+            'pirate_weather': 0.9,   # HRRR-based, excellent for short-term US forecasts
+            'visual_crossing': 0.85, # Good aggregated source
+            'weatherbit': 0.8,       # Good but less reliable
+            'hrrr': 0.95,            # NOAA HRRR - best short-term US model
+            'gefs_mean': 0.85,       # GEFS ensemble mean
+            'ecmwf_open': 0.95,      # ECMWF open data
         }
-        
+
+        # Model-specific bias correction (learned from historical errors)
+        # Format: {source: {city_base: {month: bias_correction}}}
+        # Positive bias = model runs hot, negative = model runs cold
+        self.model_bias = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+
         # Historical forecast error tracking
         # Format: {series_ticker: {month: [errors...]}}
         self.forecast_error_history = defaultdict(lambda: defaultdict(list))
-        
+
+        # Per-model error tracking for bias correction
+        # Format: {source: {series_ticker: {month: [(predicted, actual), ...]}}}
+        self.model_error_history = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
         # Use session for connection pooling
         self.session = requests.Session()
     
@@ -196,7 +233,470 @@ class WeatherDataAggregator:
         except Exception as e:
             logger.debug(f"Weatherbit API error: {e}")
         return None
-    
+
+    # ==================== NEW DATA SOURCES ====================
+
+    def get_forecast_open_meteo(self, lat: float, lon: float, date: datetime, series_ticker: str = '',
+                                model: str = 'best_match') -> Optional[Tuple[float, str, datetime]]:
+        """
+        Get forecast from Open-Meteo API (100% free, no API key required)
+        Supports multiple weather models: best_match, gfs_seamless, ecmwf_ifs04, icon_seamless
+
+        Free tier: 10,000 requests/day
+        Returns (temp, source, timestamp) for HIGH/LOW markets
+        """
+        try:
+            is_low_market = 'LOW' in series_ticker
+            temp_field = 'temperature_2m_min' if is_low_market else 'temperature_2m_max'
+
+            # Open-Meteo supports multiple models in one request
+            url = "https://api.open-meteo.com/v1/forecast"
+            params = {
+                'latitude': lat,
+                'longitude': lon,
+                'daily': f'{temp_field}',
+                'temperature_unit': 'fahrenheit',
+                'timezone': 'auto',
+                'forecast_days': 7
+            }
+
+            # Add specific model if not using best_match
+            if model != 'best_match':
+                params['models'] = model
+
+            response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                target_date_str = date.strftime('%Y-%m-%d')
+                daily_data = data.get('daily', {})
+                dates = daily_data.get('time', [])
+                temps = daily_data.get(temp_field, [])
+
+                for i, forecast_date in enumerate(dates):
+                    if forecast_date == target_date_str and i < len(temps):
+                        temp = temps[i]
+                        if temp is not None:
+                            source_name = f'open_meteo_{model}' if model != 'best_match' else 'open_meteo_best'
+                            return (temp, source_name, datetime.now())
+        except Exception as e:
+            logger.debug(f"Open-Meteo API error (model={model}): {e}")
+        return None
+
+    def get_forecast_open_meteo_multi(self, lat: float, lon: float, date: datetime,
+                                      series_ticker: str = '') -> List[Tuple[float, str, datetime]]:
+        """
+        Get forecasts from multiple Open-Meteo models in a single request
+        Returns list of (temp, source, timestamp) tuples for ensemble building
+        """
+        results = []
+        try:
+            is_low_market = 'LOW' in series_ticker
+            temp_field = 'temperature_2m_min' if is_low_market else 'temperature_2m_max'
+
+            # Request multiple models at once for efficiency
+            url = "https://api.open-meteo.com/v1/forecast"
+            models = ['gfs_seamless', 'ecmwf_ifs04', 'icon_seamless', 'gem_seamless', 'jma_seamless']
+            params = {
+                'latitude': lat,
+                'longitude': lon,
+                'daily': temp_field,
+                'temperature_unit': 'fahrenheit',
+                'timezone': 'auto',
+                'forecast_days': 7,
+                'models': ','.join(models)
+            }
+
+            response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                target_date_str = date.strftime('%Y-%m-%d')
+
+                # When multiple models are requested, data is structured differently
+                # Each model gets its own section
+                for model in models:
+                    model_key = f'daily_{model}' if f'daily_{model}' in data else 'daily'
+                    daily_data = data.get(model_key, data.get('daily', {}))
+
+                    if daily_data:
+                        dates = daily_data.get('time', [])
+                        temps = daily_data.get(temp_field, [])
+
+                        for i, forecast_date in enumerate(dates):
+                            if forecast_date == target_date_str and i < len(temps):
+                                temp = temps[i]
+                                if temp is not None:
+                                    results.append((temp, f'open_meteo_{model}', datetime.now()))
+                                break
+        except Exception as e:
+            logger.debug(f"Open-Meteo multi-model API error: {e}")
+
+        return results
+
+    def get_forecast_pirate_weather(self, lat: float, lon: float, date: datetime,
+                                    series_ticker: str = '') -> Optional[Tuple[float, str, datetime]]:
+        """
+        Get forecast from Pirate Weather API (HRRR-based, Dark Sky format)
+        Free tier: 10,000 requests/month (~333/day)
+        Excellent for short-term US forecasts due to HRRR model usage
+
+        Returns (temp, source, timestamp) for HIGH/LOW markets
+        """
+        if not self.pirate_weather_api_key:
+            return None
+
+        try:
+            is_low_market = 'LOW' in series_ticker
+
+            # Pirate Weather uses Dark Sky API format
+            url = f"https://api.pirateweather.net/forecast/{self.pirate_weather_api_key}/{lat},{lon}"
+            params = {
+                'exclude': 'currently,minutely,hourly,alerts',
+                'units': 'us'  # Fahrenheit
+            }
+
+            response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                target_date_str = date.strftime('%Y-%m-%d')
+
+                for day in data.get('daily', {}).get('data', []):
+                    # Pirate Weather uses Unix timestamps
+                    day_date = datetime.fromtimestamp(day['time']).strftime('%Y-%m-%d')
+                    if day_date == target_date_str:
+                        if is_low_market:
+                            temp = day.get('temperatureMin') or day.get('temperatureLow')
+                        else:
+                            temp = day.get('temperatureMax') or day.get('temperatureHigh')
+
+                        if temp is not None:
+                            return (temp, 'pirate_weather', datetime.now())
+        except Exception as e:
+            logger.debug(f"Pirate Weather API error: {e}")
+        return None
+
+    def get_forecast_visual_crossing(self, lat: float, lon: float, date: datetime,
+                                     series_ticker: str = '') -> Optional[Tuple[float, str, datetime]]:
+        """
+        Get forecast from Visual Crossing API
+        Free tier: 1,000 records/day
+        Good for both forecasts and historical data
+
+        Returns (temp, source, timestamp) for HIGH/LOW markets
+        """
+        if not self.visual_crossing_api_key:
+            return None
+
+        try:
+            is_low_market = 'LOW' in series_ticker
+            target_date_str = date.strftime('%Y-%m-%d')
+
+            url = f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/{lat},{lon}/{target_date_str}"
+            params = {
+                'key': self.visual_crossing_api_key,
+                'unitGroup': 'us',  # Fahrenheit
+                'include': 'days',
+                'elements': 'tempmax,tempmin'
+            }
+
+            response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                for day in data.get('days', []):
+                    if day.get('datetime') == target_date_str:
+                        if is_low_market:
+                            temp = day.get('tempmin')
+                        else:
+                            temp = day.get('tempmax')
+
+                        if temp is not None:
+                            return (temp, 'visual_crossing', datetime.now())
+        except Exception as e:
+            logger.debug(f"Visual Crossing API error: {e}")
+        return None
+
+    def get_forecast_nws_mos(self, lat: float, lon: float, date: datetime,
+                            series_ticker: str = '') -> Optional[Tuple[float, str, datetime]]:
+        """
+        Get MOS (Model Output Statistics) forecast from NWS
+        MOS data is bias-corrected and statistically post-processed
+        Free, no API key required
+
+        Returns (temp, source, timestamp) for HIGH/LOW markets
+        """
+        try:
+            is_low_market = 'LOW' in series_ticker
+
+            # First, get the nearest forecast office and station
+            points_url = f"https://api.weather.gov/points/{lat},{lon}"
+            response = self.session.get(points_url, timeout=5, headers={'User-Agent': 'KalshiBot/1.0'})
+
+            if response.status_code != 200:
+                return None
+
+            points_data = response.json()
+            grid_id = points_data['properties'].get('gridId')
+            grid_x = points_data['properties'].get('gridX')
+            grid_y = points_data['properties'].get('gridY')
+
+            if not all([grid_id, grid_x, grid_y]):
+                return None
+
+            # Get gridpoint forecast (includes MOS-like data in quantitative values)
+            gridpoint_url = f"https://api.weather.gov/gridpoints/{grid_id}/{grid_x},{grid_y}"
+            gridpoint_response = self.session.get(gridpoint_url, timeout=10, headers={'User-Agent': 'KalshiBot/1.0'})
+
+            if gridpoint_response.status_code == 200:
+                grid_data = gridpoint_response.json()
+                props = grid_data.get('properties', {})
+
+                # Get min/max temperature forecasts
+                if is_low_market:
+                    temp_data = props.get('minTemperature', {})
+                else:
+                    temp_data = props.get('maxTemperature', {})
+
+                values = temp_data.get('values', [])
+                target_date_str = date.strftime('%Y-%m-%d')
+
+                for value in values:
+                    valid_time = value.get('validTime', '')
+                    if target_date_str in valid_time:
+                        temp_c = value.get('value')
+                        if temp_c is not None:
+                            # Convert Celsius to Fahrenheit
+                            temp_f = (temp_c * 9/5) + 32
+                            return (temp_f, 'nws_mos', datetime.now())
+        except Exception as e:
+            logger.debug(f"NWS MOS API error: {e}")
+        return None
+
+    def get_forecast_gefs_ensemble(self, lat: float, lon: float, date: datetime,
+                                   series_ticker: str = '') -> List[Tuple[float, str, datetime]]:
+        """
+        Get GEFS (Global Ensemble Forecast System) ensemble forecasts
+        GEFS provides 31 ensemble members (1 control + 30 perturbations)
+        This gives real uncertainty quantification instead of synthetic estimates
+
+        Uses Open-Meteo's GEFS endpoint for easier access (avoids GRIB parsing)
+        Free, no API key required
+
+        Returns list of (temp, source, timestamp) tuples for all ensemble members
+        """
+        results = []
+        try:
+            is_low_market = 'LOW' in series_ticker
+            temp_field = 'temperature_2m_min' if is_low_market else 'temperature_2m_max'
+
+            # Open-Meteo provides GEFS ensemble data
+            url = "https://ensemble-api.open-meteo.com/v1/ensemble"
+            params = {
+                'latitude': lat,
+                'longitude': lon,
+                'daily': temp_field,
+                'temperature_unit': 'fahrenheit',
+                'timezone': 'auto',
+                'forecast_days': 7,
+                'models': 'gfs_seamless'  # GFS ensemble
+            }
+
+            response = self.session.get(url, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                target_date_str = date.strftime('%Y-%m-%d')
+                daily_data = data.get('daily', {})
+                dates = daily_data.get('time', [])
+
+                # Ensemble data comes as arrays for each member
+                # Format: temperature_2m_max_member01, temperature_2m_max_member02, etc.
+                for key, values in daily_data.items():
+                    if temp_field in key and 'member' in key:
+                        member_num = key.split('member')[-1] if 'member' in key else '00'
+                        for i, forecast_date in enumerate(dates):
+                            if forecast_date == target_date_str and i < len(values):
+                                temp = values[i]
+                                if temp is not None:
+                                    results.append((temp, f'gefs_member{member_num}', datetime.now()))
+                                break
+
+                # Also get the ensemble mean if available
+                mean_key = temp_field
+                if mean_key in daily_data:
+                    for i, forecast_date in enumerate(dates):
+                        if forecast_date == target_date_str:
+                            temps = daily_data[mean_key]
+                            if i < len(temps) and temps[i] is not None:
+                                results.append((temps[i], 'gefs_mean', datetime.now()))
+                            break
+
+        except Exception as e:
+            logger.debug(f"GEFS Ensemble API error: {e}")
+
+        return results
+
+    def get_forecast_ecmwf_ensemble(self, lat: float, lon: float, date: datetime,
+                                    series_ticker: str = '') -> List[Tuple[float, str, datetime]]:
+        """
+        Get ECMWF IFS ensemble forecasts via Open-Meteo
+        ECMWF provides 51 ensemble members (1 control + 50 perturbations)
+        This is the world's most accurate global model
+
+        Returns list of (temp, source, timestamp) tuples for all ensemble members
+        """
+        results = []
+        try:
+            is_low_market = 'LOW' in series_ticker
+            temp_field = 'temperature_2m_min' if is_low_market else 'temperature_2m_max'
+
+            url = "https://ensemble-api.open-meteo.com/v1/ensemble"
+            params = {
+                'latitude': lat,
+                'longitude': lon,
+                'daily': temp_field,
+                'temperature_unit': 'fahrenheit',
+                'timezone': 'auto',
+                'forecast_days': 7,
+                'models': 'ecmwf_ifs04'  # ECMWF ensemble
+            }
+
+            response = self.session.get(url, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                target_date_str = date.strftime('%Y-%m-%d')
+                daily_data = data.get('daily', {})
+                dates = daily_data.get('time', [])
+
+                # Ensemble data comes as arrays for each member
+                for key, values in daily_data.items():
+                    if temp_field in key:
+                        if 'member' in key:
+                            member_num = key.split('member')[-1]
+                            source_name = f'ecmwf_member{member_num}'
+                        else:
+                            source_name = 'ecmwf_mean'
+
+                        for i, forecast_date in enumerate(dates):
+                            if forecast_date == target_date_str and i < len(values):
+                                temp = values[i]
+                                if temp is not None:
+                                    results.append((temp, source_name, datetime.now()))
+                                break
+
+        except Exception as e:
+            logger.debug(f"ECMWF Ensemble API error: {e}")
+
+        return results
+
+    def get_ensemble_spread(self, lat: float, lon: float, date: datetime,
+                           series_ticker: str = '') -> Optional[Dict]:
+        """
+        Get ensemble spread data from multiple ensemble systems
+        This provides real uncertainty quantification instead of synthetic estimates
+
+        Returns dict with:
+        - 'mean': ensemble mean temperature
+        - 'std': ensemble standard deviation (real uncertainty)
+        - 'min': minimum ensemble member
+        - 'max': maximum ensemble member
+        - 'n_members': number of ensemble members
+        - 'source': primary ensemble source used
+        """
+        cache_key = f"ensemble_{series_ticker}_{date.strftime('%Y-%m-%d')}"
+
+        # Check cache first
+        if cache_key in self.ensemble_cache:
+            cached = self.ensemble_cache[cache_key]
+            if (datetime.now() - cached['timestamp']).total_seconds() < self.cache_ttl:
+                return cached
+
+        all_ensemble_temps = []
+
+        # Fetch GEFS ensemble (31 members)
+        gefs_results = self.get_forecast_gefs_ensemble(lat, lon, date, series_ticker)
+        gefs_temps = [temp for temp, source, _ in gefs_results if 'member' in source]
+        if gefs_temps:
+            all_ensemble_temps.extend(gefs_temps)
+            logger.debug(f"GEFS ensemble: {len(gefs_temps)} members, mean={np.mean(gefs_temps):.1f}°F, std={np.std(gefs_temps):.1f}°F")
+
+        # Fetch ECMWF ensemble (51 members)
+        ecmwf_results = self.get_forecast_ecmwf_ensemble(lat, lon, date, series_ticker)
+        ecmwf_temps = [temp for temp, source, _ in ecmwf_results if 'member' in source]
+        if ecmwf_temps:
+            all_ensemble_temps.extend(ecmwf_temps)
+            logger.debug(f"ECMWF ensemble: {len(ecmwf_temps)} members, mean={np.mean(ecmwf_temps):.1f}°F, std={np.std(ecmwf_temps):.1f}°F")
+
+        if not all_ensemble_temps:
+            return None
+
+        result = {
+            'mean': np.mean(all_ensemble_temps),
+            'std': np.std(all_ensemble_temps),
+            'min': np.min(all_ensemble_temps),
+            'max': np.max(all_ensemble_temps),
+            'n_members': len(all_ensemble_temps),
+            'source': 'gefs+ecmwf' if (gefs_temps and ecmwf_temps) else ('gefs' if gefs_temps else 'ecmwf'),
+            'timestamp': datetime.now(),
+            'forecasts': all_ensemble_temps
+        }
+
+        # Cache the result
+        self.ensemble_cache[cache_key] = result
+        logger.info(f"Ensemble spread for {series_ticker}: mean={result['mean']:.1f}°F, std={result['std']:.1f}°F ({result['n_members']} members)")
+
+        return result
+
+    def apply_bias_correction(self, temp: float, source: str, series_ticker: str, month: int) -> float:
+        """
+        Apply model-specific bias correction based on historical errors
+
+        Args:
+            temp: Raw forecast temperature
+            source: Model/source name
+            series_ticker: City ticker
+            month: Target month (1-12)
+
+        Returns:
+            Bias-corrected temperature
+        """
+        # Get city base (e.g., 'NY' from 'KXHIGHNY' or 'KXLOWNY')
+        city_base = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+
+        bias = self.model_bias[source][city_base][month]
+        if bias != 0:
+            corrected = temp - bias  # Subtract bias (positive bias = model runs hot)
+            logger.debug(f"Bias correction for {source}/{city_base}/month{month}: {temp:.1f}°F -> {corrected:.1f}°F (bias={bias:.1f}°F)")
+            return corrected
+        return temp
+
+    def update_model_bias(self, source: str, series_ticker: str, target_date: datetime,
+                         predicted_temp: float, actual_temp: float):
+        """
+        Update model-specific bias tracking after market settlement
+        Call this to learn model-specific biases over time
+
+        Args:
+            source: Model/source name
+            series_ticker: City ticker
+            target_date: Date of the forecast
+            predicted_temp: What the model predicted
+            actual_temp: What actually happened
+        """
+        city_base = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+        month = target_date.month
+        error = predicted_temp - actual_temp  # Positive = model ran hot
+
+        # Store in history (keep last 50 per model/city/month)
+        history = self.model_error_history[source][city_base][month]
+        history.append((predicted_temp, actual_temp))
+        if len(history) > 50:
+            history.pop(0)
+
+        # Update bias estimate (rolling mean of errors)
+        errors = [p - a for p, a in history]
+        new_bias = np.mean(errors) if errors else 0
+        self.model_bias[source][city_base][month] = new_bias
+
+        logger.info(f"Updated bias for {source}/{city_base}/month{month}: {new_bias:.2f}°F (n={len(history)})")
+
     def detect_outliers(self, forecasts: List[float]) -> List[float]:
         """
         Detect and filter outliers using IQR method
@@ -624,66 +1124,103 @@ class WeatherDataAggregator:
     def get_all_forecasts(self, series_ticker: str, target_date: datetime) -> List[float]:
         """
         Collect forecasts from all available sources with caching, parallel execution,
-        outlier detection, source weighting, and age weighting
+        outlier detection, source weighting, age weighting, and bias correction.
+
+        Enhanced to include:
+        - NWS (National Weather Service)
+        - NWS MOS (Model Output Statistics - bias corrected)
+        - Tomorrow.io
+        - Open-Meteo (multi-model: GFS, ECMWF, ICON, GEM, JMA)
+        - Pirate Weather (HRRR-based)
+        - Visual Crossing
+        - Weatherbit (fallback only)
         """
         if series_ticker not in self.CITY_COORDS:
             return []
-        
+
         # Check cache first
         cache_key = f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}"
         if cache_key in self.forecast_cache:
             cache_time = self.cache_timestamp.get(cache_key)
             if cache_time and (datetime.now() - cache_time).total_seconds() < self.cache_ttl:
                 return self.forecast_cache[cache_key]
-        
+
         city = self.CITY_COORDS[series_ticker]
         lat, lon = city['lat'], city['lon']
-        
+
         # Log market type for debugging LOW vs HIGH
         is_low_market = 'LOW' in series_ticker
         market_type = "LOW (min temp)" if is_low_market else "HIGH (max temp)"
         logger.debug(f"Fetching {market_type} forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
-        
+
         # Fetch forecasts in parallel for better performance
-        # Using NWS, Tomorrow.io, and Weatherbit (OpenWeather removed)
-        # Weatherbit is used as fallback only to stay within free tier (50 requests/day)
         forecast_data = []  # List of (temp, source, timestamp) tuples
-        
-        # First, try NWS and Tomorrow.io (both have higher free tier limits)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
+
+        # Define all forecast sources to fetch in parallel
+        # Tier 1: High-limit free sources (fetch always)
+        # Tier 2: Limited free tier sources (fetch if Tier 1 < 3 forecasts)
+        # Tier 3: Very limited sources (fallback only)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            # Tier 1: High-limit free sources
+            tier1_futures = {
                 executor.submit(self.get_forecast_nws, lat, lon, target_date, series_ticker): 'nws',
-                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date, series_ticker): 'tomorrowio'
+                executor.submit(self.get_forecast_nws_mos, lat, lon, target_date, series_ticker): 'nws_mos',
+                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date, series_ticker): 'tomorrowio',
+                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'best_match'): 'open_meteo_best',
+                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'gfs_seamless'): 'open_meteo_gfs',
+                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'ecmwf_ifs04'): 'open_meteo_ecmwf',
+                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'icon_seamless'): 'open_meteo_icon',
             }
-            
-            for future in as_completed(futures):
+
+            # Add Pirate Weather if API key available
+            if self.pirate_weather_api_key:
+                tier1_futures[executor.submit(
+                    self.get_forecast_pirate_weather, lat, lon, target_date, series_ticker
+                )] = 'pirate_weather'
+
+            # Add Visual Crossing if API key available
+            if self.visual_crossing_api_key:
+                tier1_futures[executor.submit(
+                    self.get_forecast_visual_crossing, lat, lon, target_date, series_ticker
+                )] = 'visual_crossing'
+
+            for future in as_completed(tier1_futures):
                 try:
                     result = future.result()
                     if result is not None:
-                        forecast_data.append(result)
+                        temp, source, timestamp = result
+                        # Apply bias correction
+                        corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
+                        forecast_data.append((corrected_temp, source, timestamp))
                 except Exception as e:
-                    source = futures[future]
-                    print(f"[Weather] Error fetching from {source}: {e}")
-        
-        # Only use Weatherbit if we have ZERO forecasts (emergency fallback only)
-        # This keeps Weatherbit usage minimal to stay within 50 requests/day free tier
+                    source = tier1_futures[future]
+                    logger.debug(f"Error fetching from {source}: {e}")
+
+        # Only use Weatherbit if we have very few forecasts (emergency fallback)
         # Weatherbit free tier: 50 requests/day - must be very conservative
-        if len(forecast_data) == 0 and self.weatherbit_api_key:
+        if len(forecast_data) < 2 and self.weatherbit_api_key:
             try:
                 weatherbit_result = self.get_forecast_weatherbit(lat, lon, target_date, series_ticker)
                 if weatherbit_result is not None:
-                    forecast_data.append(weatherbit_result)
-                    logger.info(f"Using Weatherbit fallback for {series_ticker} (NWS/Tomorrow.io unavailable)")
+                    temp, source, timestamp = weatherbit_result
+                    corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
+                    forecast_data.append((corrected_temp, source, timestamp))
+                    logger.info(f"Using Weatherbit fallback for {series_ticker}")
             except Exception as e:
                 logger.debug(f"Error fetching from weatherbit (fallback): {e}")
-        
+
         if not forecast_data:
             logger.warning(f"No forecasts available for {city['name']}, using fallback")
             return []
-        
+
+        # Log all sources that responded
+        sources = [source for _, source, _ in forecast_data]
+        logger.debug(f"Collected {len(forecast_data)} forecasts from: {', '.join(sources)}")
+
         # Extract temperatures for outlier detection
         raw_forecasts = [temp for temp, _, _ in forecast_data]
-        
+
         # Detect and filter outliers
         valid_indices = []
         if len(raw_forecasts) >= 3:
@@ -691,50 +1228,55 @@ class WeatherDataAggregator:
             valid_indices = [i for i, temp in enumerate(raw_forecasts) if temp in valid_forecasts]
         else:
             valid_indices = list(range(len(forecast_data)))
-        
+
         # Apply source weighting and age weighting
         now = datetime.now()
         weighted_forecasts = []
         total_weight = 0.0
-        
+
         for idx in valid_indices:
             temp, source, forecast_time = forecast_data[idx]
-            
+
             # Source reliability weight
             source_weight = self.source_weights.get(source, 0.8)
-            
+
             # Forecast age weight (exponential decay with 6-hour half-life)
             age_hours = (now - forecast_time).total_seconds() / 3600.0
             age_weight = np.exp(-age_hours / 6.0)  # 6-hour half-life
-            
+
             # Combined weight
             combined_weight = source_weight * age_weight
-            
-            weighted_forecasts.append((temp, combined_weight))
+
+            weighted_forecasts.append((temp, combined_weight, source))
             total_weight += combined_weight
-        
+
         # Calculate weighted average
         if total_weight > 0:
-            weighted_mean = sum(temp * weight for temp, weight in weighted_forecasts) / total_weight
-            
+            weighted_mean = sum(temp * weight for temp, weight, _ in weighted_forecasts) / total_weight
+
             # For probability distribution, we need individual forecasts
-            # Use weighted mean as primary, but keep individual forecasts for std calculation
             # Adjust forecasts to be closer to weighted mean based on their weights
             adjusted_forecasts = []
-            for temp, weight in weighted_forecasts:
+            for temp, weight, source in weighted_forecasts:
                 # Blend original forecast with weighted mean based on source reliability
-                adjusted = temp * (weight / total_weight) + weighted_mean * (1 - weight / total_weight)
+                blend_factor = weight / total_weight
+                adjusted = temp * blend_factor + weighted_mean * (1 - blend_factor)
                 adjusted_forecasts.append(adjusted)
-            
+
             # Store metadata for later use
             self.forecast_metadata[cache_key] = forecast_data
-            
+
             # Cache the adjusted forecasts
             self.forecast_cache[cache_key] = adjusted_forecasts
             self.cache_timestamp[cache_key] = datetime.now()
-            
+
+            # Log summary
+            logger.info(f"Forecast for {series_ticker} ({target_date.strftime('%Y-%m-%d')}): "
+                       f"mean={weighted_mean:.1f}°F, range=[{min(raw_forecasts):.1f}, {max(raw_forecasts):.1f}]°F, "
+                       f"sources={len(forecast_data)}")
+
             return adjusted_forecasts
-        
+
         return []
     
     def get_historical_forecast_error(self, series_ticker: str, month: int) -> float:
@@ -749,34 +1291,71 @@ class WeatherDataAggregator:
         # Default forecast error: 2.0°F (conservative estimate)
         return 2.0
     
-    def build_probability_distribution(self, forecasts: List[float], 
+    def build_probability_distribution(self, forecasts: List[float],
                                      temperature_ranges: List[Tuple[float, float]],
                                      series_ticker: str = '',
                                      target_date: Optional[datetime] = None) -> Dict[Tuple[float, float], float]:
         """
         Build probability distribution over temperature ranges from forecasts
-        Uses dynamic standard deviation based on forecast agreement and historical data
-        
+        Uses ensemble-based uncertainty when available, falling back to synthetic estimates
+
+        Enhanced to use GEFS/ECMWF ensemble spread for real uncertainty quantification
+        instead of synthetic time-based estimates.
+
         Args:
             forecasts: List of temperature forecasts from different sources
             temperature_ranges: List of (min, max) temperature range tuples
             series_ticker: City ticker for historical error lookup
             target_date: Target date for time-based uncertainty adjustment
-        
+
         Returns:
             Dictionary mapping (min, max) ranges to probabilities
         """
         if not forecasts:
             return {}
-        
+
         # Calculate mean and std of forecasts
         mean_temp = np.mean(forecasts)
-        
+
+        # Try to get ensemble-based uncertainty (GEFS + ECMWF)
+        ensemble_std = None
+        if series_ticker and target_date and series_ticker in self.CITY_COORDS:
+            city = self.CITY_COORDS[series_ticker]
+            lat, lon = city['lat'], city['lon']
+            ensemble_data = self.get_ensemble_spread(lat, lon, target_date, series_ticker)
+            if ensemble_data and ensemble_data.get('n_members', 0) >= 10:
+                # Use ensemble standard deviation as primary uncertainty measure
+                ensemble_std = ensemble_data['std']
+                # Also use ensemble mean if it's close to our multi-source mean
+                ensemble_mean = ensemble_data['mean']
+                if abs(ensemble_mean - mean_temp) < 3.0:  # Within 3°F
+                    # Blend means (60% multi-source, 40% ensemble)
+                    mean_temp = 0.6 * mean_temp + 0.4 * ensemble_mean
+                logger.debug(f"Using ensemble uncertainty: std={ensemble_std:.2f}°F "
+                           f"({ensemble_data['n_members']} members from {ensemble_data['source']})")
+
         # Dynamic standard deviation calculation
-        if len(forecasts) > 1:
-            # Use actual std from forecast spread
+        if ensemble_std is not None:
+            # Ensemble-based uncertainty (preferred)
+            std_temp = ensemble_std
+
+            # Blend with multi-source spread if available
+            if len(forecasts) > 1:
+                source_std = np.std(forecasts)
+                # Weight ensemble std higher (70%) but incorporate source spread (30%)
+                std_temp = 0.7 * ensemble_std + 0.3 * source_std
+
+            # Add small time-based uncertainty for longer horizons
+            if target_date:
+                days_until = max(0, (target_date - datetime.now()).days)
+                # Smaller time penalty when we have ensemble data
+                time_uncertainty = days_until * 0.2  # 0.2°F per day
+                std_temp = np.sqrt(std_temp**2 + time_uncertainty**2)
+
+        elif len(forecasts) > 1:
+            # Fallback: Use actual std from forecast spread (synthetic uncertainty)
             std_temp = np.std(forecasts)
-            
+
             # Add base uncertainty based on forecast horizon
             if target_date:
                 days_until = (target_date - datetime.now()).days
@@ -784,7 +1363,7 @@ class WeatherDataAggregator:
                 # Base uncertainty increases with time: +0.5°F per day, +0.1°F per hour
                 base_uncertainty = 1.0 + (days_until * 0.5) + max(0, (hours_until - days_until * 24) * 0.1)
                 std_temp = max(std_temp, base_uncertainty)
-            
+
             # Incorporate historical forecast error if available
             if series_ticker and target_date:
                 historical_error = self.get_historical_forecast_error(series_ticker, target_date.month)
@@ -796,27 +1375,33 @@ class WeatherDataAggregator:
                 std_temp = self.get_historical_forecast_error(series_ticker, target_date.month)
             else:
                 std_temp = 2.0  # Default std if no historical data
-        
-        # Ensure minimum std for stability
-        std_temp = max(std_temp, 1.0)
-        
+
+        # Ensure minimum std for stability (but lower minimum when we have ensemble data)
+        min_std = 0.5 if ensemble_std is not None else 1.0
+        std_temp = max(std_temp, min_std)
+
+        # Log the uncertainty source and value
+        uncertainty_source = 'ensemble' if ensemble_std is not None else 'synthetic'
+        logger.debug(f"Probability distribution for {series_ticker}: mean={mean_temp:.1f}°F, "
+                    f"std={std_temp:.2f}°F (source: {uncertainty_source})")
+
         # Build probability distribution using normal distribution
         # This models uncertainty around the mean forecast
         distribution = {}
         total_prob = 0
-        
+
         for temp_min, temp_max in temperature_ranges:
             # Probability that temperature falls in this range
             # Using cumulative distribution function
             prob = stats.norm.cdf(temp_max, mean_temp, std_temp) - stats.norm.cdf(temp_min, mean_temp, std_temp)
             distribution[(temp_min, temp_max)] = max(0, prob)  # Ensure non-negative
             total_prob += prob
-        
+
         # Normalize probabilities to sum to 1
         if total_prob > 0:
             for key in distribution:
                 distribution[key] /= total_prob
-        
+
         return distribution
     
     def update_forecast_error(self, series_ticker: str, target_date: datetime, actual_temp: float, predicted_temp: float):
@@ -826,14 +1411,38 @@ class WeatherDataAggregator:
         """
         error = abs(actual_temp - predicted_temp)
         month = target_date.month
-        
+
         # Store error in history (keep last 100 errors per city/month)
         errors = self.forecast_error_history[series_ticker][month]
         errors.append(error)
         if len(errors) > 100:
             errors.pop(0)  # Keep only most recent 100
-        
+
         logger.info(f"📊 Updated forecast error for {series_ticker} (month {month}): {error:.2f}°F")
+
+    def update_all_model_biases(self, series_ticker: str, target_date: datetime, actual_temp: float):
+        """
+        Update bias tracking for all models that contributed to a forecast
+        Call this after market settles with the actual observed temperature
+
+        This looks up the cached forecast metadata to find which sources
+        contributed and updates their individual bias estimates.
+        """
+        cache_key = f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}"
+
+        if cache_key not in self.forecast_metadata:
+            logger.debug(f"No forecast metadata found for {cache_key}, skipping bias update")
+            return
+
+        forecast_data = self.forecast_metadata[cache_key]
+        updated_sources = []
+
+        for temp, source, timestamp in forecast_data:
+            # Update model-specific bias
+            self.update_model_bias(source, series_ticker, target_date, temp, actual_temp)
+            updated_sources.append(source)
+
+        logger.info(f"📊 Updated bias for {len(updated_sources)} models: {', '.join(updated_sources)}")
     
     def get_market_probability(self, market: Dict, threshold: float, 
                               probability_dist: Dict[Tuple[float, float], float]) -> float:

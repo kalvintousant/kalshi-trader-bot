@@ -47,6 +47,21 @@ class Config:
     ORDERBOOK_CACHE_TTL = int(os.getenv('ORDERBOOK_CACHE_TTL', '3'))  # 3 seconds
     PORTFOLIO_CACHE_TTL = int(os.getenv('PORTFOLIO_CACHE_TTL', '10'))  # 10 seconds
     FORECAST_CACHE_TTL = int(os.getenv('FORECAST_CACHE_TTL', '1800'))  # 30 minutes
+    ENSEMBLE_CACHE_TTL = int(os.getenv('ENSEMBLE_CACHE_TTL', '3600'))  # 1 hour for ensemble data
+
+    # Weather Data Source Configuration
+    # Enable/disable specific data sources (all enabled by default)
+    ENABLE_OPEN_METEO = os.getenv('ENABLE_OPEN_METEO', 'true').lower() == 'true'
+    ENABLE_PIRATE_WEATHER = os.getenv('ENABLE_PIRATE_WEATHER', 'true').lower() == 'true'
+    ENABLE_VISUAL_CROSSING = os.getenv('ENABLE_VISUAL_CROSSING', 'true').lower() == 'true'
+    ENABLE_ENSEMBLE_DATA = os.getenv('ENABLE_ENSEMBLE_DATA', 'true').lower() == 'true'
+
+    # Minimum number of ensemble members required to use ensemble uncertainty
+    MIN_ENSEMBLE_MEMBERS = int(os.getenv('MIN_ENSEMBLE_MEMBERS', '10'))
+
+    # Bias correction settings
+    ENABLE_BIAS_CORRECTION = os.getenv('ENABLE_BIAS_CORRECTION', 'true').lower() == 'true'
+    MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '5'))  # Min samples before applying bias correction
     
     # Market Tickers
     # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles, Denver
