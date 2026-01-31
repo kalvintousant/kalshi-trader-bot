@@ -63,41 +63,35 @@ class OutcomeTracker:
     
     def check_settled_positions(self) -> List[Dict]:
         """
-        Check portfolio for settled positions (markets that have resolved)
-        Returns list of settled positions with outcomes
+        Check portfolio for settled positions (markets that have resolved).
+        Groups fills by market_ticker so each market is logged once with aggregated P&L.
+        Returns list of settled positions (each has 'fills' list and 'market').
         """
         try:
-            # Get all fills (past trades)
             fills = self.client.get_fills()
-            
-            settled_positions = []
-            
+            # Group fills by market_ticker (same market can have many fill records)
+            by_ticker: Dict[str, list] = defaultdict(list)
             for fill in fills:
-                market_ticker = fill.get('ticker')
-                
-                # Skip if already logged
-                if market_ticker in self.logged_positions:
+                ticker = fill.get('ticker')
+                if ticker and ticker not in self.logged_positions:
+                    by_ticker[ticker].append(fill)
+
+            settled_positions = []
+            for market_ticker, ticker_fills in by_ticker.items():
+                if not ticker_fills:
                     continue
-                
-                # Get market details to check if settled
                 try:
                     market = self.client.get_market(market_ticker)
                     status = market.get('status', '').lower()
-                    
-                    # Market is settled/closed/finalized
                     if status in ['closed', 'finalized', 'settled']:
                         settled_positions.append({
-                            'fill': fill,
+                            'fills': ticker_fills,
                             'market': market
                         })
-                        logger.info(f"Found settled position: {market_ticker} (status: {status})")
-                
+                        logger.info(f"Found settled position: {market_ticker} (status: {status}, {len(ticker_fills)} fill(s))")
                 except Exception as e:
                     logger.debug(f"Could not fetch market {market_ticker}: {e}")
-                    continue
-            
             return settled_positions
-        
         except Exception as e:
             logger.error(f"Error checking settled positions: {e}", exc_info=True)
             return []
@@ -170,62 +164,58 @@ class OutcomeTracker:
     
     def log_outcome(self, settled_position: Dict):
         """
-        Log outcome of a settled position to CSV
-        Update forecast model with actual accuracy data
+        Log outcome of a settled position to CSV (one row per market, aggregated over all fills).
+        Update forecast model with actual accuracy data.
         """
         try:
-            fill = settled_position['fill']
+            fills = settled_position.get('fills')
+            if not fills:
+                fill = settled_position.get('fill')
+                fills = [fill] if fill else []
+            if not fills:
+                return
             market = settled_position['market']
-            
-            market_ticker = fill.get('ticker')
-            
-            # Parse market details
+            first_fill = fills[0]
+            market_ticker = first_fill.get('ticker')
+
             from src.weather_data import extract_threshold_from_market
             threshold = extract_threshold_from_market(market)
-            
-            # Extract city and date
             series_ticker = market.get('series_ticker', '')
-            title = market.get('title', '')
-            
-            # Try to extract date from market
-            # TODO: Use the _extract_market_date method from strategies
             target_date = datetime.now()  # Placeholder
-            
-            # Get actual temperature
             actual_temp = self.extract_actual_temperature(market)
-            
-            # Get our predicted temperature
             predicted_temp = None
             if actual_temp and series_ticker:
                 predicted_temp = self.get_predicted_temperature(market_ticker, target_date, series_ticker)
-            
-            # Calculate forecast error
             forecast_error = None
             if actual_temp and predicted_temp:
                 forecast_error = abs(actual_temp - predicted_temp)
-                
-                # Update forecast model!
+                # Update overall forecast error tracking
                 self.weather_agg.update_forecast_error(
                     series_ticker, target_date, actual_temp, predicted_temp
                 )
-            
-            # Determine win/loss
-            side = fill.get('side', '').lower()
+                # Update per-model bias tracking for all sources that contributed
+                self.weather_agg.update_all_model_biases(
+                    series_ticker, target_date, actual_temp
+                )
+                logger.info(f"📊 Updated forecast model biases for {series_ticker} (actual: {actual_temp:.1f}°F)")
+
             result = market.get('result', '').lower()
+            total_count = 0
+            total_profit_loss = 0.0
+            side = first_fill.get('side', '').lower()
+            for fill in fills:
+                count = fill.get('count', 0)
+                trade_price = fill.get('yes_price', 0) if side == 'yes' else fill.get('no_price', 0)
+                won = (side == result)
+                if won:
+                    total_profit_loss += count * (100 - trade_price) / 100.0
+                else:
+                    total_profit_loss -= count * trade_price / 100.0
+                total_count += count
+            # Use avg entry price for display (first fill's price as proxy)
+            trade_price = first_fill.get('yes_price', 0) if side == 'yes' else first_fill.get('no_price', 0)
             won = (side == result)
-            
-            # Calculate P&L
-            count = fill.get('count', 0)
-            trade_price = fill.get('yes_price', 0) if side == 'yes' else fill.get('no_price', 0)
-            
-            if won:
-                # Won: get $1 per contract, minus what we paid
-                profit_loss = count * (100 - trade_price) / 100.0
-            else:
-                # Lost: lose what we paid
-                profit_loss = -count * trade_price / 100.0
-            
-            # Write to CSV
+
             with open(self.outcomes_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -235,32 +225,23 @@ class OutcomeTracker:
                     target_date.date().isoformat() if target_date else '',
                     str(threshold),
                     'range' if isinstance(threshold, tuple) else 'threshold',
-                    '',  # our_probability (would need to store this when trading)
-                    '',  # market_price
-                    '',  # edge
-                    '',  # ev
-                    '',  # strategy_mode
+                    '', '', '', '', '',
                     side,
-                    count,
+                    total_count,
                     trade_price,
                     result,
                     actual_temp if actual_temp else '',
                     predicted_temp if predicted_temp else '',
                     forecast_error if forecast_error else '',
                     'YES' if won else 'NO',
-                    f"{profit_loss:.2f}"
+                    f"{total_profit_loss:.2f}"
                 ])
-            
-            # Mark as logged
+
             self.logged_positions.add(market_ticker)
-            
-            # Log summary
             outcome_symbol = "✅" if won else "❌"
-            logger.info(f"{outcome_symbol} Logged outcome: {market_ticker} | {side.upper()} | {'WON' if won else 'LOST'} | P&L: ${profit_loss:.2f}")
-            
+            logger.info(f"{outcome_symbol} Logged outcome: {market_ticker} | {side.upper()} | {'WON' if won else 'LOST'} | P&L: ${total_profit_loss:.2f} ({total_count} contract(s))")
             if forecast_error:
                 logger.info(f"   Forecast accuracy: Predicted {predicted_temp:.1f}°, Actual {actual_temp:.1f}° (error: {forecast_error:.1f}°)")
-        
         except Exception as e:
             logger.error(f"Error logging outcome: {e}", exc_info=True)
     

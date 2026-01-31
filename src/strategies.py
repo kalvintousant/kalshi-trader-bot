@@ -177,7 +177,7 @@ class TradingStrategy:
             try:
                 exp = self._get_market_exposure(market_ticker)
                 exposure_str = f" | Exposure: {exp['total_contracts']}/{Config.MAX_CONTRACTS_PER_MARKET} contracts"
-            except:
+            except (KeyError, TypeError, ValueError):
                 exposure_str = ""
             
             trade_msg = f"🔄 TRADE EXECUTED: {action.upper()} {count} {side.upper()} @ {price}¢{exposure_str} | Order: {order_id} | Market: {market_ticker}"
