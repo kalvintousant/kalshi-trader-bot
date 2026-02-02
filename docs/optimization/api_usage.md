@@ -39,10 +39,10 @@
 
 ## Optimization Strategies
 
-### 1. Forecast Caching
-- **Cache TTL**: 30 minutes
-- **Benefit**: Reduces API calls by 90%+ (only refresh when cache expires)
-- **Impact**: 10 series × 2 refreshes/hour = 20 API calls/hour instead of 2,880
+### 1. Forecast Caching (24/7 Free-Tier Safe)
+- **Cache TTL**: **3 hours (10,800 s)** — default; minimum **156 min (9,360 s)** for all APIs in free tier
+- **Benefit**: Keeps Pirate Weather (333/day), Tomorrow.io (500/day), Visual Crossing (1k/day), Open-Meteo (10k/day) within limits
+- **Impact**: 36 keys × 8 refreshes/day = 288 calls/day per paid API (~8,640/month for Pirate Weather, under 10k)
 
 ### 2. Weatherbit Emergency Fallback
 - **Strategy**: Only call Weatherbit if NWS + Tomorrow.io both return zero forecasts
@@ -61,17 +61,21 @@
 
 ## Usage Calculation
 
-### Worst-Case Scenario
-- **Cities**: 5 (NYC, Chicago, Miami, Austin, LA)
-- **Types**: 2 (High, Low) = 10 series total
-- **Cache Refresh**: Every 30 minutes = 2 refreshes/hour = 48 refreshes/day
-- **APIs per Refresh**: 2 (NWS + Tomorrow.io) = 20 calls/hour = 480 calls/day
-- **Weatherbit Fallback**: ~5% failure rate = ~24 calls/day
+### 24/7 Free-Tier Safe Configuration
+- **Series**: 12 (6 cities × High/Low)
+- **Cache keys**: up to 36 (12 series × 3 target dates)
+- **FORECAST_CACHE_TTL**: **≥ 9,360 s (156 min)** required; **10,800 s (3 h)** recommended (default)
+- **Refreshes per key per day**: 86,400 ÷ 10,800 = 8
+- **Calls per day per paid API**: 36 × 8 = **288** (under Tomorrow.io 500, Pirate 333, Visual Crossing 1,000, Open-Meteo 10k)
+
+### Why 3 Hours?
+- **Pirate Weather** free tier: **10,000/month** (no daily reset — use ~333/day to stay under 10k for the month).
+- 36 keys × (86,400 ÷ TTL) ≤ 333 → TTL ≥ **9,341 s (~156 min)**.
+- Default **10,800 s (3 h)** gives a safety margin and keeps all APIs in free tier for 24/7 operation.
 
 ### Actual Usage (Typical)
-- **Cache Hit Rate**: 90%+ (most scans use cached forecasts)
-- **Actual API Calls**: Lower than worst-case due to cache efficiency
-- **Weatherbit Usage**: Minimal (only when both primary sources fail)
+- **Cache Hit Rate**: High (forecasts refreshed every 3 hours)
+- **Weatherbit**: Emergency fallback only (when primary sources return zero)
 
 ## Monitoring
 
@@ -95,16 +99,16 @@
 
 ## Recommendations
 
-### Current Status: ✅ Optimal
-- All APIs within free tier limits
+### Current Status: ✅ Optimal for 24/7
+- All APIs within free tier with **FORECAST_CACHE_TTL=10800** (3 hours)
 - Weatherbit emergency-only usage keeps us safe
-- 30-minute cache balances freshness with API limits
-- 30-second Kalshi scans catch market movements quickly
+- 3-hour forecast cache keeps Pirate Weather (10k/month) and Tomorrow.io (500/day) in free tier
+- 30-second Kalshi scans catch market movements; forecasts refresh every 3 h
 
 ### If Limits Are Approached
-1. **Increase cache TTL** to 60 minutes (reduces calls by 50%)
-2. **Remove Weatherbit** entirely (if NWS + Tomorrow.io are reliable)
-3. **Reduce cities** if needed (though current usage is safe)
+1. **Increase FORECAST_CACHE_TTL** (e.g. 14400 = 4 h) to reduce calls further
+2. **Disable a source** via env: `ENABLE_PIRATE_WEATHER=false` or `ENABLE_VISUAL_CROSSING=false` if needed
+3. **Reduce cities** only if adding more series would exceed limits
 
 ### Future Scaling
 - Can add 1-2 more cities within free tier limits

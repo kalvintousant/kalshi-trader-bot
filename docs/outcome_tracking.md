@@ -43,9 +43,11 @@ Comprehensive analytics on:
 ```
 data/
 ├── trades.csv           # All trades placed
-├── outcomes.csv         # Settled positions with results
+├── outcomes.csv         # Real Kalshi API results only (markets officially settled)
 └── performance.json     # Performance analytics
 ```
+
+**Note:** `outcomes.csv` (results) contains only real Kalshi API data: rows are written when a market has officially closed/settled on the API. NWS-inferred outcomes are not written here; today's P&L may still use NWS inference for same-day reporting when the outcome is known but the market has not closed yet.
 
 ## View Performance
 

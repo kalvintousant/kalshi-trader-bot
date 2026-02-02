@@ -68,7 +68,8 @@ So “nothing buying” is often: **all markets are today’s and it’s past re
 
 1. **Time:** If it’s evening (e.g. after 4 PM local in your cities), **today’s** markets are intentionally skipped; **tomorrow’s** can still trade.
 2. **Logs:** Run with default logging and search for `📊 SKIP` and `⛔` to see the exact reason per market.
-3. **Config:** Confirm `MIN_EDGE_THRESHOLD`, `MIN_EV_THRESHOLD`, `REQUIRE_HIGH_CONFIDENCE`, `MIN_DEGREES_FROM_THRESHOLD`, `MIN_ORDER_CONTRACTS`, `MAX_BUY_PRICE_CENTS` — any of these can make the bot much pickier and reduce buys.
+3. **Config:** Confirm `MIN_EDGE_THRESHOLD`, `MIN_EV_THRESHOLD`, `REQUIRE_HIGH_CONFIDENCE`, `MIN_DEGREES_FROM_THRESHOLD`, `MIN_ORDER_CONTRACTS`, `MAX_BUY_PRICE_CENTS`, `LONGSHOT_LOW_CUTOFF_HOUR` — any of these can make the bot much pickier and reduce buys.
+4. **LOW (min-temp) markets:** Today's low markets are only eligible before **8 AM local** in each city (configurable via `LONGSHOT_LOW_CUTOFF_HOUR`). After that, only tomorrow's low markets can be bought.
 
 ---
 

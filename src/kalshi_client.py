@@ -277,13 +277,63 @@ class KalshiClient:
         self.orders_cache.clear()
     
     def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> List[Dict]:
-        """Get filled orders (past trades)"""
-        params = {'limit': limit}
+        """Get filled orders (past trades), first page only."""
+        params = {'limit': min(limit, 200)}
         if ticker:
             params['ticker'] = ticker
         response = self._get('/portfolio/fills', params=params)
         return response.get('fills', [])
-    
+
+    def get_all_fills(self, since_ts: Optional[int] = None, ticker: Optional[str] = None,
+                      action_filter: Optional[str] = 'buy') -> List[Dict]:
+        """
+        Paginate through fills and return all. since_ts = Unix timestamp in milliseconds.
+        action_filter = 'buy' returns only buy fills (default).
+        """
+        all_fills = []
+        cursor = None
+        while True:
+            params = {'limit': 200}
+            if since_ts is not None:
+                params['min_ts'] = since_ts
+            if ticker:
+                params['ticker'] = ticker
+            if cursor:
+                params['cursor'] = cursor
+            resp = self._get('/portfolio/fills', params=params)
+            fills = resp.get('fills', [])
+            for f in fills:
+                if action_filter is None or (f.get('action') or 'buy').lower() == action_filter:
+                    all_fills.append(f)
+            cursor = resp.get('cursor')
+            if not cursor or not fills:
+                break
+        return all_fills
+
+    def get_all_settlements(self, since_ts: Optional[int] = None,
+                            ticker: Optional[str] = None) -> List[Dict]:
+        """
+        Paginate through /portfolio/settlements. since_ts = Unix timestamp in milliseconds.
+        Returns list of settlements (actual payouts from Kalshi — matches account balance).
+        """
+        all_settlements = []
+        cursor = None
+        while True:
+            params = {'limit': 200}
+            if since_ts is not None:
+                params['min_ts'] = since_ts
+            if ticker:
+                params['ticker'] = ticker
+            if cursor:
+                params['cursor'] = cursor
+            resp = self._get('/portfolio/settlements', params=params)
+            settlements = resp.get('settlements', [])
+            all_settlements.extend(settlements)
+            cursor = resp.get('cursor')
+            if not cursor or not settlements:
+                break
+        return all_settlements
+
     def get_market(self, ticker: str) -> Dict:
         """Get details for a specific market"""
         return self._get(f'/markets/{ticker}')

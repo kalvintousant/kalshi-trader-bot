@@ -77,7 +77,7 @@ class WeatherDataAggregator:
     # Local hour (24h) after which we assume the high of the day has occurred (longshot value is minimal)
     LONGSHOT_HIGH_CUTOFF_HOUR = 16  # 4 PM local (high typically occurs 2-5 PM)
     # Local hour (24h) after which we assume the low of the day has occurred (longshot value is minimal)
-    LONGSHOT_LOW_CUTOFF_HOUR = 8  # 8 AM local (low typically occurs 4-7 AM)
+    LONGSHOT_LOW_CUTOFF_HOUR = 8  # 8 AM local (low typically occurs 4-7 AM); overridden from Config in __init__
     
     def __init__(self):
         # API keys from environment (optional - will use free tiers where possible)
@@ -97,6 +97,8 @@ class WeatherDataAggregator:
         self.cache_timestamp = {}
         from .config import Config
         self.cache_ttl = Config.FORECAST_CACHE_TTL
+        # Use configurable cutoff for today's low markets (default 8 AM local)
+        self.LONGSHOT_LOW_CUTOFF_HOUR = getattr(Config, 'LONGSHOT_LOW_CUTOFF_HOUR', self.LONGSHOT_LOW_CUTOFF_HOUR)
 
         # Forecast metadata cache (stores source and timestamp for each forecast)
         self.forecast_metadata = {}  # {cache_key: [(temp, source, timestamp), ...]}

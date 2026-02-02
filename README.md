@@ -127,7 +127,7 @@ MIN_MARKET_VOLUME=50                  # Minimum market volume to trade
 # Performance
 ORDERBOOK_CACHE_TTL=3                 # Seconds
 PORTFOLIO_CACHE_TTL=10                # Seconds
-FORECAST_CACHE_TTL=1800               # Seconds (30 minutes)
+FORECAST_CACHE_TTL=10800              # Seconds (3 hours; 24/7 free-tier safe)
 
 # Logging
 LOG_LEVEL=INFO                        # DEBUG, INFO, WARNING, ERROR, CRITICAL

@@ -1,11 +1,15 @@
 """
 Outcome Tracker - Track bet outcomes and improve forecast accuracy over time
 
+Writes only real Kalshi API data to data/outcomes.csv (results.csv): markets that have
+officially settled (status closed/finalized/settled). No NWS-inferred outcomes are
+written here; today's P&L may still use NWS inference for same-day reporting.
+
 This module:
-1. Checks for settled positions (markets that have resolved)
+1. Checks for settled positions (markets that have resolved on API)
 2. Extracts actual temperatures from market outcomes
-3. Updates forecast model with historical accuracy data
-4. Generates performance reports
+3. Writes one row per market to outcomes.csv (real Kalshi results only)
+4. Updates forecast model with historical accuracy data
 """
 
 import json

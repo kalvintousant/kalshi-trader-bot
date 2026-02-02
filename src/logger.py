@@ -19,19 +19,23 @@ def setup_logging(log_level: str = None, log_file: str = None):
     
     if log_file is None:
         log_file = os.getenv('LOG_FILE', 'bot.log')
-    
-    # Create logs directory if it doesn't exist
-    log_dir = os.path.dirname(log_file) if os.path.dirname(log_file) else '.'
-    if log_dir and not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
-    
+    # Disable file logging if LOG_FILE is empty, "0", "false", or "none"
+    if isinstance(log_file, str) and log_file.strip().lower() in ('', '0', 'false', 'none'):
+        log_file = None
+
+    # Create logs directory if it doesn't exist (only when file logging is enabled)
+    if log_file:
+        log_dir = os.path.dirname(log_file) if os.path.dirname(log_file) else '.'
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, log_level, logging.INFO))
-    
+
     # Remove existing handlers
     root_logger.handlers.clear()
-    
+
     # Console handler with colored output
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
@@ -41,8 +45,8 @@ def setup_logging(log_level: str = None, log_file: str = None):
     )
     console_handler.setFormatter(console_format)
     root_logger.addHandler(console_handler)
-    
-    # File handler with rotation
+
+    # File handler with rotation (only if log_file is set)
     if log_file:
         file_handler = RotatingFileHandler(
             log_file,

@@ -131,6 +131,45 @@ def compute_result_from_nws(
     return 'yes' if observed_temp < threshold else 'no'
 
 
+def compute_single_fill_pnl(
+    client: KalshiClient,
+    weather_agg: WeatherDataAggregator,
+    fill: dict,
+    as_of_date,
+    nws_cache: dict,
+):
+    """
+    Compute P&L for one fill. Uses API result if settled, NWS if past/today and unsettled.
+    Returns (pnl, source) where source is 'API', 'NWS', or (None, 'pending') if outcome unknown.
+    """
+    ticker = fill.get("ticker") or fill.get("market_ticker") or "?"
+    side = (fill.get("side") or "yes").lower()
+    count = int(fill.get("count", 0))
+    price = int(fill.get("yes_price") or fill.get("no_price") or fill.get("price", 0))
+    try:
+        market = client.get_market(ticker)
+    except Exception:
+        return (None, "pending")
+    market_date, series_ticker = parse_date_from_ticker(ticker)
+    status = (market.get("status") or "").lower()
+    result = (market.get("result") or "").lower()
+    if status in ("closed", "finalized", "settled") and result in ("yes", "no"):
+        won = side == result
+        pnl = count * (100 - price) / 100.0 if won else -count * price / 100.0
+        return (pnl, "API")
+    if market_date and market_date > as_of_date:
+        return (None, "pending")
+    if market_date and market_date <= as_of_date and series_ticker:
+        result_nws = compute_result_from_nws(
+            market, market_date, series_ticker, ticker, weather_agg, nws_cache
+        )
+        if result_nws:
+            won = side == result_nws
+            pnl = count * (100 - price) / 100.0 if won else -count * price / 100.0
+            return (pnl, "NWS")
+    return (None, "pending")
+
+
 def compute_today_fill_pnl(client: KalshiClient, weather_agg: WeatherDataAggregator):
     """
     Compute today's P&L from fills using API result (settled) + NWS inferred (past/today).

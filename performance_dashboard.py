@@ -13,8 +13,9 @@ Tracks and displays:
 - Performance trends over time
 
 Data sources:
-- api (default): Real fills from Kalshi API with NWS-inferred outcomes
-- csv: Historical data from outcomes.csv (may contain stale/test data)
+- api (default): Kalshi API. For --period=today: fills + NWS-inferred outcomes.
+  For all/week/month: real Kalshi settlements only (no NWS inference).
+- csv: data/outcomes.csv (real Kalshi API results only, written by outcome_tracker)
 """
 
 import csv
@@ -29,7 +30,8 @@ load_dotenv()
 
 
 def load_outcomes_from_api(period: str = 'all') -> List[Dict]:
-    """Load real outcomes from Kalshi API with NWS-inferred results."""
+    """Load outcomes from Kalshi API. For period=today only: include NWS-inferred outcomes
+    (results already determined but market not closed). For all/week/month: API settlements only."""
     from src.config import Config
     from src.kalshi_client import KalshiClient
     from src.weather_data import WeatherDataAggregator, extract_threshold_from_market
@@ -173,6 +175,9 @@ def load_outcomes_from_api(period: str = 'all') -> List[Dict]:
                     won = (side == nws_result)
                     outcome_source = 'nws'
 
+        # For non-today periods: use real Kalshi API data only (no NWS inference)
+        if period != 'today' and outcome_source != 'api':
+            continue
         # Skip pending trades for P&L calculation
         if won is None:
             continue
@@ -615,7 +620,10 @@ def main():
     args = parser.parse_args()
 
     if args.source == 'api':
-        print("\n📡 Loading data from Kalshi API (with NWS-inferred outcomes)...")
+        if args.period == 'today':
+            print("\n📡 Loading data from Kalshi API (with NWS-inferred outcomes for today)...")
+        else:
+            print("\n📡 Loading data from Kalshi API (real settlements only)...")
         outcomes = load_outcomes_from_api(args.period)
         if not outcomes:
             print(f"\n❌ No fills found from Kalshi API\n")

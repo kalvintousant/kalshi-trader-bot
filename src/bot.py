@@ -455,7 +455,7 @@ class KalshiTradingBot:
             # Run polling mode
             logger.info("Running in polling mode...")
             if 'weather_daily' in Config.ENABLED_STRATEGIES:
-                logger.info(f"Scan interval: 30 seconds (Kalshi odds check) | Weather forecast cache: {Config.FORECAST_CACHE_TTL/60} minutes")
+                logger.info(f"Scan interval: 30 seconds (Kalshi odds check) | Weather forecast cache: {Config.FORECAST_CACHE_TTL/60:.0f} min")
             else:
                 logger.info("Scan interval: 15 seconds")
             # Heartbeat interval (log every 30 minutes for weather markets)
