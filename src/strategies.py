@@ -58,16 +58,12 @@ class TradingStrategy:
                             contracts = abs(position.get('position', 0))
                             total_contracts += contracts
 
-                            # COST BASIS ESTIMATION:
-                            # The API doesn't provide cost basis directly, only current market_exposure
-                            # Based on analysis of actual trades, average entry price is ~47¢
-                            # This is reasonable since we trade both:
-                            # - Longshots: 3-15¢ (low frequency)
-                            # - Conservative: 30-65¢ (high frequency)
-                            # Using 47¢ as empirically-derived average
-                            estimated_cost_per_contract = 0.47  # $0.47 average entry price
-                            estimated_cost = contracts * estimated_cost_per_contract
-                            total_dollars += estimated_cost
+                            # Use market_exposure from API (actual dollars at risk)
+                            # This is the real cost basis, not an estimate
+                            market_exposure = position.get('market_exposure', 0)
+                            # market_exposure is in cents, convert to dollars
+                            cost_dollars = market_exposure / 100.0
+                            total_dollars += cost_dollars
             except Exception as e:
                 logger.debug(f"Could not fetch positions for {base_market}: {e}")
 
@@ -311,7 +307,193 @@ class WeatherDailyStrategy(TradingStrategy):
         
         # Track active positions for exit logic
         self.active_positions: Dict[str, Dict] = {}  # {market_ticker: position_info}
-    
+
+    def _calculate_time_decay_factor(self, target_date: datetime, series_ticker: str) -> float:
+        """
+        Calculate time decay factor (0.5-1.0) based on hours until temperature extreme.
+
+        HIGH markets: Extreme typically 2-6 PM local (use configurable hour, default 4 PM)
+        LOW markets: Extreme typically 4-7 AM local (use configurable hour, default 6 AM)
+
+        Closer to extreme = higher confidence = larger positions
+        Further from extreme = more uncertainty = smaller positions
+        """
+        from zoneinfo import ZoneInfo
+
+        tz_name = self.weather_agg.CITY_TIMEZONES.get(series_ticker)
+        if tz_name:
+            tz = ZoneInfo(tz_name)
+            local_now = datetime.now(tz)
+        else:
+            local_now = datetime.now()
+            tz = None
+
+        is_high_market = 'HIGH' in series_ticker
+        is_low_market = 'LOW' in series_ticker
+
+        # Determine when the extreme typically occurs (local time)
+        if is_high_market:
+            extreme_hour = Config.HIGH_EXTREME_HOUR  # Default 4 PM local
+        elif is_low_market:
+            extreme_hour = Config.LOW_EXTREME_HOUR   # Default 6 AM local
+        else:
+            extreme_hour = 12  # Fallback to noon
+
+        # Calculate extreme time for target date
+        extreme_time = datetime.combine(target_date.date(), datetime.min.time().replace(hour=extreme_hour))
+        if tz:
+            extreme_time = extreme_time.replace(tzinfo=tz)
+
+        # Hours until the extreme occurs
+        hours_until_extreme = (extreme_time - local_now).total_seconds() / 3600
+
+        min_factor = Config.TIME_DECAY_MIN_FACTOR
+
+        # If extreme has passed (negative hours), return high confidence
+        if hours_until_extreme <= 0:
+            return 1.0
+
+        # If same day and within 6 hours of extreme: high confidence (0.85-1.0)
+        if hours_until_extreme <= 6:
+            return 0.85 + (0.15 * (1 - hours_until_extreme / 6))
+
+        # If 6-24 hours out: medium confidence (0.65-0.85)
+        if hours_until_extreme <= 24:
+            return 0.65 + (0.20 * (1 - (hours_until_extreme - 6) / 18))
+
+        # If 24-48 hours out: lower confidence (min_factor to 0.65)
+        if hours_until_extreme <= 48:
+            return min_factor + ((0.65 - min_factor) * (1 - (hours_until_extreme - 24) / 24))
+
+        # Beyond 48 hours: minimum factor
+        return min_factor
+
+    def _get_correlated_exposure(self, market_ticker: str) -> Dict:
+        """
+        Calculate total exposure across ALL correlated markets:
+        - Same city (KXHIGHNY and KXLOWNY are correlated)
+        - Same date
+
+        Returns dict with total_contracts, total_dollars, correlation_factor
+        """
+        parts = market_ticker.split('-')
+        if len(parts) < 2:
+            return {'total_contracts': 0, 'total_dollars': 0.0, 'correlation_factor': 1.0}
+
+        # Extract city and date
+        series = parts[0]  # e.g., KXHIGHNY
+        date_part = parts[1]  # e.g., 26FEB01
+
+        # Find correlated series (HIGH/LOW for same city)
+        city_code = series.replace('KXHIGH', '').replace('KXLOW', '')
+        correlated_series = [f'KXHIGH{city_code}', f'KXLOW{city_code}']
+
+        total_contracts = 0
+        total_dollars = 0.0
+
+        try:
+            positions = self.client.get_positions()
+            for position in positions:
+                pos_ticker = position.get('ticker', '')
+                pos_parts = pos_ticker.split('-')
+                if len(pos_parts) >= 2:
+                    pos_series = pos_parts[0]
+                    pos_date = pos_parts[1]
+                    # Check if same city AND same date
+                    if pos_series in correlated_series and pos_date == date_part:
+                        contracts = abs(position.get('position', 0))
+                        total_contracts += contracts
+                        total_dollars += contracts * 0.47  # Estimated cost basis
+        except Exception as e:
+            logger.debug(f"Error fetching positions for correlation check: {e}")
+
+        try:
+            # Also check resting orders
+            orders = self.client.get_orders(status='resting', use_cache=False)
+            for order in orders:
+                order_ticker = order.get('ticker', '')
+                order_parts = order_ticker.split('-')
+                if len(order_parts) >= 2:
+                    order_series = order_parts[0]
+                    order_date = order_parts[1]
+                    if order_series in correlated_series and order_date == date_part:
+                        remaining = order.get('remaining_count', 0)
+                        total_contracts += remaining
+                        price = order.get('yes_price') or order.get('no_price') or 50
+                        total_dollars += (remaining * price) / 100.0
+        except Exception as e:
+            logger.debug(f"Error fetching orders for correlation check: {e}")
+
+        # Correlation factor: reduce size as correlated exposure increases
+        # At 50% of max contracts, reduce new positions by 25%
+        # At 100% of max, reduce by max_reduction (default 50%)
+        max_reduction = Config.CORRELATION_MAX_REDUCTION
+        exposure_ratio = min(1.0, total_contracts / Config.MAX_CONTRACTS_PER_MARKET)
+        correlation_factor = max(1.0 - max_reduction, 1.0 - (exposure_ratio * max_reduction))
+
+        return {
+            'total_contracts': total_contracts,
+            'total_dollars': total_dollars,
+            'correlation_factor': correlation_factor
+        }
+
+    def _calculate_liquidity_cap(self, orderbook: Dict, side: str, target_price: int) -> int:
+        """
+        Calculate max contracts we can buy without significant slippage.
+        Returns max contracts at or near target_price.
+
+        Prevents taking more than LIQUIDITY_CAP_PERCENT of visible liquidity.
+        """
+        # Get orderbook for opposite side (we're buying, so look at sellers)
+        opposite_side = 'no' if side == 'yes' else 'yes'
+        orders = orderbook.get('orderbook', {}).get(opposite_side, [])
+
+        if not orders:
+            return Config.MAX_POSITION_SIZE * 5  # No data, use high default
+
+        # Sum up available contracts within tolerance of target price
+        # Orderbook format: [[price, quantity], ...] sorted ascending
+        available_contracts = 0
+        price_tolerance = Config.LIQUIDITY_PRICE_TOLERANCE
+
+        for price, quantity in orders:
+            # For buying YES: our ask = 100 - their bid
+            effective_ask = 100 - price
+            if effective_ask <= target_price + price_tolerance:
+                available_contracts += quantity
+
+        # Don't take more than configured percent of visible liquidity
+        liquidity_cap = int(available_contracts * Config.LIQUIDITY_CAP_PERCENT)
+
+        return max(1, liquidity_cap)  # At least 1 contract
+
+    def _calculate_ev_proportional_size(self, ev: float, is_longshot: bool) -> int:
+        """
+        Calculate position size proportional to expected value.
+        Higher EV = larger position (within limits).
+
+        Replaces discrete multipliers with continuous EV-based scaling.
+        """
+        # Baseline EV thresholds from config
+        if is_longshot:
+            baseline_ev = Config.EV_BASELINE_LONGSHOT  # Default $0.05
+            max_multiplier = 5.0  # Up to 5x for exceptional EV
+        else:
+            baseline_ev = Config.EV_BASELINE_CONSERVATIVE  # Default $0.02
+            max_multiplier = 2.0  # Up to 2x for conservative
+
+        # Calculate EV multiplier (capped)
+        if ev <= 0:
+            return 0
+
+        ev_ratio = ev / baseline_ev
+        ev_multiplier = min(max_multiplier, max(0.5, ev_ratio))
+
+        # Apply to base position
+        base_position = int(self.max_position_size * ev_multiplier)
+
+        return base_position
+
     def _extract_market_date(self, market: Dict) -> Optional[datetime]:
         """Extract the target date from market ticker or title"""
         ticker = market.get('ticker', '')
@@ -664,7 +846,12 @@ class WeatherDailyStrategy(TradingStrategy):
             # Arrays are sorted ASCENDING, so best bid (highest) is LAST element [-1]
             best_yes_bid = yes_orders[-1][0] if yes_orders else yes_market_price
             best_no_bid = no_orders[-1][0] if no_orders else no_market_price
-            
+
+            # EARLY PRICE CHECK: Skip if BOTH sides are too expensive (saves calculation time)
+            if best_yes_ask > Config.MAX_BUY_PRICE_CENTS and best_no_ask > Config.MAX_BUY_PRICE_CENTS:
+                logger.info(f"📊 SKIP {market_ticker}: both YES ({best_yes_ask}¢) and NO ({best_no_ask}¢) exceed max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                return None
+
             # Calculate edge for YES side using ASK price (what we'd actually pay)
             yes_edge = self.weather_agg.calculate_edge(our_prob, int(best_yes_ask))
             
@@ -755,7 +942,11 @@ class WeatherDailyStrategy(TradingStrategy):
                     # Check confidence: only use Kelly if CI doesn't overlap with market price
                     use_kelly = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
                     
-                    if use_kelly and len(forecasts) >= 2:
+                    # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
+                    if Config.EV_PROPORTIONAL_ENABLED:
+                        base_position = self._calculate_ev_proportional_size(yes_ev, is_longshot=True)
+                        logger.debug(f"EV-proportional sizing: EV=${yes_ev:.4f}, position={base_position}")
+                    elif use_kelly and len(forecasts) >= 2:
                         # HIGH CONFIDENCE: Use Kelly Criterion for optimal position sizing
                         payout_ratio = 1.0 / (best_yes_ask / 100.0)  # Payout / Stake
                         kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.5)
@@ -780,10 +971,32 @@ class WeatherDailyStrategy(TradingStrategy):
                         base_position = int(self.max_position_size * confidence_multiplier)
                         base_position = min(base_position, self.max_position_size * 5)  # Cap at 5x
                         logger.debug(f"Using Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
-                    
-                    # Cap by REMAINING contract count and dollars (not absolute limits)
+
+                    # Apply time decay factor (reduce size for markets further from temperature extreme)
+                    if Config.TIME_DECAY_ENABLED:
+                        time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
+                        base_position = max(1, int(base_position * time_factor))
+                        logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
+
+                    # Apply correlation adjustment (reduce size when holding correlated positions)
+                    if Config.CORRELATION_ADJUSTMENT_ENABLED:
+                        corr_data = self._get_correlated_exposure(market_ticker)
+                        base_position = max(1, int(base_position * corr_data['correlation_factor']))
+                        if corr_data['correlation_factor'] < 1.0:
+                            logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
+
+                    # Calculate liquidity cap
+                    if Config.LIQUIDITY_CAP_ENABLED:
+                        liquidity_cap = self._calculate_liquidity_cap(orderbook, 'yes', int(best_yes_ask))
+                    else:
+                        liquidity_cap = self.max_position_size * 10  # Effectively no cap
+
+                    # Cap by REMAINING contract count, dollars, and liquidity
                     dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
-                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
+                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
+
+                    if liquidity_cap < base_position:
+                        logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
                     
                     # Skip if no room or below minimum order size
                     if position_size <= 0:
@@ -794,7 +1007,8 @@ class WeatherDailyStrategy(TradingStrategy):
                         return None
                     
                     if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (YES ask {best_yes_ask}¢)")
+                        logger.info(f"📊 SKIP {market_ticker}: YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                        # Don't return None here - fall through to check NO side
                     else:
                         confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
                         logger.info(f"🎯 LONGSHOT YES {market_ticker}: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
@@ -831,7 +1045,11 @@ class WeatherDailyStrategy(TradingStrategy):
                     # Check confidence: only use Kelly if CI doesn't overlap with market price
                     use_kelly = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
                     
-                    if use_kelly and len(forecasts) >= 2:
+                    # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
+                    if Config.EV_PROPORTIONAL_ENABLED:
+                        base_position = self._calculate_ev_proportional_size(no_ev, is_longshot=True)
+                        logger.debug(f"EV-proportional sizing: EV=${no_ev:.4f}, position={base_position}")
+                    elif use_kelly and len(forecasts) >= 2:
                         # HIGH CONFIDENCE: Use Kelly Criterion for optimal position sizing
                         payout_ratio = 1.0 / (best_no_ask / 100.0)  # Payout / Stake
                         kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.5)
@@ -856,11 +1074,33 @@ class WeatherDailyStrategy(TradingStrategy):
                         base_position = int(self.max_position_size * confidence_multiplier)
                         base_position = min(base_position, self.max_position_size * 5)  # Cap at 5x
                         logger.debug(f"Using Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
-                    
-                    # Cap by REMAINING contract count and dollars (not absolute limits)
+
+                    # Apply time decay factor (reduce size for markets further from temperature extreme)
+                    if Config.TIME_DECAY_ENABLED:
+                        time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
+                        base_position = max(1, int(base_position * time_factor))
+                        logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
+
+                    # Apply correlation adjustment (reduce size when holding correlated positions)
+                    if Config.CORRELATION_ADJUSTMENT_ENABLED:
+                        corr_data = self._get_correlated_exposure(market_ticker)
+                        base_position = max(1, int(base_position * corr_data['correlation_factor']))
+                        if corr_data['correlation_factor'] < 1.0:
+                            logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
+
+                    # Calculate liquidity cap
+                    if Config.LIQUIDITY_CAP_ENABLED:
+                        liquidity_cap = self._calculate_liquidity_cap(orderbook, 'no', int(best_no_ask))
+                    else:
+                        liquidity_cap = self.max_position_size * 10  # Effectively no cap
+
+                    # Cap by REMAINING contract count, dollars, and liquidity
                     dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
-                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
-                    
+                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
+
+                    if liquidity_cap < base_position:
+                        logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
+
                     if position_size <= 0:
                         logger.info(f"📊 SKIP {market_ticker}: longshot NO ok but no capacity (position_size=0)")
                         return None
@@ -869,7 +1109,7 @@ class WeatherDailyStrategy(TradingStrategy):
                         return None
                     
                     if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (NO ask {best_no_ask}¢)")
+                        logger.info(f"📊 SKIP {market_ticker}: NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                     else:
                         confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
                         logger.info(f"🎯 LONGSHOT NO {market_ticker}: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
@@ -905,8 +1145,12 @@ class WeatherDailyStrategy(TradingStrategy):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and our_prob > 0.7 and (ci_lower_yes > best_yes_ask / 100.0)
-                
-                if use_kelly:
+
+                # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
+                if Config.EV_PROPORTIONAL_ENABLED:
+                    base_position = self._calculate_ev_proportional_size(yes_ev, is_longshot=False)
+                    logger.debug(f"EV-proportional sizing: EV=${yes_ev:.4f}, position={base_position}")
+                elif use_kelly:
                     # HIGH CONFIDENCE: Kelly Criterion with very conservative fractional (0.25)
                     payout_ratio = 1.0 / (best_yes_ask / 100.0)
                     kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.25)
@@ -930,11 +1174,33 @@ class WeatherDailyStrategy(TradingStrategy):
                     base_position = int(self.max_position_size * confidence_multiplier)
                     base_position = max(1, min(base_position, self.max_position_size * 2))
                     logger.debug(f"Conservative Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
-                
-                # Cap by REMAINING capacity, not absolute limits
+
+                # Apply time decay factor (reduce size for markets further from temperature extreme)
+                if Config.TIME_DECAY_ENABLED:
+                    time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
+                    base_position = max(1, int(base_position * time_factor))
+                    logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
+
+                # Apply correlation adjustment (reduce size when holding correlated positions)
+                if Config.CORRELATION_ADJUSTMENT_ENABLED:
+                    corr_data = self._get_correlated_exposure(market_ticker)
+                    base_position = max(1, int(base_position * corr_data['correlation_factor']))
+                    if corr_data['correlation_factor'] < 1.0:
+                        logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
+
+                # Calculate liquidity cap
+                if Config.LIQUIDITY_CAP_ENABLED:
+                    liquidity_cap = self._calculate_liquidity_cap(orderbook, 'yes', int(best_yes_ask))
+                else:
+                    liquidity_cap = self.max_position_size * 10  # Effectively no cap
+
+                # Cap by REMAINING capacity, dollars, and liquidity
                 dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
-                position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
-                
+                position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
+
+                if liquidity_cap < base_position:
+                    logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
+
                 if position_size <= 0:
                     logger.info(f"📊 SKIP {market_ticker}: conservative YES ok but no capacity (position_size=0)")
                     return None
@@ -943,7 +1209,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     return None
                 
                 if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (YES ask {best_yes_ask}¢)")
+                    logger.info(f"📊 SKIP {market_ticker}: YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                 else:
                     logger.info(f"✓ Conservative YES {market_ticker}: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
                     
@@ -971,8 +1237,12 @@ class WeatherDailyStrategy(TradingStrategy):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and no_prob > 0.7 and (ci_lower_no > best_no_ask / 100.0)
-                
-                if use_kelly:
+
+                # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
+                if Config.EV_PROPORTIONAL_ENABLED:
+                    base_position = self._calculate_ev_proportional_size(no_ev, is_longshot=False)
+                    logger.debug(f"EV-proportional sizing: EV=${no_ev:.4f}, position={base_position}")
+                elif use_kelly:
                     # HIGH CONFIDENCE: Kelly Criterion with very conservative fractional (0.25)
                     payout_ratio = 1.0 / (best_no_ask / 100.0)
                     kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.25)
@@ -996,11 +1266,33 @@ class WeatherDailyStrategy(TradingStrategy):
                     base_position = int(self.max_position_size * confidence_multiplier)
                     base_position = max(1, min(base_position, self.max_position_size * 2))
                     logger.debug(f"Conservative Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
-                
-                # Cap by REMAINING capacity, not absolute limits
+
+                # Apply time decay factor (reduce size for markets further from temperature extreme)
+                if Config.TIME_DECAY_ENABLED:
+                    time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
+                    base_position = max(1, int(base_position * time_factor))
+                    logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
+
+                # Apply correlation adjustment (reduce size when holding correlated positions)
+                if Config.CORRELATION_ADJUSTMENT_ENABLED:
+                    corr_data = self._get_correlated_exposure(market_ticker)
+                    base_position = max(1, int(base_position * corr_data['correlation_factor']))
+                    if corr_data['correlation_factor'] < 1.0:
+                        logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
+
+                # Calculate liquidity cap
+                if Config.LIQUIDITY_CAP_ENABLED:
+                    liquidity_cap = self._calculate_liquidity_cap(orderbook, 'no', int(best_no_ask))
+                else:
+                    liquidity_cap = self.max_position_size * 10  # Effectively no cap
+
+                # Cap by REMAINING capacity, dollars, and liquidity
                 dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
-                position_size = min(base_position, contracts_remaining, dollar_cap_contracts)
-                
+                position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
+
+                if liquidity_cap < base_position:
+                    logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
+
                 if position_size <= 0:
                     logger.info(f"📊 SKIP {market_ticker}: conservative NO ok but no capacity (position_size=0)")
                     return None
@@ -1009,7 +1301,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     return None
                 
                 if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.info(f"📊 SKIP {market_ticker}: no value at 100¢ (NO ask {best_no_ask}¢)")
+                    logger.info(f"📊 SKIP {market_ticker}: NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                 else:
                     logger.info(f"✓ Conservative NO {market_ticker}: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
                     
@@ -1057,20 +1349,24 @@ class WeatherDailyStrategy(TradingStrategy):
     def _check_exit(self, market: Dict, orderbook: Dict, market_ticker: str) -> Optional[Dict]:
         """
         Check if we should exit an active weather position
-        
+
         Exit conditions:
         - Edge disappears (re-evaluate and edge < threshold)
         - Take profit (price moved significantly in our favor)
         - Stop loss (price moved significantly against us)
-        
+
         Args:
             market: Market data from Kalshi
             orderbook: Current orderbook data
             market_ticker: Market ticker symbol
-            
+
         Returns:
             Exit decision dict or None
         """
+        # Check if exit logic is enabled
+        if not Config.EXIT_LOGIC_ENABLED:
+            return None
+
         try:
             position = self.active_positions.get(market_ticker)
             if not position:

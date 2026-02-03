@@ -40,7 +40,7 @@ class Config:
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '3'))  # Max days in future for forecasts
     # Never buy at or above this price (cents). 99 = no buys at 99¢ or 100¢ (no edge).
-    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '65'))  # Cap at 65¢ to avoid expensive losing positions (was 99¢)
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '75'))  # Cap at 75¢ to avoid expensive losing positions
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
     MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '2.0'))  # Skip trades within 2°F of threshold (reduces coin-flip losses)
@@ -65,6 +65,30 @@ class Config:
     # Bias correction settings
     ENABLE_BIAS_CORRECTION = os.getenv('ENABLE_BIAS_CORRECTION', 'true').lower() == 'true'
     MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '5'))  # Min samples before applying bias correction
+
+    # Exit/Sell Logic
+    EXIT_LOGIC_ENABLED = os.getenv('EXIT_LOGIC_ENABLED', 'false').lower() == 'true'  # Disabled by default
+
+    # Position Sizing Enhancements
+    # 1. Time Decay: Reduce position size based on hours until temperature extreme
+    TIME_DECAY_ENABLED = os.getenv('TIME_DECAY_ENABLED', 'true').lower() == 'true'
+    TIME_DECAY_MIN_FACTOR = float(os.getenv('TIME_DECAY_MIN_FACTOR', '0.5'))  # Min 50% of base size
+    HIGH_EXTREME_HOUR = int(os.getenv('HIGH_EXTREME_HOUR', '16'))  # 4 PM local for daily highs
+    LOW_EXTREME_HOUR = int(os.getenv('LOW_EXTREME_HOUR', '6'))  # 6 AM local for daily lows
+
+    # 2. Correlation Adjustment: Reduce size when holding correlated positions (same city/date)
+    CORRELATION_ADJUSTMENT_ENABLED = os.getenv('CORRELATION_ADJUSTMENT_ENABLED', 'true').lower() == 'true'
+    CORRELATION_MAX_REDUCTION = float(os.getenv('CORRELATION_MAX_REDUCTION', '0.5'))  # Max 50% reduction
+
+    # 3. Liquidity Cap: Don't take more than X% of visible liquidity
+    LIQUIDITY_CAP_ENABLED = os.getenv('LIQUIDITY_CAP_ENABLED', 'true').lower() == 'true'
+    LIQUIDITY_CAP_PERCENT = float(os.getenv('LIQUIDITY_CAP_PERCENT', '0.5'))  # Take max 50% of visible
+    LIQUIDITY_PRICE_TOLERANCE = int(os.getenv('LIQUIDITY_PRICE_TOLERANCE', '2'))  # Within 2 cents
+
+    # 4. EV-Proportional Sizing: Size proportionally to expected value
+    EV_PROPORTIONAL_ENABLED = os.getenv('EV_PROPORTIONAL_ENABLED', 'true').lower() == 'true'
+    EV_BASELINE_LONGSHOT = float(os.getenv('EV_BASELINE_LONGSHOT', '0.05'))  # $0.05 baseline
+    EV_BASELINE_CONSERVATIVE = float(os.getenv('EV_BASELINE_CONSERVATIVE', '0.02'))  # $0.02 baseline
     
     # Market Tickers
     # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles, Denver
