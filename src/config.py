@@ -13,8 +13,8 @@ class Config:
     # Trading Settings
     MAX_POSITION_SIZE = int(os.getenv('MAX_POSITION_SIZE', '10'))
     MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '10'))  # $10 max daily loss limit
-    MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '25'))  # Max contracts per market
-    MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '5.0'))  # Max dollars per market ($5.00)
+    MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '15'))  # Max contracts per market (reduced from 25)
+    MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '3.0'))  # Max dollars per market (reduced from $15 to $3)
     # Skip placing an order if computed size would be below this (avoids many 1-contract orders).
     MIN_ORDER_CONTRACTS = int(os.getenv('MIN_ORDER_CONTRACTS', '1'))  # 1 = allow 1-contract orders; 2+ = require at least that many
     ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'weather_daily').split(',')

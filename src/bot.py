@@ -230,12 +230,19 @@ class KalshiTradingBot:
                 
                 # Get current market data
                 try:
-                    # Get market info
-                    markets = self.client.get_markets(limit=200)
-                    market = next((m for m in markets if m.get('ticker') == ticker), None)
-                    
+                    # Get market info - fetch by specific ticker to avoid missing it in large lists
+                    try:
+                        market_response = self.client.get_market(ticker)
+                        # API returns {'market': {...}}, extract the market data
+                        market = market_response.get('market') if market_response else None
+                    except Exception as e:
+                        # If we can't fetch the market, it might be closed or invalid
+                        # But don't cancel immediately - could be a transient API error
+                        logger.debug(f"Could not fetch market {ticker}: {e}")
+                        continue  # Skip this order, don't cancel
+
                     if not market:
-                        # Market might have closed, cancel order
+                        # Market definitely doesn't exist, cancel order
                         logger.info(f"🗑️  Canceling order {order_id}: Market {ticker} not found (likely closed)")
                         self.client.cancel_order(order_id)
                         self.client.invalidate_orders_cache()
@@ -326,9 +333,14 @@ class KalshiTradingBot:
         if self.check_daily_loss_limit():
             logger.warning("Pausing trading due to daily loss limit")
             return
-        
+
         logger.debug(f"Scanning markets at {datetime.now()}")
-        
+
+        # Track markets evaluated this scan to prevent duplicate evaluations
+        # This prevents the same ticker from being evaluated multiple times
+        # if it appears in multiple threshold lists within the same scan
+        markets_traded_this_scan: Set[str] = set()
+
         try:
             # Filter markets by relevant series FIRST to reduce API calls
             # Increase limit to catch all markets, especially new ones
@@ -390,10 +402,19 @@ class KalshiTradingBot:
             
             markets_evaluated = 0
             for i, market in enumerate(markets_to_process):
+                market_ticker = market.get('ticker', '')
+
+                # CRITICAL: Skip if we already evaluated this ticker this scan
+                # This prevents duplicate orders when the same market appears multiple times
+                if market_ticker in markets_traded_this_scan:
+                    logger.debug(f"📊 SKIP {market_ticker}: already evaluated this scan")
+                    continue
+                markets_traded_this_scan.add(market_ticker)
+
                 # Small delay every 10 markets to avoid overwhelming the API
                 if i > 0 and i % 10 == 0:
                     time.sleep(0.5)  # 500ms pause every 10 markets
-                
+
                 # Quick filter check before expensive orderbook call
                 should_trade = any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies)
                 if not should_trade:

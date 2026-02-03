@@ -18,15 +18,40 @@ class TradingStrategy:
         self.client = client
         self.name = self.__class__.__name__
     
+    def _has_resting_order_on_ticker(self, ticker: str) -> bool:
+        """
+        Check if we already have a resting order on this EXACT ticker.
+
+        This prevents placing duplicate orders on the same ticker every scan cycle.
+        The base market limit check prevents over-exposure to a market, but this
+        check prevents order accumulation on the same specific ticker.
+
+        Args:
+            ticker: The exact ticker to check (e.g., KXHIGHLAX-26JAN28-B69.5)
+
+        Returns:
+            True if there's already a resting order on this exact ticker
+        """
+        try:
+            orders = self.client.get_orders(status='resting', use_cache=False)
+            for order in orders:
+                if order.get('ticker') == ticker:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"Could not check resting orders for {ticker}: {e}")
+            # Return True (assume order exists) to be safe and prevent duplicates
+            return True
+
     def _get_market_exposure(self, market_ticker: str) -> Dict:
         """
         Calculate total exposure (contracts + dollars) on a specific BASE MARKET.
         Includes both current positions AND resting (open) orders.
-        
+
         IMPORTANT: Tracks at BASE MARKET level (e.g., KXHIGHMIA-26FEB01)
         not per-threshold (e.g., KXHIGHMIA-26FEB01-B51.5).
         This means all temperature thresholds for a market are combined.
-        
+
         Uses get_positions() for actual holdings (not get_fills which is historical).
         Uses use_cache=False for resting orders to get fresh data for accurate limit checks.
         """
@@ -155,19 +180,21 @@ class TradingStrategy:
                 yes_price = None
                 no_price = price
             
-            order = self.client.create_order(
-                ticker=market_ticker,
-                action=decision['action'],
-                side=decision['side'],
-                count=decision['count'],
-                order_type='limit',
-                yes_price=yes_price,
-                no_price=no_price,
-                client_order_id=str(uuid.uuid4())
-            )
-
-            # Invalidate orders cache so subsequent exposure checks see this order
-            self.client.invalidate_orders_cache()
+            try:
+                order = self.client.create_order(
+                    ticker=market_ticker,
+                    action=decision['action'],
+                    side=decision['side'],
+                    count=decision['count'],
+                    order_type='limit',
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    client_order_id=str(uuid.uuid4())
+                )
+            finally:
+                # ALWAYS invalidate orders cache after order attempt (success or failure)
+                # This ensures subsequent exposure checks see accurate order state
+                self.client.invalidate_orders_cache()
 
             # Enhanced trade notification  
             order_id = order.get('order_id', 'N/A')
@@ -893,22 +920,34 @@ class WeatherDailyStrategy(TradingStrategy):
             no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake,
                                                   include_fees=True, fee_rate=0.05)
             
+            # CRITICAL FIX: Check if we already have a resting order on THIS EXACT ticker
+            # This prevents the bug where we place multiple orders on the same ticker every scan
+            if self._has_resting_order_on_ticker(market_ticker):
+                logger.info(f"📊 SKIP {market_ticker}: already have resting order on this ticker")
+                return None
+
             # Check existing exposure on this BASE MARKET BEFORE placing new orders
-            # This prevents the bug where we place multiple orders on the same market
+            # This prevents over-exposure to a market (across all thresholds)
             existing_exposure = self._get_market_exposure(market_ticker)
             existing_contracts = existing_exposure['total_contracts']
             existing_dollars = existing_exposure['total_dollars']
             base_market = existing_exposure.get('base_market', market_ticker)
-            
+
             # Calculate remaining capacity
             contracts_remaining = max(0, Config.MAX_CONTRACTS_PER_MARKET - existing_contracts)
             dollars_remaining = max(0, Config.MAX_DOLLARS_PER_MARKET - existing_dollars)
-            
-            # If we're at or over limits, skip this market
-            if contracts_remaining == 0 or dollars_remaining < 0.01:
+
+            # HARD BLOCK: If we're already at or over dollar limit, skip this market
+            # This enforces the $5 limit even if existing orders already exceeded it
+            if existing_dollars >= Config.MAX_DOLLARS_PER_MARKET:
+                logger.info(f"📊 SKIP {market_ticker}: already at dollar limit ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f} for {base_market}")
+                return None
+
+            # If we're at or over contract limits, skip this market
+            if contracts_remaining == 0:
                 logger.info(f"📊 SKIP {market_ticker}: at BASE MARKET position limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f}) for {base_market}")
                 return None
-            
+
             logger.debug(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining for BASE MARKET {base_market} (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
             
             # Skip ALL new trades on today's markets once the extreme (high/low) of day has likely occurred.
@@ -1007,8 +1046,8 @@ class WeatherDailyStrategy(TradingStrategy):
                         return None
                     
                     if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.info(f"📊 SKIP {market_ticker}: YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                        # Don't return None here - fall through to check NO side
+                        logger.info(f"📊 SKIP {market_ticker}: longshot YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                        # Fall through to check NO side (don't return yet)
                     else:
                         confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
                         logger.info(f"🎯 LONGSHOT YES {market_ticker}: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
@@ -1109,32 +1148,33 @@ class WeatherDailyStrategy(TradingStrategy):
                         return None
                     
                     if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.info(f"📊 SKIP {market_ticker}: NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                    else:
-                        confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
-                        logger.info(f"🎯 LONGSHOT NO {market_ticker}: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
-                        logger.info(f"💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
-                        
-                        # Record position for exit logic
-                        self.active_positions[market_ticker] = {
-                            'side': 'no',
-                            'entry_price': best_no_ask,
-                            'entry_time': datetime.now(),
-                            'count': position_size,
-                            'edge': no_edge,
-                            'ev': no_ev,
-                            'strategy_mode': 'longshot'
-                        }
-                        
-                        return {
-                            'action': 'buy',
-                            'side': 'no',
-                            'count': position_size,
-                            'price': best_no_ask,  # Pay the ask price to get filled
-                            'edge': no_edge,
-                            'ev': no_ev,
-                            'strategy_mode': 'longshot'
-                        }
+                        logger.info(f"📊 SKIP {market_ticker}: longshot NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                        return None  # EXPLICIT: Don't trade above price limit
+
+                    confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
+                    logger.info(f"🎯 LONGSHOT NO {market_ticker}: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
+                    logger.info(f"💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
+
+                    # Record position for exit logic
+                    self.active_positions[market_ticker] = {
+                        'side': 'no',
+                        'entry_price': best_no_ask,
+                        'entry_time': datetime.now(),
+                        'count': position_size,
+                        'edge': no_edge,
+                        'ev': no_ev,
+                        'strategy_mode': 'longshot'
+                    }
+
+                    return {
+                        'action': 'buy',
+                        'side': 'no',
+                        'count': position_size,
+                        'price': best_no_ask,  # Pay the ask price to get filled
+                        'edge': no_edge,
+                        'ev': no_ev,
+                        'strategy_mode': 'longshot'
+                    }
             
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             # Optionally require confidence interval to not overlap market price (REQUIRE_HIGH_CONFIDENCE)
@@ -1209,30 +1249,31 @@ class WeatherDailyStrategy(TradingStrategy):
                     return None
                 
                 if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.info(f"📊 SKIP {market_ticker}: YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                else:
-                    logger.info(f"✓ Conservative YES {market_ticker}: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
-                    
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'yes',
-                        'entry_price': best_yes_ask,
-                        'entry_time': datetime.now(),
-                        'count': position_size,
-                        'edge': yes_edge,
-                        'ev': yes_ev,
-                        'strategy_mode': 'conservative'
-                    }
-                    
-                    return {
-                        'action': 'buy',
-                        'side': 'yes',
-                        'count': position_size,
-                        'price': best_yes_ask,  # Pay the ask price to get filled
-                        'edge': yes_edge,
-                        'ev': yes_ev,
-                        'strategy_mode': 'conservative'
-                    }
+                    logger.info(f"📊 SKIP {market_ticker}: conservative YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                    return None  # EXPLICIT: Don't trade above price limit
+
+                logger.info(f"✓ Conservative YES {market_ticker}: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
+
+                # Record position for exit logic
+                self.active_positions[market_ticker] = {
+                    'side': 'yes',
+                    'entry_price': best_yes_ask,
+                    'entry_time': datetime.now(),
+                    'count': position_size,
+                    'edge': yes_edge,
+                    'ev': yes_ev,
+                    'strategy_mode': 'conservative'
+                }
+
+                return {
+                    'action': 'buy',
+                    'side': 'yes',
+                    'count': position_size,
+                    'price': best_yes_ask,  # Pay the ask price to get filled
+                    'edge': yes_edge,
+                    'ev': yes_ev,
+                    'strategy_mode': 'conservative'
+                }
             elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_no):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
@@ -1301,30 +1342,31 @@ class WeatherDailyStrategy(TradingStrategy):
                     return None
                 
                 if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.info(f"📊 SKIP {market_ticker}: NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                else:
-                    logger.info(f"✓ Conservative NO {market_ticker}: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
-                    
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'no',
-                        'entry_price': best_no_ask,
-                        'entry_time': datetime.now(),
-                        'count': position_size,
-                        'edge': no_edge,
-                        'ev': no_ev,
-                        'strategy_mode': 'conservative'
-                    }
-                    
-                    return {
-                        'action': 'buy',
-                        'side': 'no',
-                        'count': position_size,
-                        'price': best_no_ask,  # Pay the ask price to get filled
-                        'edge': no_edge,
-                        'ev': no_ev,
-                        'strategy_mode': 'conservative'
-                    }
+                    logger.info(f"📊 SKIP {market_ticker}: conservative NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                    return None  # EXPLICIT: Don't trade above price limit
+
+                logger.info(f"✓ Conservative NO {market_ticker}: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
+
+                # Record position for exit logic
+                self.active_positions[market_ticker] = {
+                    'side': 'no',
+                    'entry_price': best_no_ask,
+                    'entry_time': datetime.now(),
+                    'count': position_size,
+                    'edge': no_edge,
+                    'ev': no_ev,
+                    'strategy_mode': 'conservative'
+                }
+
+                return {
+                    'action': 'buy',
+                    'side': 'no',
+                    'count': position_size,
+                    'price': best_no_ask,  # Pay the ask price to get filled
+                    'edge': no_edge,
+                    'ev': no_ev,
+                    'strategy_mode': 'conservative'
+                }
             
             # Diagnostic: log why we didn't trade (helps debug "no purchases")
             best_edge = max(yes_edge, no_edge)
