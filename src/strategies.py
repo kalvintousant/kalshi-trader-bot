@@ -1,22 +1,29 @@
 import time
 import uuid
 import logging
+import numpy as np
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from .kalshi_client import KalshiClient
 from .config import Config
 from .weather_data import WeatherDataAggregator, extract_threshold_from_market
+from .market_maker import MarketMaker, SmartOrderRouter
+from .portfolio_risk import CorrelationAwareRisk
+from .backtester import get_data_store
 
 logger = logging.getLogger(__name__)
 
 
 class TradingStrategy:
     """Base class for trading strategies"""
-    
+
     def __init__(self, client: KalshiClient):
         # Don't call super() - this is the base class
         self.client = client
         self.name = self.__class__.__name__
+
+        # Data store for backtesting (shared instance)
+        self.data_store = get_data_store()
     
     def _has_resting_order_on_ticker(self, ticker: str) -> bool:
         """
@@ -158,6 +165,9 @@ class TradingStrategy:
                 logger.warning(f"⛔ BLOCKED trade on {market_ticker}: price {new_price}¢ > MAX_BUY_PRICE_CENTS ({Config.MAX_BUY_PRICE_CENTS})")
                 return None
             
+            # Log pre-trade exposure for debugging
+            logger.debug(f"Pre-trade check {market_ticker}: {existing_contracts} contracts, ${existing_dollars:.2f} | Adding: {new_count} @ {new_price}¢ = ${new_dollars:.2f}")
+
             # Block if EITHER limit would be exceeded by this trade
             # Uses > (not >=) to allow trading UP TO the limit (e.g., 3 contracts allowed, block 4th)
             # NOTE: Limits apply to BASE MARKET (e.g., KXHIGHMIA-26FEB01) not per-threshold
@@ -165,7 +175,7 @@ class TradingStrategy:
                 logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed BASE MARKET contract limit")
                 logger.warning(f"   Base market {base_market}: {existing_contracts} + {new_count} = {existing_contracts + new_count} > {Config.MAX_CONTRACTS_PER_MARKET}")
                 return None
-            
+
             if existing_dollars + new_dollars > Config.MAX_DOLLARS_PER_MARKET:
                 logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed BASE MARKET dollar limit")
                 logger.warning(f"   Base market {base_market}: ${existing_dollars:.2f} + ${new_dollars:.2f} = ${existing_dollars + new_dollars:.2f} > ${Config.MAX_DOLLARS_PER_MARKET:.2f}")
@@ -196,7 +206,38 @@ class TradingStrategy:
                 # This ensures subsequent exposure checks see accurate order state
                 self.client.invalidate_orders_cache()
 
-            # Enhanced trade notification  
+            # Store trade in data store for backtesting
+            try:
+                self.data_store.store_trade(
+                    ticker=market_ticker,
+                    side=decision['side'],
+                    action=decision['action'],
+                    count=decision['count'],
+                    price=decision.get('price', 0),
+                    edge=decision.get('edge'),
+                    ev=decision.get('ev'),
+                    strategy_mode=decision.get('strategy_mode'),
+                    market_price=decision.get('price', 0)
+                )
+            except Exception as store_err:
+                logger.debug(f"Could not store trade in data store: {store_err}")
+
+            # Track order with market maker for requote management
+            order_type = decision.get('order_type', 'taker')
+            if hasattr(self, 'market_maker') and order_type == 'maker':
+                try:
+                    self.market_maker.track_order(
+                        order_id=order.get('order_id'),
+                        ticker=market_ticker,
+                        side=decision['side'],
+                        price=decision.get('price', 0),
+                        count=decision['count'],
+                        order_type=order_type
+                    )
+                except Exception as track_err:
+                    logger.debug(f"Could not track order with market maker: {track_err}")
+
+            # Enhanced trade notification
             order_id = order.get('order_id', 'N/A')
             action = decision['action']
             side = decision['side']
@@ -206,7 +247,7 @@ class TradingStrategy:
             # Get current exposure for this market to display
             try:
                 exp = self._get_market_exposure(market_ticker)
-                exposure_str = f" | Exposure: {exp['total_contracts']}/{Config.MAX_CONTRACTS_PER_MARKET} contracts"
+                exposure_str = f" | Exposure: {exp['total_contracts']}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${exp['total_dollars']:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f}"
             except (KeyError, TypeError, ValueError):
                 exposure_str = ""
             
@@ -236,9 +277,9 @@ class TradingStrategy:
             from datetime import datetime
             import csv
             from pathlib import Path
-            
+
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
+
             # Human-readable log
             log_file = "trades.log"
             log_entry = f"[{timestamp}] {message}\n"
@@ -246,25 +287,28 @@ class TradingStrategy:
                 log_entry += f"  Order Details: {order}\n"
             log_entry += f"  Decision: {decision}\n"
             log_entry += "-" * 70 + "\n"
-            
+
             with open(log_file, 'a') as f:
                 f.write(log_entry)
-            
-            # Structured CSV for outcome tracking
+
+            # Structured CSV for outcome tracking (enhanced columns)
             csv_file = Path("data/trades.csv")
             csv_file.parent.mkdir(exist_ok=True)
-            
-            # Create CSV with headers if it doesn't exist
+
+            # Create CSV with headers if it doesn't exist (enhanced columns)
             if not csv_file.exists():
                 with open(csv_file, 'w', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([
-                        'timestamp', 'market_ticker', 'order_id', 'action', 'side', 'count', 
-                        'price', 'edge', 'ev', 'strategy_mode', 'our_probability', 
-                        'market_price', 'status'
+                        'timestamp', 'market_ticker', 'order_id', 'action', 'side', 'count',
+                        'price', 'edge', 'ev', 'strategy_mode', 'our_probability',
+                        'market_price', 'status',
+                        # Enhanced columns for analysis
+                        'mean_forecast', 'forecast_std', 'ci_lower', 'ci_upper',
+                        'time_decay_factor', 'num_sources', 'threshold', 'target_date'
                     ])
-            
-            # Append trade details
+
+            # Append trade details with enhanced columns
             if order:
                 with open(csv_file, 'a', newline='') as f:
                     writer = csv.writer(f)
@@ -279,12 +323,50 @@ class TradingStrategy:
                         decision.get('edge', 0),
                         decision.get('ev', 0),
                         decision.get('strategy_mode', ''),
-                        '',  # our_probability - would need to pass from strategy
+                        decision.get('our_probability', ''),
                         decision.get('price', 0),  # market_price at time of trade
-                        order.get('status', 'unknown')
+                        order.get('status', 'unknown'),
+                        # Enhanced columns
+                        decision.get('mean_forecast', ''),
+                        decision.get('forecast_std', ''),
+                        decision.get('ci_lower', ''),
+                        decision.get('ci_upper', ''),
+                        decision.get('time_decay_factor', ''),
+                        decision.get('num_sources', ''),
+                        decision.get('threshold', ''),
+                        decision.get('target_date', '')
                     ])
         except Exception as e:
             logger.error(f"Error logging trade: {e}")
+
+    def _log_trade_decision(self, market_ticker: str, decision_data: Dict):
+        """
+        Log detailed trade decision data to JSONL file for analysis.
+
+        Writes comprehensive decision context including:
+        - All forecast sources with temperatures and weights
+        - Confidence interval bounds
+        - Position sizing factors
+        - Edge/EV breakdown for both sides
+        - Market context
+        """
+        try:
+            import json
+            from pathlib import Path
+
+            jsonl_file = Path("data/trade_decisions.jsonl")
+            jsonl_file.parent.mkdir(exist_ok=True)
+
+            # Add timestamp
+            decision_data['timestamp'] = datetime.now().isoformat()
+            decision_data['market_ticker'] = market_ticker
+
+            # Write as JSONL (one JSON object per line)
+            with open(jsonl_file, 'a') as f:
+                f.write(json.dumps(decision_data) + '\n')
+
+        except Exception as e:
+            logger.debug(f"Error logging trade decision: {e}")
     
     def _send_notification(self, title: str, message: str):
         """Send macOS notification"""
@@ -334,6 +416,46 @@ class WeatherDailyStrategy(TradingStrategy):
         
         # Track active positions for exit logic
         self.active_positions: Dict[str, Dict] = {}  # {market_ticker: position_info}
+
+        # Scaled edge requirements - require more edge for expensive contracts
+        self.scaled_edge_enabled = Config.SCALED_EDGE_ENABLED
+        self.scaled_edge_price_threshold = Config.SCALED_EDGE_PRICE_THRESHOLD
+        self.scaled_edge_multiplier = Config.SCALED_EDGE_MULTIPLIER
+
+        # Market making mode - post limit orders at better prices
+        self.market_making_enabled = Config.MARKET_MAKING_ENABLED
+        if self.market_making_enabled:
+            self.market_maker = MarketMaker(client)
+            self.order_router = SmartOrderRouter(self.market_maker)
+            logger.info("📈 Market making mode ENABLED - will post limit orders at better prices")
+
+        # Correlation-aware risk management
+        self.risk_manager = CorrelationAwareRisk(client)
+
+        # Data store for backtesting
+        self.data_store = get_data_store()
+
+    def _get_required_edge(self, price: int) -> float:
+        """
+        Calculate required edge threshold based on entry price.
+        Expensive contracts require more edge to be profitable.
+
+        Args:
+            price: Entry price in cents
+
+        Returns:
+            Required edge percentage
+        """
+        if not self.scaled_edge_enabled:
+            return self.min_edge_threshold
+
+        if price <= self.scaled_edge_price_threshold:
+            # Below threshold, use normal edge requirement
+            return self.min_edge_threshold
+        else:
+            # Above threshold, scale up edge requirement
+            # E.g., at 50¢ with 35¢ threshold and 1.5x multiplier: 8% * 1.5 = 12%
+            return self.min_edge_threshold * self.scaled_edge_multiplier
 
     def _calculate_time_decay_factor(self, target_date: datetime, series_ticker: str) -> float:
         """
@@ -1049,31 +1171,95 @@ class WeatherDailyStrategy(TradingStrategy):
                         logger.info(f"📊 SKIP {market_ticker}: longshot YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                         # Fall through to check NO side (don't return yet)
                     else:
+                        # Apply portfolio-wide correlation adjustment via risk manager
+                        position_size = self.risk_manager.adjust_position_size(
+                            position_size, market_ticker, 'yes'
+                        )
+                        if position_size <= 0:
+                            logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                            return None
+
+                        # Determine execution price (market making or taker)
+                        execution_price = best_yes_ask
+                        order_type = 'taker'
+                        if self.market_making_enabled and hasattr(self, 'order_router'):
+                            routes = self.order_router.route_order(
+                                side='yes',
+                                count=position_size,
+                                orderbook=orderbook,
+                                our_fair_value=int(our_prob * 100),
+                                edge=yes_edge,
+                                urgency=Config.MM_ORDER_URGENCY
+                            )
+                            if routes:
+                                execution_price = routes[0]['price']
+                                order_type = routes[0]['type']
+                                if order_type == 'maker':
+                                    logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_yes_ask}¢, saving {best_yes_ask - execution_price}¢)")
+
                         confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
                         logger.info(f"🎯 LONGSHOT YES {market_ticker}: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
-                        logger.info(f"💰 Asymmetric play: Risk ${best_yes_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_yes_ask):.1f}x)")
-                        
+                        logger.info(f"💰 Asymmetric play: Risk ${execution_price/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/execution_price):.1f}x)")
+
                         # Record position for exit logic
                         self.active_positions[market_ticker] = {
                             'side': 'yes',
-                            'entry_price': best_yes_ask,
+                            'entry_price': execution_price,
                             'entry_time': datetime.now(),
                             'count': position_size,
                             'edge': yes_edge,
                             'ev': yes_ev,
                             'strategy_mode': 'longshot'
                         }
-                        
-                        return {
+
+                        # Build enhanced decision with analysis data
+                        time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
+                        corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
+
+                        decision = {
                             'action': 'buy',
                             'side': 'yes',
                             'count': position_size,
-                            'price': best_yes_ask,  # Pay the ask price to get filled
+                            'price': execution_price,
                             'edge': yes_edge,
                             'ev': yes_ev,
-                            'strategy_mode': 'longshot'
+                            'strategy_mode': 'longshot',
+                            'order_type': order_type,
+                            # Enhanced fields for analysis
+                            'our_probability': our_prob,
+                            'mean_forecast': mean_forecast,
+                            'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
+                            'ci_lower': ci_lower_yes,
+                            'ci_upper': ci_upper_yes,
+                            'time_decay_factor': time_factor,
+                            'num_sources': len(forecasts),
+                            'threshold': str(threshold),
+                            'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
                         }
-                
+
+                        # Log detailed trade decision for analysis
+                        self._log_trade_decision(market_ticker, {
+                            'decision': 'longshot_yes',
+                            'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
+                                         for f, s, t in self.weather_agg.forecast_metadata.get(
+                                             f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
+                            'ci_lower': ci_lower_yes,
+                            'ci_upper': ci_upper_yes,
+                            'time_decay_factor': time_factor,
+                            'correlation_factor': corr_data['correlation_factor'],
+                            'liquidity_cap': liquidity_cap,
+                            'yes_edge': yes_edge,
+                            'yes_ev': yes_ev,
+                            'no_edge': no_edge,
+                            'no_ev': no_ev,
+                            'threshold': str(threshold),
+                            'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
+                            'is_longshot': True,
+                            'series_ticker': series_ticker
+                        })
+
+                        return decision
+
                 # Check NO side for longshot opportunity
                 # Use ASK price to check if it's cheap enough
                 if (best_no_ask <= self.longshot_max_price and 
@@ -1151,14 +1337,40 @@ class WeatherDailyStrategy(TradingStrategy):
                         logger.info(f"📊 SKIP {market_ticker}: longshot NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                         return None  # EXPLICIT: Don't trade above price limit
 
+                    # Apply portfolio-wide correlation adjustment via risk manager
+                    position_size = self.risk_manager.adjust_position_size(
+                        position_size, market_ticker, 'no'
+                    )
+                    if position_size <= 0:
+                        logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                        return None
+
+                    # Determine execution price (market making or taker)
+                    execution_price = best_no_ask
+                    order_type = 'taker'
+                    if self.market_making_enabled and hasattr(self, 'order_router'):
+                        routes = self.order_router.route_order(
+                            side='no',
+                            count=position_size,
+                            orderbook=orderbook,
+                            our_fair_value=int(no_prob * 100),
+                            edge=no_edge,
+                            urgency=Config.MM_ORDER_URGENCY
+                        )
+                        if routes:
+                            execution_price = routes[0]['price']
+                            order_type = routes[0]['type']
+                            if order_type == 'maker':
+                                logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_no_ask}¢, saving {best_no_ask - execution_price}¢)")
+
                     confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
                     logger.info(f"🎯 LONGSHOT NO {market_ticker}: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
-                    logger.info(f"💰 Asymmetric play: Risk ${best_no_ask/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/best_no_ask):.1f}x)")
+                    logger.info(f"💰 Asymmetric play: Risk ${execution_price/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/execution_price):.1f}x)")
 
                     # Record position for exit logic
                     self.active_positions[market_ticker] = {
                         'side': 'no',
-                        'entry_price': best_no_ask,
+                        'entry_price': execution_price,
                         'entry_time': datetime.now(),
                         'count': position_size,
                         'edge': no_edge,
@@ -1166,22 +1378,62 @@ class WeatherDailyStrategy(TradingStrategy):
                         'strategy_mode': 'longshot'
                     }
 
-                    return {
+                    # Build enhanced decision with analysis data
+                    time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
+                    corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
+
+                    decision = {
                         'action': 'buy',
                         'side': 'no',
                         'count': position_size,
-                        'price': best_no_ask,  # Pay the ask price to get filled
+                        'price': execution_price,
                         'edge': no_edge,
                         'ev': no_ev,
-                        'strategy_mode': 'longshot'
+                        'strategy_mode': 'longshot',
+                        'order_type': order_type,
+                        # Enhanced fields for analysis
+                        'our_probability': no_prob,
+                        'mean_forecast': mean_forecast,
+                        'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
+                        'ci_lower': ci_lower_no,
+                        'ci_upper': ci_upper_no,
+                        'time_decay_factor': time_factor,
+                        'num_sources': len(forecasts),
+                        'threshold': str(threshold),
+                        'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
                     }
-            
+
+                    # Log detailed trade decision for analysis
+                    self._log_trade_decision(market_ticker, {
+                        'decision': 'longshot_no',
+                        'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
+                                     for f, s, t in self.weather_agg.forecast_metadata.get(
+                                         f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
+                        'ci_lower': ci_lower_no,
+                        'ci_upper': ci_upper_no,
+                        'time_decay_factor': time_factor,
+                        'correlation_factor': corr_data['correlation_factor'],
+                        'liquidity_cap': liquidity_cap,
+                        'yes_edge': yes_edge,
+                        'yes_ev': yes_ev,
+                        'no_edge': no_edge,
+                        'no_ev': no_ev,
+                        'threshold': str(threshold),
+                        'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
+                        'is_longshot': True,
+                        'series_ticker': series_ticker
+                    })
+
+                    return decision
+
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             # Optionally require confidence interval to not overlap market price (REQUIRE_HIGH_CONFIDENCE)
             high_confidence_yes = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
             high_confidence_no = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
             
-            if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_yes):
+            # Get required edge based on price (scaled edge for expensive contracts)
+            required_yes_edge = self._get_required_edge(best_yes_ask)
+            if yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_yes):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and our_prob > 0.7 and (ci_lower_yes > best_yes_ask / 100.0)
@@ -1252,12 +1504,38 @@ class WeatherDailyStrategy(TradingStrategy):
                     logger.info(f"📊 SKIP {market_ticker}: conservative YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                     return None  # EXPLICIT: Don't trade above price limit
 
-                logger.info(f"✓ Conservative YES {market_ticker}: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Ask: {best_yes_ask}¢")
+                # Apply portfolio-wide correlation adjustment via risk manager
+                position_size = self.risk_manager.adjust_position_size(
+                    position_size, market_ticker, 'yes'
+                )
+                if position_size <= 0:
+                    logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                    return None
+
+                # Determine execution price (market making or taker)
+                execution_price = best_yes_ask
+                order_type = 'taker'
+                if self.market_making_enabled and hasattr(self, 'order_router'):
+                    routes = self.order_router.route_order(
+                        side='yes',
+                        count=position_size,
+                        orderbook=orderbook,
+                        our_fair_value=int(our_prob * 100),
+                        edge=yes_edge,
+                        urgency=Config.MM_ORDER_URGENCY
+                    )
+                    if routes:
+                        execution_price = routes[0]['price']
+                        order_type = routes[0]['type']
+                        if order_type == 'maker':
+                            logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_yes_ask}¢, saving {best_yes_ask - execution_price}¢)")
+
+                logger.info(f"✓ Conservative YES {market_ticker}: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Price: {execution_price}¢")
 
                 # Record position for exit logic
                 self.active_positions[market_ticker] = {
                     'side': 'yes',
-                    'entry_price': best_yes_ask,
+                    'entry_price': execution_price,
                     'entry_time': datetime.now(),
                     'count': position_size,
                     'edge': yes_edge,
@@ -1265,16 +1543,57 @@ class WeatherDailyStrategy(TradingStrategy):
                     'strategy_mode': 'conservative'
                 }
 
-                return {
+                # Build enhanced decision with analysis data
+                time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
+                corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
+
+                decision = {
                     'action': 'buy',
                     'side': 'yes',
                     'count': position_size,
-                    'price': best_yes_ask,  # Pay the ask price to get filled
+                    'price': execution_price,
                     'edge': yes_edge,
                     'ev': yes_ev,
-                    'strategy_mode': 'conservative'
+                    'strategy_mode': 'conservative',
+                    'order_type': order_type,
+                    # Enhanced fields for analysis
+                    'our_probability': our_prob,
+                    'mean_forecast': mean_forecast,
+                    'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
+                    'ci_lower': ci_lower_yes,
+                    'ci_upper': ci_upper_yes,
+                    'time_decay_factor': time_factor,
+                    'num_sources': len(forecasts),
+                    'threshold': str(threshold),
+                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
                 }
-            elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_no):
+
+                # Log detailed trade decision for analysis
+                self._log_trade_decision(market_ticker, {
+                    'decision': 'conservative_yes',
+                    'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
+                                 for f, s, t in self.weather_agg.forecast_metadata.get(
+                                     f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
+                    'ci_lower': ci_lower_yes,
+                    'ci_upper': ci_upper_yes,
+                    'time_decay_factor': time_factor,
+                    'correlation_factor': corr_data['correlation_factor'],
+                    'liquidity_cap': liquidity_cap,
+                    'yes_edge': yes_edge,
+                    'yes_ev': yes_ev,
+                    'no_edge': no_edge,
+                    'no_ev': no_ev,
+                    'threshold': str(threshold),
+                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
+                    'is_longshot': False,
+                    'series_ticker': series_ticker
+                })
+
+                return decision
+
+            # Get required edge based on price (scaled edge for expensive contracts)
+            required_no_edge = self._get_required_edge(best_no_ask)
+            if no_edge >= required_no_edge and no_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_no):
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and no_prob > 0.7 and (ci_lower_no > best_no_ask / 100.0)
@@ -1345,12 +1664,38 @@ class WeatherDailyStrategy(TradingStrategy):
                     logger.info(f"📊 SKIP {market_ticker}: conservative NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                     return None  # EXPLICIT: Don't trade above price limit
 
-                logger.info(f"✓ Conservative NO {market_ticker}: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Ask: {best_no_ask}¢")
+                # Apply portfolio-wide correlation adjustment via risk manager
+                position_size = self.risk_manager.adjust_position_size(
+                    position_size, market_ticker, 'no'
+                )
+                if position_size <= 0:
+                    logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                    return None
+
+                # Determine execution price (market making or taker)
+                execution_price = best_no_ask
+                order_type = 'taker'
+                if self.market_making_enabled and hasattr(self, 'order_router'):
+                    routes = self.order_router.route_order(
+                        side='no',
+                        count=position_size,
+                        orderbook=orderbook,
+                        our_fair_value=int(no_prob * 100),
+                        edge=no_edge,
+                        urgency=Config.MM_ORDER_URGENCY
+                    )
+                    if routes:
+                        execution_price = routes[0]['price']
+                        order_type = routes[0]['type']
+                        if order_type == 'maker':
+                            logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_no_ask}¢, saving {best_no_ask - execution_price}¢)")
+
+                logger.info(f"✓ Conservative NO {market_ticker}: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Price: {execution_price}¢")
 
                 # Record position for exit logic
                 self.active_positions[market_ticker] = {
                     'side': 'no',
-                    'entry_price': best_no_ask,
+                    'entry_price': execution_price,
                     'entry_time': datetime.now(),
                     'count': position_size,
                     'edge': no_edge,
@@ -1358,25 +1703,64 @@ class WeatherDailyStrategy(TradingStrategy):
                     'strategy_mode': 'conservative'
                 }
 
-                return {
+                # Build enhanced decision with analysis data
+                time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
+                corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
+
+                decision = {
                     'action': 'buy',
                     'side': 'no',
                     'count': position_size,
-                    'price': best_no_ask,  # Pay the ask price to get filled
+                    'price': execution_price,
                     'edge': no_edge,
                     'ev': no_ev,
-                    'strategy_mode': 'conservative'
+                    'strategy_mode': 'conservative',
+                    'order_type': order_type,
+                    # Enhanced fields for analysis
+                    'our_probability': no_prob,
+                    'mean_forecast': mean_forecast,
+                    'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
+                    'ci_lower': ci_lower_no,
+                    'ci_upper': ci_upper_no,
+                    'time_decay_factor': time_factor,
+                    'num_sources': len(forecasts),
+                    'threshold': str(threshold),
+                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
                 }
-            
+
+                # Log detailed trade decision for analysis
+                self._log_trade_decision(market_ticker, {
+                    'decision': 'conservative_no',
+                    'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
+                                 for f, s, t in self.weather_agg.forecast_metadata.get(
+                                     f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
+                    'ci_lower': ci_lower_no,
+                    'ci_upper': ci_upper_no,
+                    'time_decay_factor': time_factor,
+                    'correlation_factor': corr_data['correlation_factor'],
+                    'liquidity_cap': liquidity_cap,
+                    'yes_edge': yes_edge,
+                    'yes_ev': yes_ev,
+                    'no_edge': no_edge,
+                    'no_ev': no_ev,
+                    'threshold': str(threshold),
+                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
+                    'is_longshot': False,
+                    'series_ticker': series_ticker
+                })
+
+                return decision
+
             # Diagnostic: log why we didn't trade (helps debug "no purchases")
             best_edge = max(yes_edge, no_edge)
             best_ev = max(yes_ev, no_ev)
-            if yes_edge >= self.min_edge_threshold and yes_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_yes:
+            min_required_edge = min(required_yes_edge, required_no_edge)
+            if yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_yes:
                 reason = f"YES edge {yes_edge:.1f}% EV ${yes_ev:.4f} ok but CI overlaps ask (REQUIRE_HIGH_CONFIDENCE=false to allow)"
-            elif no_edge >= self.min_edge_threshold and no_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_no:
+            elif no_edge >= required_no_edge and no_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_no:
                 reason = f"NO edge {no_edge:.1f}% EV ${no_ev:.4f} ok but CI overlaps ask (REQUIRE_HIGH_CONFIDENCE=false to allow)"
-            elif best_edge < self.min_edge_threshold:
-                reason = f"best edge {best_edge:.1f}% < {self.min_edge_threshold}%"
+            elif best_edge < min_required_edge:
+                reason = f"best edge {best_edge:.1f}% < {min_required_edge:.1f}%"
             elif best_ev < self.min_ev_threshold:
                 reason = f"edge ok, best EV ${best_ev:.4f} < ${self.min_ev_threshold}"
             else:
@@ -1439,41 +1823,46 @@ class WeatherDailyStrategy(TradingStrategy):
             current_ask = current_yes_ask if side == 'yes' else current_no_ask
             
             # Calculate current profit/loss
+            # For both YES and NO: profit = what we can sell for now - what we paid
+            # We can sell by placing an order on the opposite side
             if side == 'yes':
-                # If YES wins, we get $1 per contract
-                # Current value = current_yes_ask / 100
-                current_value = current_ask / 100.0
-                entry_cost = entry_price / 100.0
-                profit_pct = ((current_value - entry_cost) / entry_cost) * 100 if entry_cost > 0 else 0
+                # We own YES, can sell at YES bid price
+                sell_price = yes_orders[-1][0] if yes_orders else 50
             else:
-                # If NO wins, we get $1 per contract
-                current_value = current_ask / 100.0
-                entry_cost = entry_price / 100.0
-                profit_pct = ((current_value - entry_cost) / entry_cost) * 100 if entry_cost > 0 else 0
-            
-            # Exit condition 1: Take profit (price moved 20%+ in our favor)
-            if profit_pct >= 20:
-                logger.info(f"Taking profit on {market_ticker}: {side.upper()} entry {entry_price}¢ -> current {current_ask}¢ ({profit_pct:.1f}% profit)")
+                # We own NO, can sell at NO bid price
+                sell_price = no_orders[-1][0] if no_orders else 50
+
+            entry_cost = entry_price / 100.0
+            current_value = sell_price / 100.0
+            profit_cents = sell_price - entry_price
+            profit_pct = ((current_value - entry_cost) / entry_cost) * 100 if entry_cost > 0 else 0
+
+            # Exit condition 1: Take profit (configurable threshold)
+            take_profit_threshold = Config.EXIT_TAKE_PROFIT_PERCENT
+            min_profit_cents = Config.EXIT_MIN_PROFIT_CENTS
+            if profit_pct >= take_profit_threshold and profit_cents >= min_profit_cents:
+                logger.info(f"💰 Taking profit on {market_ticker}: {side.upper()} entry {entry_price}¢ -> sell {sell_price}¢ ({profit_pct:.1f}% / {profit_cents}¢ profit)")
                 del self.active_positions[market_ticker]
                 return {
                     'action': 'sell',
                     'side': side,
                     'count': position.get('count', 1),
-                    'price': int(current_ask - 1),  # Slightly below ask to exit quickly
+                    'price': int(sell_price - 1),  # Slightly below bid to exit quickly
                     'reason': 'take_profit'
                 }
             
             # Exit condition 2: Stop loss (price moved 30%+ against us)
-            if profit_pct <= -30:
-                logger.warning(f"Stop loss triggered on {market_ticker}: {side.upper()} entry {entry_price}¢ -> current {current_ask}¢ ({profit_pct:.1f}% loss)")
-                del self.active_positions[market_ticker]
-                return {
-                    'action': 'sell',
-                    'side': side,
-                    'count': position.get('count', 1),
-                    'price': int(current_ask - 1),
-                    'reason': 'stop_loss'
-                }
+            # Disabled for now - weather markets often recover, stop loss causes unnecessary losses
+            # if profit_pct <= -30:
+            #     logger.warning(f"Stop loss triggered on {market_ticker}: {side.upper()} entry {entry_price}¢ -> sell {sell_price}¢ ({profit_pct:.1f}% loss)")
+            #     del self.active_positions[market_ticker]
+            #     return {
+            #         'action': 'sell',
+            #         'side': side,
+            #         'count': position.get('count', 1),
+            #         'price': int(sell_price - 1),
+            #         'reason': 'stop_loss'
+            #     }
             
             # Exit condition 3: Edge disappeared (re-evaluate market)
             # Re-run strategy evaluation to check if edge still exists
@@ -1494,15 +1883,20 @@ class WeatherDailyStrategy(TradingStrategy):
                             break
                 
                 if not edge_still_exists and entry_edge > 0:
-                    logger.info(f"Edge disappeared on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), exiting")
-                    del self.active_positions[market_ticker]
-                    return {
-                        'action': 'sell',
-                        'side': side,
-                        'count': position.get('count', 1),
-                        'price': int(current_ask - 1),
-                        'reason': 'edge_gone'
-                    }
+                    # Only exit on edge disappearing if we're not losing too much
+                    # This prevents panic selling at a loss when edge fluctuates
+                    if profit_pct >= -10:  # Only exit if not losing more than 10%
+                        logger.info(f"📉 Edge disappeared on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), exiting at {sell_price}¢")
+                        del self.active_positions[market_ticker]
+                        return {
+                            'action': 'sell',
+                            'side': side,
+                            'count': position.get('count', 1),
+                            'price': int(sell_price - 1),
+                            'reason': 'edge_gone'
+                        }
+                    else:
+                        logger.debug(f"Edge gone on {market_ticker} but holding (loss: {profit_pct:.1f}%)")
             except Exception as e:
                 logger.debug(f"Could not re-evaluate edge for {market_ticker}: {e}")
             

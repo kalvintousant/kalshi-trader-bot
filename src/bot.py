@@ -3,7 +3,7 @@ import json
 import time
 import requests
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Set
 from src.kalshi_client import KalshiClient
 from src.strategies import StrategyManager
@@ -173,7 +173,6 @@ class KalshiTradingBot:
                 last_update = order.get('last_update_time')
                 if last_update:
                     try:
-                        from datetime import datetime, timezone
                         update_time = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
                         now = datetime.now(timezone.utc)
                         if (now - update_time).total_seconds() > 300:  # 5 minutes
@@ -218,16 +217,38 @@ class KalshiTradingBot:
                 return
             if not resting_orders:
                 return
-            
+
             for order in resting_orders:
                 order_id = order.get('order_id')
                 ticker = order.get('ticker')
                 side = order.get('side')
                 order_price = order.get('yes_price') or order.get('no_price', 0)
-                
+
                 if not ticker:
                     continue
-                
+
+                # IMPORTANT: Check order age before considering cancellation
+                # This prevents the place->cancel->place churn loop
+                created_time = order.get('created_time')
+                if created_time:
+                    try:
+                        # Parse ISO format timestamp
+                        if created_time.endswith('Z'):
+                            created_dt = datetime.fromisoformat(created_time.replace('Z', '+00:00'))
+                        else:
+                            created_dt = datetime.fromisoformat(created_time)
+
+                        now = datetime.now(timezone.utc)
+                        age_minutes = (now - created_dt).total_seconds() / 60
+
+                        min_age = Config.STALE_ORDER_MIN_AGE_MINUTES
+                        if age_minutes < min_age:
+                            logger.debug(f"Skipping stale check for {order_id}: order is only {age_minutes:.1f} min old (min: {min_age} min)")
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Could not parse order time for {order_id}: {e}")
+                        # Continue with cancellation check if we can't parse time
+
                 # Get current market data
                 try:
                     # Get market info - fetch by specific ticker to avoid missing it in large lists
@@ -512,7 +533,24 @@ class KalshiTradingBot:
             except Exception as e:
                 logger.warning(f"WebSocket error: {e}, reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
-    
+
+    def _manage_market_maker_orders(self):
+        """
+        Manage market maker orders - requote if outbid.
+
+        This iterates through all strategies that have market making enabled
+        and calls their market maker's manage_orders() method.
+        """
+        try:
+            for strategy in self.strategy_manager.strategies:
+                if hasattr(strategy, 'market_maker') and strategy.market_making_enabled:
+                    managed_count = len(strategy.market_maker.get_managed_orders())
+                    if managed_count > 0:
+                        logger.debug(f"Managing {managed_count} market maker orders...")
+                        strategy.market_maker.manage_orders()
+        except Exception as e:
+            logger.debug(f"Error managing market maker orders: {e}")
+
     def run(self, use_websocket: bool = False):
         """Run the trading bot"""
         self.running = True
@@ -557,7 +595,10 @@ class KalshiTradingBot:
                     
                     # Check and cancel stale orders (edge/EV no longer valid)
                     self.check_and_cancel_stale_orders()
-                    
+
+                    # Manage market maker orders (requote if outbid)
+                    self._manage_market_maker_orders()
+
                     # Check for settled positions and update forecast model (every hour)
                     outcome_check_interval = 3600  # 1 hour
                     if self.outcome_tracker and time.time() - self.last_outcome_check >= outcome_check_interval:

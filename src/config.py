@@ -39,8 +39,8 @@ class Config:
     # Market filtering
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '3'))  # Max days in future for forecasts
-    # Never buy at or above this price (cents). 99 = no buys at 99¢ or 100¢ (no edge).
-    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '75'))  # Cap at 75¢ to avoid expensive losing positions
+    # Never buy at or above this price (cents). Data shows 51-75¢ entries lose money (42% win rate).
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '50'))  # Cap at 50¢ - profitable win rates at 1-50¢ entries
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
     MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '2.0'))  # Skip trades within 2°F of threshold (reduces coin-flip losses)
@@ -67,7 +67,25 @@ class Config:
     MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '5'))  # Min samples before applying bias correction
 
     # Exit/Sell Logic
-    EXIT_LOGIC_ENABLED = os.getenv('EXIT_LOGIC_ENABLED', 'false').lower() == 'true'  # Disabled by default
+    EXIT_LOGIC_ENABLED = os.getenv('EXIT_LOGIC_ENABLED', 'true').lower() == 'true'  # Enabled - sell when profitable
+    EXIT_TAKE_PROFIT_PERCENT = float(os.getenv('EXIT_TAKE_PROFIT_PERCENT', '30.0'))  # Sell when position is +30% profitable
+    EXIT_MIN_PROFIT_CENTS = int(os.getenv('EXIT_MIN_PROFIT_CENTS', '5'))  # Minimum 5¢ profit to trigger exit
+
+    # Stale Order Management
+    STALE_ORDER_MIN_AGE_MINUTES = int(os.getenv('STALE_ORDER_MIN_AGE_MINUTES', '5'))  # Don't cancel orders younger than 5 min
+
+    # Scaled Edge Requirements (require more edge for expensive contracts)
+    SCALED_EDGE_ENABLED = os.getenv('SCALED_EDGE_ENABLED', 'true').lower() == 'true'
+    SCALED_EDGE_PRICE_THRESHOLD = int(os.getenv('SCALED_EDGE_PRICE_THRESHOLD', '35'))  # Apply scaling above 35¢
+    SCALED_EDGE_MULTIPLIER = float(os.getenv('SCALED_EDGE_MULTIPLIER', '1.5'))  # Require 1.5x edge for expensive contracts
+
+    # Market Making Mode (post limit orders at better prices instead of paying the ask)
+    MARKET_MAKING_ENABLED = os.getenv('MARKET_MAKING_ENABLED', 'true').lower() == 'true'
+    MM_MIN_SPREAD_TO_MAKE = int(os.getenv('MM_MIN_SPREAD_TO_MAKE', '3'))  # Minimum spread to post maker orders
+    MM_MAX_SPREAD_TO_MAKE = int(os.getenv('MM_MAX_SPREAD_TO_MAKE', '15'))  # Don't make very wide markets
+    MM_REQUOTE_THRESHOLD = int(os.getenv('MM_REQUOTE_THRESHOLD', '2'))  # Requote if outbid by this many cents
+    MM_AGGRESSIVE_EDGE_THRESHOLD = float(os.getenv('MM_AGGRESSIVE_EDGE_THRESHOLD', '25.0'))  # Take liquidity if edge > this
+    MM_ORDER_URGENCY = os.getenv('MM_ORDER_URGENCY', 'normal')  # 'low', 'normal', 'high'
 
     # Position Sizing Enhancements
     # 1. Time Decay: Reduce position size based on hours until temperature extreme

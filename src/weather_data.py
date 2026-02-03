@@ -90,6 +90,25 @@ class WeatherDataAggregator:
         self.pirate_weather_api_key = os.getenv('PIRATE_WEATHER_API_KEY', '')
         self.visual_crossing_api_key = os.getenv('VISUAL_CROSSING_API_KEY', '')
 
+        # Source enable/disable flags (for testing NOAA-only mode)
+        self.enable_nws = os.getenv('ENABLE_NWS', 'true').lower() == 'true'
+        self.enable_nws_mos = os.getenv('ENABLE_NWS_MOS', 'true').lower() == 'true'
+        self.enable_open_meteo = os.getenv('ENABLE_OPEN_METEO', 'true').lower() == 'true'
+        self.enable_pirate_weather = os.getenv('ENABLE_PIRATE_WEATHER', 'true').lower() == 'true'
+        self.enable_visual_crossing = os.getenv('ENABLE_VISUAL_CROSSING', 'true').lower() == 'true'
+        self.enable_tomorrowio = os.getenv('ENABLE_TOMORROWIO', 'true').lower() == 'true'
+        self.enable_forecast_logging = os.getenv('ENABLE_FORECAST_LOGGING', 'true').lower() == 'true'
+
+        # Log enabled sources on init
+        enabled_sources = []
+        if self.enable_nws: enabled_sources.append('NWS')
+        if self.enable_nws_mos: enabled_sources.append('NWS_MOS')
+        if self.enable_open_meteo: enabled_sources.append('Open-Meteo')
+        if self.enable_pirate_weather and self.pirate_weather_api_key: enabled_sources.append('Pirate Weather')
+        if self.enable_visual_crossing and self.visual_crossing_api_key: enabled_sources.append('Visual Crossing')
+        if self.enable_tomorrowio and self.tomorrowio_api_key: enabled_sources.append('Tomorrow.io')
+        logger.info(f"🌡️ Weather sources enabled: {', '.join(enabled_sources) if enabled_sources else 'NONE'}")
+
         # Cache for forecasts (from Config)
         # Based on AUSHIGH contract rules: daily markets, forecasts update 2-4x/day
         # Cache TTL balances freshness with API rate limits
@@ -152,16 +171,28 @@ class WeatherDataAggregator:
                 import csv
                 writer = csv.writer(f)
                 writer.writerow([
-                    'timestamp', 'series_ticker', 'target_date', 'source', 
-                    'forecast_temp', 'market_type'
+                    'timestamp', 'series_ticker', 'target_date', 'source',
+                    'forecast_temp', 'market_type', 'hours_until_settlement', 'city'
                 ])
-    
-    def _log_source_forecast(self, series_ticker: str, target_date: datetime, 
+
+    def _log_source_forecast(self, series_ticker: str, target_date: datetime,
                             source: str, forecast_temp: float):
-        """Log individual source forecast to CSV for later analysis"""
+        """Log individual source forecast to CSV for later accuracy analysis"""
+        if not self.enable_forecast_logging:
+            return
+
         try:
             import csv
             market_type = 'low' if 'LOW' in series_ticker else 'high'
+
+            # Extract city from series ticker (e.g., KXHIGHNY -> NY)
+            city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+
+            # Calculate hours until settlement (roughly 11 PM local for daily markets)
+            # Use a simple estimate - actual settlement time varies by city
+            settlement_time = datetime.combine(target_date.date(), datetime.max.time().replace(hour=23, minute=0))
+            hours_until = max(0, (settlement_time - datetime.now()).total_seconds() / 3600)
+
             with open(self.forecasts_log_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -170,7 +201,9 @@ class WeatherDataAggregator:
                     target_date.date().isoformat(),
                     source,
                     f"{forecast_temp:.2f}",
-                    market_type
+                    market_type,
+                    f"{hours_until:.1f}",
+                    city
                 ])
         except Exception as e:
             logger.debug(f"Error logging source forecast: {e}")
@@ -1195,30 +1228,52 @@ class WeatherDataAggregator:
         forecast_data = []  # List of (temp, source, timestamp) tuples
 
         # Define all forecast sources to fetch in parallel
-        # Tier 1: High-limit free sources (fetch always)
-        # Tier 2: Limited free tier sources (fetch if Tier 1 < 3 forecasts)
-        # Tier 3: Very limited sources (fallback only)
+        # Sources are conditionally enabled via environment variables
+        # NOAA-only mode: set ENABLE_OPEN_METEO=false, ENABLE_PIRATE_WEATHER=false, etc.
 
         with ThreadPoolExecutor(max_workers=8) as executor:
-            # Tier 1: High-limit free sources
-            tier1_futures = {
-                executor.submit(self.get_forecast_nws, lat, lon, target_date, series_ticker): 'nws',
-                executor.submit(self.get_forecast_nws_mos, lat, lon, target_date, series_ticker): 'nws_mos',
-                executor.submit(self.get_forecast_tomorrowio, lat, lon, target_date, series_ticker): 'tomorrowio',
-                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'best_match'): 'open_meteo_best',
-                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'gfs_seamless'): 'open_meteo_gfs',
-                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'ecmwf_ifs04'): 'open_meteo_ecmwf',
-                executor.submit(self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'icon_seamless'): 'open_meteo_icon',
-            }
+            tier1_futures = {}
 
-            # Add Pirate Weather if API key available
-            if self.pirate_weather_api_key:
+            # NOAA sources (NWS and NWS MOS) - most reliable, matches Kalshi settlement
+            if self.enable_nws:
+                tier1_futures[executor.submit(
+                    self.get_forecast_nws, lat, lon, target_date, series_ticker
+                )] = 'nws'
+
+            if self.enable_nws_mos:
+                tier1_futures[executor.submit(
+                    self.get_forecast_nws_mos, lat, lon, target_date, series_ticker
+                )] = 'nws_mos'
+
+            # Tomorrow.io (if enabled and API key available)
+            if self.enable_tomorrowio and self.tomorrowio_api_key:
+                tier1_futures[executor.submit(
+                    self.get_forecast_tomorrowio, lat, lon, target_date, series_ticker
+                )] = 'tomorrowio'
+
+            # Open-Meteo models (if enabled)
+            if self.enable_open_meteo:
+                tier1_futures[executor.submit(
+                    self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'best_match'
+                )] = 'open_meteo_best'
+                tier1_futures[executor.submit(
+                    self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'gfs_seamless'
+                )] = 'open_meteo_gfs'
+                tier1_futures[executor.submit(
+                    self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'ecmwf_ifs04'
+                )] = 'open_meteo_ecmwf'
+                tier1_futures[executor.submit(
+                    self.get_forecast_open_meteo, lat, lon, target_date, series_ticker, 'icon_seamless'
+                )] = 'open_meteo_icon'
+
+            # Pirate Weather (if enabled and API key available)
+            if self.enable_pirate_weather and self.pirate_weather_api_key:
                 tier1_futures[executor.submit(
                     self.get_forecast_pirate_weather, lat, lon, target_date, series_ticker
                 )] = 'pirate_weather'
 
-            # Add Visual Crossing if API key available
-            if self.visual_crossing_api_key:
+            # Visual Crossing (if enabled and API key available)
+            if self.enable_visual_crossing and self.visual_crossing_api_key:
                 tier1_futures[executor.submit(
                     self.get_forecast_visual_crossing, lat, lon, target_date, series_ticker
                 )] = 'visual_crossing'
@@ -1233,6 +1288,9 @@ class WeatherDataAggregator:
                         # Apply bias correction
                         corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
                         forecast_data.append((corrected_temp, source, timestamp))
+                        # Log each source at INFO level for analysis
+                        weight = self.source_weights.get(source, 0.8)
+                        logger.info(f"  {source}: {corrected_temp:.1f}°F (weight={weight:.2f})")
                 except Exception as e:
                     source = tier1_futures[future]
                     logger.debug(f"Error fetching from {source}: {e}")
@@ -1373,8 +1431,7 @@ class WeatherDataAggregator:
                 if abs(ensemble_mean - mean_temp) < 3.0:  # Within 3°F
                     # Blend means (60% multi-source, 40% ensemble)
                     mean_temp = 0.6 * mean_temp + 0.4 * ensemble_mean
-                logger.debug(f"Using ensemble uncertainty: std={ensemble_std:.2f}°F "
-                           f"({ensemble_data['n_members']} members from {ensemble_data['source']})")
+                logger.info(f"  Ensemble: std={ensemble_std:.1f}°F ({ensemble_data['n_members']} members from {ensemble_data['source']})")
 
         # Dynamic standard deviation calculation
         if ensemble_std is not None:
