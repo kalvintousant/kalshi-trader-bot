@@ -29,7 +29,8 @@ class KalshiTradingBot:
         self.markets_being_tracked = set()
         self.daily_pnl = 0
         self.last_reset_date = datetime.now().date()
-        self.starting_account_value = None  # Track starting account value for daily P&L
+        self.starting_weather_exposure = None  # Track starting weather position value for daily P&L
+        self.today_start_timestamp = None  # Timestamp for filtering today's fills/settlements
         
         # Track seen markets to detect new ones quickly
         self.seen_markets: Set[str] = set()
@@ -54,40 +55,99 @@ class KalshiTradingBot:
         """Reset daily statistics"""
         today = datetime.now().date()
         if today > self.last_reset_date:
-            # Get starting account value (balance + portfolio_value) for the day
-            portfolio = self.client.get_portfolio(use_cache=False)  # Force fresh data for daily reset
-            balance = portfolio.get('balance', 0) / 100.0  # Convert cents to dollars
-            portfolio_value = portfolio.get('portfolio_value', 0) / 100.0
-            self.starting_account_value = balance + portfolio_value
+            # Get starting weather position exposure for the day
+            self.starting_weather_exposure = self._get_weather_exposure()
+            # Set timestamp to filter today's fills/settlements (midnight local time)
+            self.today_start_timestamp = int(datetime.combine(today, datetime.min.time()).timestamp() * 1000)
             self.daily_pnl = 0
             self.last_reset_date = today
             logger.info(f"Daily stats reset for {today}")
-            logger.info(f"Starting account value: ${self.starting_account_value:.2f}")
+            logger.info(f"Starting weather exposure: ${self.starting_weather_exposure:.2f}")
     
+    def _is_weather_ticker(self, ticker: str) -> bool:
+        """Check if a ticker belongs to a weather market"""
+        if not ticker:
+            return False
+        # Check if ticker starts with any weather series prefix
+        for series in Config.WEATHER_SERIES:
+            if ticker.startswith(series):
+                return True
+        return False
+
+    def _get_weather_exposure(self) -> float:
+        """Get total market exposure for weather positions only"""
+        positions = self.client.get_positions()
+        weather_exposure = 0.0
+        for pos in positions:
+            ticker = pos.get('ticker', '')
+            if self._is_weather_ticker(ticker):
+                # market_exposure is in cents
+                weather_exposure += pos.get('market_exposure', 0) / 100.0
+        return weather_exposure
+
+    def _get_todays_weather_fills_cost(self) -> float:
+        """Get total cost of weather market fills made today"""
+        if self.today_start_timestamp is None:
+            return 0.0
+        fills = self.client.get_all_fills(since_ts=self.today_start_timestamp, action_filter='buy')
+        cost = 0.0
+        for fill in fills:
+            ticker = fill.get('ticker', '')
+            if self._is_weather_ticker(ticker):
+                # Fill has 'count' (contracts) and 'yes_price' or 'no_price' in cents
+                count = fill.get('count', 0)
+                # Price depends on side
+                if fill.get('side') == 'yes':
+                    price = fill.get('yes_price', 0)
+                else:
+                    price = fill.get('no_price', 0)
+                cost += (count * price) / 100.0  # Convert cents to dollars
+        return cost
+
+    def _get_todays_weather_settlements(self) -> float:
+        """Get total settlements (payouts) from weather markets today"""
+        if self.today_start_timestamp is None:
+            return 0.0
+        settlements = self.client.get_all_settlements(since_ts=self.today_start_timestamp)
+        payout = 0.0
+        for settlement in settlements:
+            ticker = settlement.get('ticker', '')
+            if self._is_weather_ticker(ticker):
+                # revenue is in cents (can be positive payout or negative loss)
+                payout += settlement.get('revenue', 0) / 100.0
+        return payout
+
     def check_daily_loss_limit(self):
-        """Check if we've hit daily loss limit based on total portfolio P&L"""
+        """Check if we've hit daily loss limit based on weather-only P&L"""
         self.reset_daily_stats()
-        
-        # Get current account value (cash balance + portfolio value)
-        portfolio = self.client.get_portfolio()  # Uses cache
-        balance = portfolio.get('balance', 0) / 100.0  # Convert cents to dollars
-        portfolio_value = portfolio.get('portfolio_value', 0) / 100.0
-        current_account_value = balance + portfolio_value
-        
-        # Calculate daily P&L from account value change
-        if self.starting_account_value is not None:
-            self.daily_pnl = current_account_value - self.starting_account_value
+
+        # Get current weather exposure
+        current_weather_exposure = self._get_weather_exposure()
+
+        # Calculate daily P&L for weather markets only
+        # P&L = (current exposure + settlements) - (starting exposure + fills cost)
+        if self.starting_weather_exposure is not None:
+            todays_fills_cost = self._get_todays_weather_fills_cost()
+            todays_settlements = self._get_todays_weather_settlements()
+
+            # Total invested = starting exposure + new buys today
+            total_invested = self.starting_weather_exposure + todays_fills_cost
+            # Total return = current exposure + settlements received
+            total_return = current_weather_exposure + todays_settlements
+
+            self.daily_pnl = total_return - total_invested
         else:
             # First check of the day - set starting value
-            self.starting_account_value = current_account_value
+            self.starting_weather_exposure = current_weather_exposure
+            self.today_start_timestamp = int(datetime.combine(datetime.now().date(), datetime.min.time()).timestamp() * 1000)
             self.daily_pnl = 0
-        
+
         # Check if we've hit the loss limit
         if self.daily_pnl <= -Config.MAX_DAILY_LOSS:
-            logger.critical(f"⛔ Daily loss limit reached!")
-            logger.critical(f"Starting value: ${self.starting_account_value:.2f}")
-            logger.critical(f"Current value: ${current_account_value:.2f}")
-            logger.critical(f"Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+            logger.critical(f"⛔ Daily loss limit reached (weather markets only)!")
+            logger.critical(f"Starting weather exposure: ${self.starting_weather_exposure:.2f}")
+            logger.critical(f"Current weather exposure: ${current_weather_exposure:.2f}")
+            logger.critical(f"Weather P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
             return True
         return False
     
@@ -492,14 +552,19 @@ class KalshiTradingBot:
                         balance = portfolio.get('balance', 0) / 100  # Convert cents to dollars
                         portfolio_value = portfolio.get('portfolio_value', 0) / 100  # Convert cents to dollars
                         total_value = balance + portfolio_value
-                        
-                        # Update daily P&L for heartbeat
-                        if self.starting_account_value is not None:
-                            self.daily_pnl = total_value - self.starting_account_value
-                        
+
+                        # Update weather-only daily P&L for heartbeat
+                        current_weather_exposure = self._get_weather_exposure()
+                        if self.starting_weather_exposure is not None:
+                            todays_fills_cost = self._get_todays_weather_fills_cost()
+                            todays_settlements = self._get_todays_weather_settlements()
+                            total_invested = self.starting_weather_exposure + todays_fills_cost
+                            total_return = current_weather_exposure + todays_settlements
+                            self.daily_pnl = total_return - total_invested
+
                         logger.info(f"❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h")
-                        logger.info(f"   Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
-                        logger.info(f"   Daily P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+                        logger.info(f"   Account - Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
+                        logger.info(f"   Weather P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
                         last_heartbeat = time.time()
                     
                     # Adaptive scan intervals based on market type
