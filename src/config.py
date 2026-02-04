@@ -109,14 +109,15 @@ class Config:
     EV_BASELINE_CONSERVATIVE = float(os.getenv('EV_BASELINE_CONSERVATIVE', '0.02'))  # $0.02 baseline
     
     # Market Tickers
-    # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles, Denver
+    # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles
+    # Denver disabled due to poor forecast accuracy (19% win rate, -$46 P&L)
     WEATHER_SERIES = [
         'KXHIGHNY', 'KXLOWNY',      # New York City
-        'KXHIGHCHI', 'KXLOWCHI',    # Chicago (corrected from KXHIGHCH)
-        'KXHIGHMIA', 'KXLOWMIA',    # Miami (corrected from KXHIGHMI)
+        'KXHIGHCHI', 'KXLOWCHI',    # Chicago
+        'KXHIGHMIA', 'KXLOWMIA',    # Miami
         'KXHIGHAUS', 'KXLOWAUS',    # Austin
         'KXHIGHLAX', 'KXLOWLAX',    # Los Angeles
-        'KXHIGHDEN', 'KXLOWDEN'     # Denver
+        # 'KXHIGHDEN', 'KXLOWDEN'   # Denver - DISABLED
     ]
     
     @classmethod
