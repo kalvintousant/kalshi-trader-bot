@@ -25,11 +25,12 @@ logger = logging.getLogger(__name__)
 
 class OutcomeTracker:
     """Track market outcomes and forecast accuracy"""
-    
-    def __init__(self, client, weather_aggregator):
+
+    def __init__(self, client, weather_aggregator, adaptive_manager=None):
         self.client = client
         self.weather_agg = weather_aggregator
-        
+        self.adaptive_manager = adaptive_manager
+
         # File paths for persistent storage
         self.outcomes_file = Path("data/outcomes.csv")
         self.performance_file = Path("data/performance.json")
@@ -246,6 +247,13 @@ class OutcomeTracker:
             logger.info(f"{outcome_symbol} Logged outcome: {market_ticker} | {side.upper()} | {'WON' if won else 'LOST'} | P&L: ${total_profit_loss:.2f} ({total_count} contract(s))")
             if forecast_error:
                 logger.info(f"   Forecast accuracy: Predicted {predicted_temp:.1f}°, Actual {actual_temp:.1f}° (error: {forecast_error:.1f}°)")
+
+            # Update adaptive city manager with outcome
+            if self.adaptive_manager and series_ticker:
+                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                self.adaptive_manager.record_outcome(city, won, total_profit_loss)
+                logger.debug(f"Updated adaptive manager for city {city}")
+
         except Exception as e:
             logger.error(f"Error logging outcome: {e}", exc_info=True)
     

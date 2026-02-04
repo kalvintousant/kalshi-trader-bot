@@ -435,6 +435,16 @@ class WeatherDailyStrategy(TradingStrategy):
         # Data store for backtesting
         self.data_store = get_data_store()
 
+        # Adaptive city manager for auto-disable/enable of poorly performing cities
+        self.adaptive_manager = None
+        try:
+            from .adaptive_manager import AdaptiveCityManager
+            self.adaptive_manager = AdaptiveCityManager()
+            if getattr(Config, 'ADAPTIVE_ENABLED', True):
+                logger.info("📊 Adaptive city management ENABLED - poor performers will be auto-disabled")
+        except ImportError as e:
+            logger.warning(f"Could not load AdaptiveCityManager: {e}")
+
     def _get_required_edge(self, price: int) -> float:
         """
         Calculate required edge threshold based on entry price.
@@ -720,27 +730,41 @@ class WeatherDailyStrategy(TradingStrategy):
         """Check if this is a weather market we should trade"""
         # Try multiple ways to get series ticker (Kalshi API may vary)
         series_ticker = market.get('series_ticker') or market.get('series_ticker_symbol') or ''
-        
-        # Also check if ticker starts with weather series prefix
         ticker = market.get('ticker', '')
+
+        # If series_ticker is empty, extract from ticker
+        if not series_ticker and ticker:
+            for weather_series in Config.WEATHER_SERIES:
+                if ticker.startswith(weather_series):
+                    series_ticker = weather_series
+                    break
+
+        # Also check if ticker starts with weather series prefix
         is_weather = False
         if series_ticker in Config.WEATHER_SERIES:
             is_weather = True
         elif any(ticker.startswith(prefix) for prefix in ['KXHIGH', 'KXLOW']):
             is_weather = True
-        
+
         if not is_weather:
             return False
-        
+
+        # Check if city is adaptively disabled (poor performance)
+        if self.adaptive_manager and series_ticker:
+            if not self.adaptive_manager.is_city_enabled(series_ticker):
+                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                logger.info(f"📊 SKIP {ticker}: city {city} adaptively disabled (poor win rate)")
+                return False
+
         # Status can be 'open' or 'active' (both mean tradeable)
         status = market.get('status', '').lower()
         if status not in ['open', 'active']:
             return False
-        
+
         # Check if market has sufficient volume (liquidity requirement)
         if market.get('volume', 0) < Config.MIN_MARKET_VOLUME:
             return False
-        
+
         return True
     
     def get_trade_decision(self, market: Dict, orderbook: Dict) -> Optional[Dict]:
@@ -1146,6 +1170,13 @@ class WeatherDailyStrategy(TradingStrategy):
                         if corr_data['correlation_factor'] < 1.0:
                             logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
 
+                    # Apply adaptive city multiplier (scale by historical win rate)
+                    if self.adaptive_manager and series_ticker:
+                        adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
+                        if adaptive_multiplier != 1.0:
+                            base_position = max(1, int(base_position * adaptive_multiplier))
+                            logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
+
                     # Calculate liquidity cap
                     if Config.LIQUIDITY_CAP_ENABLED:
                         liquidity_cap = self._calculate_liquidity_cap(orderbook, 'yes', int(best_yes_ask))
@@ -1312,6 +1343,13 @@ class WeatherDailyStrategy(TradingStrategy):
                         base_position = max(1, int(base_position * corr_data['correlation_factor']))
                         if corr_data['correlation_factor'] < 1.0:
                             logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
+
+                    # Apply adaptive city multiplier (scale by historical win rate)
+                    if self.adaptive_manager and series_ticker:
+                        adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
+                        if adaptive_multiplier != 1.0:
+                            base_position = max(1, int(base_position * adaptive_multiplier))
+                            logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
 
                     # Calculate liquidity cap
                     if Config.LIQUIDITY_CAP_ENABLED:
@@ -1480,6 +1518,13 @@ class WeatherDailyStrategy(TradingStrategy):
                     if corr_data['correlation_factor'] < 1.0:
                         logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
 
+                # Apply adaptive city multiplier (scale by historical win rate)
+                if self.adaptive_manager and series_ticker:
+                    adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
+                    if adaptive_multiplier != 1.0:
+                        base_position = max(1, int(base_position * adaptive_multiplier))
+                        logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
+
                 # Calculate liquidity cap
                 if Config.LIQUIDITY_CAP_ENABLED:
                     liquidity_cap = self._calculate_liquidity_cap(orderbook, 'yes', int(best_yes_ask))
@@ -1639,6 +1684,13 @@ class WeatherDailyStrategy(TradingStrategy):
                     base_position = max(1, int(base_position * corr_data['correlation_factor']))
                     if corr_data['correlation_factor'] < 1.0:
                         logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
+
+                # Apply adaptive city multiplier (scale by historical win rate)
+                if self.adaptive_manager and series_ticker:
+                    adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
+                    if adaptive_multiplier != 1.0:
+                        base_position = max(1, int(base_position * adaptive_multiplier))
+                        logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
 
                 # Calculate liquidity cap
                 if Config.LIQUIDITY_CAP_ENABLED:

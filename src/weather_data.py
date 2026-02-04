@@ -162,6 +162,9 @@ class WeatherDataAggregator:
 
         # Use session for connection pooling
         self.session = requests.Session()
+
+        # Load persisted learned state (biases, errors)
+        self._load_learned_state()
     
     def _init_forecasts_log(self):
         """Initialize source_forecasts.csv if it doesn't exist"""
@@ -1542,8 +1545,151 @@ class WeatherDataAggregator:
             updated_sources.append(source)
 
         logger.info(f"📊 Updated bias for {len(updated_sources)} models: {', '.join(updated_sources)}")
-    
-    def get_market_probability(self, market: Dict, threshold: float, 
+
+        # Save learned state after updating biases
+        self._save_learned_state()
+
+    def _save_learned_state(self):
+        """
+        Save learned state (model biases, forecast errors) to JSON for persistence across restarts.
+        Called automatically after update_all_model_biases().
+        """
+        try:
+            from .config import Config
+            if not getattr(Config, 'PERSIST_LEARNING', True):
+                return
+
+            state = {
+                'model_bias': {},
+                'forecast_errors': {},
+                'model_error_history': {},
+                'saved_at': datetime.now().isoformat()
+            }
+
+            # Convert nested defaultdicts to regular dicts
+            for source, city_data in self.model_bias.items():
+                state['model_bias'][source] = {}
+                for city, month_data in city_data.items():
+                    state['model_bias'][source][city] = dict(month_data)
+
+            for ticker, month_data in self.forecast_error_history.items():
+                state['forecast_errors'][ticker] = dict(month_data)
+
+            # Save model error history (for bias calculation)
+            for source, ticker_data in self.model_error_history.items():
+                state['model_error_history'][source] = {}
+                for ticker, month_data in ticker_data.items():
+                    state['model_error_history'][source][ticker] = {}
+                    for month, history in month_data.items():
+                        # Keep only last 20 entries per month to limit file size
+                        state['model_error_history'][source][ticker][str(month)] = history[-20:]
+
+            state_file = Path('data/learned_state.json')
+            state_file.parent.mkdir(exist_ok=True)
+
+            with open(state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+
+            logger.debug(f"Saved learned state to {state_file}")
+
+        except Exception as e:
+            logger.warning(f"Could not save learned state: {e}")
+
+    def _load_learned_state(self):
+        """
+        Load learned state from JSON on initialization.
+        Restores model biases and forecast error history from previous sessions.
+        """
+        try:
+            from .config import Config
+            if not getattr(Config, 'PERSIST_LEARNING', True):
+                logger.info("Learning persistence disabled, starting fresh")
+                return
+
+            state_file = Path('data/learned_state.json')
+            if not state_file.exists():
+                logger.info("No learned state file found, starting fresh")
+                return
+
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+
+            # Restore model biases
+            for source, city_data in state.get('model_bias', {}).items():
+                for city, month_data in city_data.items():
+                    for month, bias in month_data.items():
+                        self.model_bias[source][city][int(month)] = bias
+
+            # Restore forecast error history
+            for ticker, month_data in state.get('forecast_errors', {}).items():
+                for month, errors in month_data.items():
+                    self.forecast_error_history[ticker][int(month)] = errors
+
+            # Restore model error history
+            for source, ticker_data in state.get('model_error_history', {}).items():
+                for ticker, month_data in ticker_data.items():
+                    for month, history in month_data.items():
+                        # History is list of [predicted, actual] pairs
+                        self.model_error_history[source][ticker][int(month)] = [
+                            tuple(pair) for pair in history
+                        ]
+
+            saved_at = state.get('saved_at', 'unknown')
+            bias_count = sum(
+                sum(len(m) for m in c.values())
+                for c in state.get('model_bias', {}).values()
+            )
+            logger.info(f"📂 Loaded learned state (saved at {saved_at}): {bias_count} bias corrections")
+
+        except Exception as e:
+            logger.warning(f"Could not load learned state: {e}")
+
+    def is_source_reliable(self, source: str, city: str, min_samples: int = 10) -> bool:
+        """
+        Check if a forecast source has acceptable RMSE for this city.
+
+        Uses historical prediction vs actual data to calculate RMSE.
+        If RMSE exceeds MAX_SOURCE_RMSE, the source is considered unreliable.
+
+        Args:
+            source: Model/source name (e.g., 'nws', 'open_meteo_gfs')
+            city: City code (e.g., 'NY', 'CHI')
+            min_samples: Minimum samples required for evaluation
+
+        Returns:
+            True if source is reliable (or insufficient data), False if unreliable
+        """
+        try:
+            from .config import Config
+            max_rmse = getattr(Config, 'MAX_SOURCE_RMSE', 4.0)
+
+            # Check all months for this source/city
+            total_samples = 0
+            sum_squared_errors = 0.0
+
+            for month in range(1, 13):
+                history = self.model_error_history[source][city].get(month, [])
+                for predicted, actual in history:
+                    error = predicted - actual
+                    sum_squared_errors += error ** 2
+                    total_samples += 1
+
+            if total_samples < min_samples:
+                return True  # Not enough data, trust the source
+
+            rmse = np.sqrt(sum_squared_errors / total_samples)
+
+            if rmse > max_rmse:
+                logger.debug(f"Source {source} unreliable for {city}: RMSE={rmse:.2f}°F > {max_rmse}°F")
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"Error checking source reliability: {e}")
+            return True  # Default to trusting the source
+
+    def get_market_probability(self, market: Dict, threshold: float,
                               probability_dist: Dict[Tuple[float, float], float]) -> float:
         """
         Calculate probability that temperature will be above/below threshold

@@ -108,6 +108,22 @@ class Config:
     EV_BASELINE_LONGSHOT = float(os.getenv('EV_BASELINE_LONGSHOT', '0.05'))  # $0.05 baseline
     EV_BASELINE_CONSERVATIVE = float(os.getenv('EV_BASELINE_CONSERVATIVE', '0.02'))  # $0.02 baseline
     
+    # Adaptive Learning Settings
+    # Enable/disable adaptive city management (auto-disable poor performers)
+    ADAPTIVE_ENABLED = os.getenv('ADAPTIVE_ENABLED', 'true').lower() == 'true'
+    # Minimum trades before evaluating city performance
+    ADAPTIVE_MIN_TRADES = int(os.getenv('ADAPTIVE_MIN_TRADES', '20'))
+    # Disable city if win rate falls below this threshold (40% = 0.40)
+    ADAPTIVE_DISABLE_WIN_RATE = float(os.getenv('ADAPTIVE_DISABLE_WIN_RATE', '0.40'))
+    # How long to disable a city (in hours)
+    ADAPTIVE_DISABLE_HOURS = int(os.getenv('ADAPTIVE_DISABLE_HOURS', '24'))
+    # How often to check if disabled cities should be re-enabled (in hours)
+    ADAPTIVE_REENABLE_CHECK_HOURS = int(os.getenv('ADAPTIVE_REENABLE_CHECK_HOURS', '6'))
+    # Maximum source RMSE before marking unreliable (in degrees F)
+    MAX_SOURCE_RMSE = float(os.getenv('MAX_SOURCE_RMSE', '4.0'))
+    # Enable/disable persisting learned state (biases, errors) across restarts
+    PERSIST_LEARNING = os.getenv('PERSIST_LEARNING', 'true').lower() == 'true'
+
     # Market Tickers
     # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles
     # Denver disabled due to poor forecast accuracy (19% win rate, -$46 P&L)

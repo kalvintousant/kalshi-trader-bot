@@ -46,9 +46,17 @@ class KalshiTradingBot:
         if 'weather_daily' in Config.ENABLED_STRATEGIES:
             self.relevant_series.update(Config.WEATHER_SERIES)
         
+        # Adaptive city manager (shared with strategies)
+        self.adaptive_manager = None
+        if self.strategy_manager.strategies:
+            # Get adaptive manager from first strategy (if available)
+            first_strategy = self.strategy_manager.strategies[0]
+            if hasattr(first_strategy, 'adaptive_manager'):
+                self.adaptive_manager = first_strategy.adaptive_manager
+
         # Outcome tracker for learning from results
         weather_agg = self.strategy_manager.strategies[0].weather_agg if self.strategy_manager.strategies else None
-        self.outcome_tracker = OutcomeTracker(self.client, weather_agg) if weather_agg else None
+        self.outcome_tracker = OutcomeTracker(self.client, weather_agg, self.adaptive_manager) if weather_agg else None
         self.last_outcome_check = 0  # Timestamp of last outcome check
     
     def reset_daily_stats(self):
