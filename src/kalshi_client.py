@@ -40,7 +40,51 @@ class KalshiClient:
         # Cache for orders (reduces 429 rate limit hits - portfolio/orders is called often)
         self.orders_cache = {}  # {status: (orders_list, timestamp)}
         self.orders_cache_ttl = 90  # seconds (increased from 45s to reduce API calls)
+
+        # Global rate limiter — token bucket
+        # Conservative: 2 req/s sustained, burst of 5
+        self._rate_limit_tokens = 5.0
+        self._rate_limit_max = 5.0
+        self._rate_limit_refill = 2.0  # tokens per second
+        self._rate_limit_last = time.time()
+        self._rate_limit_backoff_until = 0  # timestamp: sleep until this time after 429
     
+    def _wait_for_rate_limit(self):
+        """Wait if needed to respect rate limits. Called before every API request."""
+        now = time.time()
+
+        # If we're in a 429 backoff window, sleep until it expires
+        if now < self._rate_limit_backoff_until:
+            sleep_time = self._rate_limit_backoff_until - now
+            logger.debug(f"Rate limit backoff: sleeping {sleep_time:.1f}s")
+            time.sleep(sleep_time)
+            now = time.time()
+
+        # Refill tokens based on elapsed time
+        elapsed = now - self._rate_limit_last
+        self._rate_limit_tokens = min(
+            self._rate_limit_max,
+            self._rate_limit_tokens + elapsed * self._rate_limit_refill,
+        )
+        self._rate_limit_last = now
+
+        # If no tokens available, sleep until one refills
+        if self._rate_limit_tokens < 1.0:
+            sleep_time = (1.0 - self._rate_limit_tokens) / self._rate_limit_refill
+            time.sleep(sleep_time)
+            self._rate_limit_tokens = 1.0
+            self._rate_limit_last = time.time()
+
+        # Consume one token
+        self._rate_limit_tokens -= 1.0
+
+    def _on_rate_limited(self):
+        """Called when a 429 is received. Sets a global backoff window."""
+        self._rate_limit_backoff_until = time.time() + 30  # 30s global pause
+        self._rate_limit_tokens = 0  # drain tokens
+        # Reduce refill rate after hitting 429 (stay conservative)
+        self._rate_limit_refill = min(self._rate_limit_refill, 1.5)
+
     def _load_private_key(self):
         """Load the private key from file"""
         with open(Config.PRIVATE_KEY_PATH, 'rb') as f:
@@ -92,27 +136,28 @@ class KalshiClient:
                     return self.orderbook_cache[cache_key]
         
         url = f"{self.base_url}{path}"
-        headers = self._create_headers('GET', path)
-        
+
         # Retry logic with exponential backoff (longer for 429 Too Many Requests)
         max_retries = 4
         for attempt in range(max_retries):
             try:
+                self._wait_for_rate_limit()
+                headers = self._create_headers('GET', path)
                 response = self.session.get(url, headers=headers, params=params, timeout=10)
                 response.raise_for_status()
                 result = response.json()
-                
+
                 # Cache orderbook results
                 if use_cache and path.startswith('/markets/') and path.endswith('/orderbook'):
                     market_ticker = path.split('/')[-2]
                     self.orderbook_cache[market_ticker] = result
                     self.orderbook_cache_timestamp[market_ticker] = time.time()
-                
+
                 return result
             except requests.exceptions.HTTPError as e:
                 if e.response is not None and e.response.status_code == 429:
+                    self._on_rate_limited()
                     if attempt < max_retries - 1:
-                        # Rate limited: use longer backoff, respect Retry-After if present
                         retry_after = e.response.headers.get('Retry-After')
                         wait_time = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * (2 ** attempt))
                         logger.warning(f"Rate limited (429), waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
@@ -121,7 +166,7 @@ class KalshiClient:
                 raise
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    wait_time = 2 ** attempt
                     time.sleep(wait_time)
                     continue
                 raise
@@ -129,21 +174,20 @@ class KalshiClient:
     def _post(self, path: str, data: Dict) -> Dict:
         """Make authenticated POST request"""
         url = f"{self.base_url}{path}"
-        headers = self._create_headers('POST', path)
-        
-        # Retry logic
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                self._wait_for_rate_limit()
+                headers = self._create_headers('POST', path)
                 response = self.session.post(url, headers=headers, json=data, timeout=10)
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                # Handle rate limiting (429) and other retryable errors
                 if attempt < max_retries - 1:
-                    if hasattr(e.response, 'status_code') and e.response.status_code == 429:
-                        # Rate limited - use longer backoff
-                        wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
+                    if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                        self._on_rate_limited()
+                        wait_time = min(60, 2 ** (attempt + 2))
                         logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
@@ -154,44 +198,44 @@ class KalshiClient:
     def _put(self, path: str, data: Dict) -> Dict:
         """Make authenticated PUT request"""
         url = f"{self.base_url}{path}"
-        headers = self._create_headers('PUT', path)
-        
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                self._wait_for_rate_limit()
+                headers = self._create_headers('PUT', path)
                 response = self.session.put(url, headers=headers, json=data, timeout=10)
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                # Handle rate limiting (429) and other retryable errors
                 if attempt < max_retries - 1:
-                    if hasattr(e.response, 'status_code') and e.response.status_code == 429:
-                        # Rate limited - use longer backoff
-                        wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
+                    if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                        self._on_rate_limited()
+                        wait_time = min(60, 2 ** (attempt + 2))
                         logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
                     time.sleep(wait_time)
                     continue
                 raise
-    
+
     def _delete(self, path: str) -> Dict:
         """Make authenticated DELETE request"""
         url = f"{self.base_url}{path}"
-        headers = self._create_headers('DELETE', path)
-        
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                self._wait_for_rate_limit()
+                headers = self._create_headers('DELETE', path)
                 response = self.session.delete(url, headers=headers, timeout=10)
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
-                # Handle rate limiting (429) and other retryable errors
                 if attempt < max_retries - 1:
-                    if hasattr(e.response, 'status_code') and e.response.status_code == 429:
-                        # Rate limited - use longer backoff
-                        wait_time = min(60, 2 ** (attempt + 2))  # 4s, 8s, 16s (capped at 60s)
+                    if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
+                        self._on_rate_limited()
+                        wait_time = min(60, 2 ** (attempt + 2))
                         logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt

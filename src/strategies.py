@@ -120,7 +120,14 @@ class TradingStrategy:
                                 price = order.get('no_price', 0)
                             total_dollars += (remaining * price) / 100.0
             except Exception as e:
-                logger.debug(f"Could not fetch orders for {base_market}: {e}")
+                # CRITICAL: If we can't verify resting orders, assume at limit
+                # to prevent duplicate orders during rate limiting (429)
+                logger.warning(f"Could not fetch orders for {base_market}: {e} — assuming at limit")
+                return {
+                    'total_contracts': Config.MAX_CONTRACTS_PER_MARKET,
+                    'total_dollars': Config.MAX_DOLLARS_PER_MARKET,
+                    'base_market': base_market
+                }
 
             return {
                 'total_contracts': total_contracts,

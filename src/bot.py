@@ -36,6 +36,10 @@ class KalshiTradingBot:
         
         # Track seen markets to detect new ones quickly
         self.seen_markets: Set[str] = set()
+
+        # Track tickers with recently placed orders (local cache to avoid API calls)
+        # Maps ticker -> timestamp of order placement
+        self._recently_ordered_tickers: Dict[str, float] = {}
         
         # Track markets with determined outcomes (skip these in future scans)
         self.determined_outcome_markets: Set[str] = set()
@@ -460,9 +464,17 @@ class KalshiTradingBot:
                     continue
                 markets_traded_this_scan.add(market_ticker)
 
-                # Small delay every 10 markets to avoid overwhelming the API
-                if i > 0 and i % 10 == 0:
-                    time.sleep(0.5)  # 500ms pause every 10 markets
+                # Skip tickers with recently placed orders (local guard, no API call)
+                # Prevents duplicate orders when API is rate-limited and can't verify resting orders
+                recent_ts = self._recently_ordered_tickers.get(market_ticker)
+                if recent_ts and (time.time() - recent_ts) < 600:  # 10-minute cooldown
+                    logger.debug(f"📊 SKIP {market_ticker}: order placed {(time.time() - recent_ts):.0f}s ago (cooldown)")
+                    self._scan_skipped_count += 1
+                    continue
+
+                # Pace API calls: 250ms between each market evaluation
+                if i > 0:
+                    time.sleep(0.25)
 
                 # Quick filter check before expensive orderbook call
                 should_trade = any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies)
@@ -502,6 +514,7 @@ class KalshiTradingBot:
                     
                     if order:
                         self.markets_being_tracked.add(market_ticker)
+                        self._recently_ordered_tickers[market_ticker] = time.time()
                         self._scan_traded_count += 1
 
                         # Record trade on dashboard
