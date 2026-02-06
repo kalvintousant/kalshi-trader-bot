@@ -714,7 +714,7 @@ class WeatherDataAggregator:
 
         # Cache the result
         self.ensemble_cache[cache_key] = result
-        logger.info(f"Ensemble spread for {series_ticker}: mean={result['mean']:.1f}°F, std={result['std']:.1f}°F ({result['n_members']} members)")
+        logger.debug(f"Ensemble spread for {series_ticker}: mean={result['mean']:.1f}°F, std={result['std']:.1f}°F ({result['n_members']} members)")
 
         return result
 
@@ -769,7 +769,7 @@ class WeatherDataAggregator:
         new_bias = np.mean(errors) if errors else 0
         self.model_bias[source][city_base][month] = new_bias
 
-        logger.info(f"Updated bias for {source}/{city_base}/month{month}: {new_bias:.2f}°F (n={len(history)})")
+        logger.debug(f"Updated bias for {source}/{city_base}/month{month}: {new_bias:.2f}°F (n={len(history)})")
 
     def detect_outliers(self, forecasts: List[float]) -> List[float]:
         """
@@ -1293,7 +1293,7 @@ class WeatherDataAggregator:
                         forecast_data.append((corrected_temp, source, timestamp))
                         # Log each source at INFO level for analysis
                         weight = self.source_weights.get(source, 0.8)
-                        logger.info(f"  {source}: {corrected_temp:.1f}°F (weight={weight:.2f})")
+                        logger.debug(f"  {source}: {corrected_temp:.1f}°F (weight={weight:.2f})")
                 except Exception as e:
                     source = tier1_futures[future]
                     logger.debug(f"Error fetching from {source}: {e}")
@@ -1309,7 +1309,7 @@ class WeatherDataAggregator:
                     self._log_source_forecast(series_ticker, target_date, source, temp)
                     corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
                     forecast_data.append((corrected_temp, source, timestamp))
-                    logger.info(f"Using Weatherbit fallback for {series_ticker}")
+                    logger.debug(f"Using Weatherbit fallback for {series_ticker}")
             except Exception as e:
                 logger.debug(f"Error fetching from weatherbit (fallback): {e}")
 
@@ -1374,9 +1374,9 @@ class WeatherDataAggregator:
             self.cache_timestamp[cache_key] = datetime.now()
 
             # Log summary
-            logger.info(f"Forecast for {series_ticker} ({target_date.strftime('%Y-%m-%d')}): "
-                       f"mean={weighted_mean:.1f}°F, range=[{min(raw_forecasts):.1f}, {max(raw_forecasts):.1f}]°F, "
-                       f"sources={len(forecast_data)}")
+            logger.debug(f"Forecast for {series_ticker} ({target_date.strftime('%Y-%m-%d')}): "
+                        f"mean={weighted_mean:.1f}°F, range=[{min(raw_forecasts):.1f}, {max(raw_forecasts):.1f}]°F, "
+                        f"sources={len(forecast_data)}")
 
             return adjusted_forecasts
 
@@ -1434,7 +1434,7 @@ class WeatherDataAggregator:
                 if abs(ensemble_mean - mean_temp) < 3.0:  # Within 3°F
                     # Blend means (60% multi-source, 40% ensemble)
                     mean_temp = 0.6 * mean_temp + 0.4 * ensemble_mean
-                logger.info(f"  Ensemble: std={ensemble_std:.1f}°F ({ensemble_data['n_members']} members from {ensemble_data['source']})")
+                logger.debug(f"  Ensemble: std={ensemble_std:.1f}°F ({ensemble_data['n_members']} members from {ensemble_data['source']})")
 
         # Dynamic standard deviation calculation
         if ensemble_std is not None:
@@ -1520,7 +1520,7 @@ class WeatherDataAggregator:
         if len(errors) > 100:
             errors.pop(0)  # Keep only most recent 100
 
-        logger.info(f"📊 Updated forecast error for {series_ticker} (month {month}): {error:.2f}°F")
+        logger.debug(f"📊 Updated forecast error for {series_ticker} (month {month}): {error:.2f}°F")
 
     def update_all_model_biases(self, series_ticker: str, target_date: datetime, actual_temp: float):
         """
@@ -1544,7 +1544,7 @@ class WeatherDataAggregator:
             self.update_model_bias(source, series_ticker, target_date, temp, actual_temp)
             updated_sources.append(source)
 
-        logger.info(f"📊 Updated bias for {len(updated_sources)} models: {', '.join(updated_sources)}")
+        logger.debug(f"📊 Updated bias for {len(updated_sources)} models: {', '.join(updated_sources)}")
 
         # Save learned state after updating biases
         self._save_learned_state()

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 import requests
 import logging
@@ -10,6 +11,7 @@ from src.strategies import StrategyManager
 from src.config import Config
 from src.logger import setup_logging
 from src.outcome_tracker import OutcomeTracker
+from src.dashboard import DashboardState, Dashboard
 
 # Set up logging
 setup_logging()
@@ -58,6 +60,11 @@ class KalshiTradingBot:
         weather_agg = self.strategy_manager.strategies[0].weather_agg if self.strategy_manager.strategies else None
         self.outcome_tracker = OutcomeTracker(self.client, weather_agg, self.adaptive_manager) if weather_agg else None
         self.last_outcome_check = 0  # Timestamp of last outcome check
+
+        # Dashboard
+        self.dashboard_enabled = os.getenv('DASHBOARD_ENABLED', 'true').lower() != 'false'
+        self.dashboard_state = DashboardState()
+        self.dashboard = Dashboard(self.dashboard_state)
     
     def reset_daily_stats(self):
         """Reset daily statistics"""
@@ -204,12 +211,18 @@ class KalshiTradingBot:
                 fill_price = yes_price if yes_price > 0 else no_price
                 
                 if fill_count > 0:
+                    # Record fill on dashboard
+                    self.dashboard_state.record_fill(action, side, fill_count, fill_price, ticker)
+
                     # Send notification
                     self._send_notification(
                         f"✅ Trade Filled: {action} {side}",
                         f"{fill_count} contract(s) @ {fill_price}¢\nMarket: {ticker}"
                     )
                     logger.info(f"📬 Notification sent: {action} {fill_count} {side} @ {fill_price}¢ filled for {ticker}")
+
+                    # Render dashboard on fill events
+                    self._maybe_render_dashboard()
         
         except Exception as e:
             logger.error(f"Error checking filled orders: {e}", exc_info=True)
@@ -275,6 +288,7 @@ class KalshiTradingBot:
                         logger.info(f"🗑️  Canceling order {order_id}: Market {ticker} not found (likely closed)")
                         self.client.cancel_order(order_id)
                         self.client.invalidate_orders_cache()
+                        self.dashboard_state.record_cancel(order_id, 'market closed')
                         continue
                     
                     # Get current orderbook
@@ -335,6 +349,7 @@ class KalshiTradingBot:
                             self.client.cancel_order(order_id)
                             self.client.invalidate_orders_cache()  # Ensure fresh data for next exposure check
                             logger.info(f"✅ Order {order_id} canceled successfully")
+                            self.dashboard_state.record_cancel(order_id, 'stale edge')
                         except Exception as e:
                             logger.warning(f"Error canceling order {order_id}: {e}")
                 
@@ -369,6 +384,9 @@ class KalshiTradingBot:
         # This prevents the same ticker from being evaluated multiple times
         # if it appears in multiple threshold lists within the same scan
         markets_traded_this_scan: Set[str] = set()
+        self._scan_traded_count = 0
+        self._scan_skipped_count = 0
+        self._scan_total_count = 0
 
         try:
             # Filter markets by relevant series FIRST to reduce API calls
@@ -429,6 +447,7 @@ class KalshiTradingBot:
                 sample = markets_to_process[0]
                 logger.debug(f"Sample market: {sample.get('ticker')} | Series: {sample.get('series_ticker')} | Volume: {sample.get('volume', 0)} | Status: {sample.get('status')}")
             
+            self._scan_total_count = len(markets_to_process)
             markets_evaluated = 0
             for i, market in enumerate(markets_to_process):
                 market_ticker = market.get('ticker', '')
@@ -437,6 +456,7 @@ class KalshiTradingBot:
                 # This prevents duplicate orders when the same market appears multiple times
                 if market_ticker in markets_traded_this_scan:
                     logger.debug(f"📊 SKIP {market_ticker}: already evaluated this scan")
+                    self._scan_skipped_count += 1
                     continue
                 markets_traded_this_scan.add(market_ticker)
 
@@ -452,13 +472,14 @@ class KalshiTradingBot:
                     status = market.get('status', 'unknown')
                     volume = market.get('volume', 0)
                     if series and series not in Config.WEATHER_SERIES and not any(ticker.startswith(p) for p in ['KXHIGH', 'KXLOW']):
-                        logger.info(f"📊 SKIP {ticker}: not a weather series ({series})")
+                        logger.debug(f"📊 SKIP {ticker}: not a weather series ({series})")
                     elif status not in ('open', 'active'):
-                        logger.info(f"📊 SKIP {ticker}: status={status} (need open/active)")
+                        logger.debug(f"📊 SKIP {ticker}: status={status} (need open/active)")
                     elif volume < Config.MIN_MARKET_VOLUME:
-                        logger.info(f"📊 SKIP {ticker}: volume {volume} < {Config.MIN_MARKET_VOLUME}")
+                        logger.debug(f"📊 SKIP {ticker}: volume {volume} < {Config.MIN_MARKET_VOLUME}")
                     else:
-                        logger.info(f"📊 SKIP {ticker}: filtered by strategy (should_trade=False)")
+                        logger.debug(f"📊 SKIP {ticker}: filtered by strategy (should_trade=False)")
+                    self._scan_skipped_count += 1
                     continue
                 
                 markets_evaluated += 1
@@ -481,13 +502,24 @@ class KalshiTradingBot:
                     
                     if order:
                         self.markets_being_tracked.add(market_ticker)
-                        
+                        self._scan_traded_count += 1
+
+                        # Record trade on dashboard
+                        self.dashboard_state.record_trade(
+                            decision.get('action', 'buy'),
+                            decision.get('side', '?'),
+                            decision.get('count', 0),
+                            decision.get('price', 0),
+                            market_ticker,
+                        )
+
                         # Log trade summary
                         logger.info(f"Trade executed successfully - Market: {market_ticker}")
                         logger.debug(f"Active positions being tracked: {len(self.markets_being_tracked)}")
-                        
+
                         time.sleep(0.3)  # Reduced rate limiting delay
         except Exception as e:
+            self.dashboard_state.record_error()
             logger.error(f"Error in scan_and_trade: {e}", exc_info=True)
     
     async def handle_websocket_messages(self, websocket):
@@ -559,6 +591,42 @@ class KalshiTradingBot:
         except Exception as e:
             logger.debug(f"Error managing market maker orders: {e}")
 
+    def _maybe_render_dashboard(self, force: bool = False):
+        """Render the dashboard if enabled (rate-limited unless forced)."""
+        if not self.dashboard_enabled:
+            return
+        self.dashboard.render(force=force)
+
+    def _update_dashboard_account(self):
+        """Fetch account data and update dashboard state."""
+        try:
+            portfolio = self.client.get_portfolio()
+            balance = portfolio.get('balance', 0) / 100
+            portfolio_value = portfolio.get('portfolio_value', 0) / 100
+            exposure = self._get_weather_exposure()
+
+            # Count active positions and resting orders
+            positions = self.client.get_positions()
+            active_count = sum(1 for p in positions if p.get('position', 0) != 0)
+            try:
+                resting = self.client.get_orders(status='resting')
+                resting_count = len(resting)
+            except Exception:
+                resting_count = 0
+
+            self.dashboard_state.update_account(
+                cash=balance,
+                portfolio_value=portfolio_value,
+                daily_pnl=self.daily_pnl,
+                daily_loss_limit=Config.MAX_DAILY_LOSS,
+                exposure=exposure,
+            )
+            self.dashboard_state.update_positions(active_count, resting_count)
+            return balance, portfolio_value
+        except Exception as e:
+            logger.debug(f"Could not update dashboard account: {e}")
+            return None, None
+
     def run(self, use_websocket: bool = False):
         """Run the trading bot"""
         self.running = True
@@ -585,22 +653,37 @@ class KalshiTradingBot:
                 logger.info(f"Scan interval: 30 seconds (Kalshi odds check) | Weather forecast cache: {Config.FORECAST_CACHE_TTL/60:.0f} min")
             else:
                 logger.info("Scan interval: 15 seconds")
-            # Heartbeat interval (log every 30 minutes for weather markets)
-            heartbeat_interval = 1800
+            # Heartbeat interval (5 min so dashboard refreshes regularly)
+            heartbeat_interval = 300
             last_heartbeat = time.time()
-            
+            first_scan_done = False
+
             while self.running:
                 try:
                     scan_start = time.time()
                     self.scan_and_trade()
                     scan_duration = time.time() - scan_start
-                    
-                    # Log scan completion
+
+                    # Record scan stats on dashboard
+                    self.dashboard_state.record_scan(
+                        markets=getattr(self, '_scan_total_count', 0),
+                        skipped=getattr(self, '_scan_skipped_count', 0),
+                        traded=getattr(self, '_scan_traded_count', 0),
+                        duration=scan_duration,
+                    )
+
+                    # Log scan completion (goes to file only via filter)
                     logger.info(f"✅ Scan complete in {scan_duration:.1f}s. Next scan in {max(0, 30 - scan_duration):.0f}s")
-                    
+
+                    # Render dashboard immediately after first scan
+                    if not first_scan_done:
+                        first_scan_done = True
+                        self._update_dashboard_account()
+                        self._maybe_render_dashboard(force=True)
+
                     # Check for filled orders and send notifications
                     self.check_filled_orders()
-                    
+
                     # Check and cancel stale orders (edge/EV no longer valid)
                     self.check_and_cancel_stale_orders()
 
@@ -616,7 +699,7 @@ class KalshiTradingBot:
                         except Exception as e:
                             logger.error(f"Error checking outcomes: {e}", exc_info=True)
                     
-                    # Heartbeat logging to confirm bot is alive
+                    # Heartbeat logging to confirm bot is alive + render dashboard
                     if time.time() - last_heartbeat >= heartbeat_interval:
                         portfolio = self.client.get_portfolio()
                         balance = portfolio.get('balance', 0) / 100  # Convert cents to dollars
@@ -636,6 +719,10 @@ class KalshiTradingBot:
                         logger.info(f"   Account - Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
                         logger.info(f"   Weather P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
                         last_heartbeat = time.time()
+
+                        # Update dashboard with fresh account data and render
+                        self._update_dashboard_account()
+                        self._maybe_render_dashboard(force=True)
                     
                     # Adaptive scan intervals based on market type
                     # Weather daily: 30s (frequent Kalshi odds check, weather forecasts cached)

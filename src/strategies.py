@@ -753,7 +753,7 @@ class WeatherDailyStrategy(TradingStrategy):
         if self.adaptive_manager and series_ticker:
             if not self.adaptive_manager.is_city_enabled(series_ticker):
                 city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
-                logger.info(f"📊 SKIP {ticker}: city {city} adaptively disabled (poor win rate)")
+                logger.debug(f"📊 SKIP {ticker}: city {city} adaptively disabled (poor win rate)")
                 return False
 
         # Status can be 'open' or 'active' (both mean tradeable)
@@ -797,7 +797,7 @@ class WeatherDailyStrategy(TradingStrategy):
                         break
             
             if not series_ticker:
-                logger.info(f"📊 SKIP {market_ticker}: could not determine series")
+                logger.debug(f"📊 SKIP {market_ticker}: could not determine series")
                 return None
             
             # Extract target date from market ticker or title
@@ -805,7 +805,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # Title format: "Will the **high temp in NYC** be >26° on Jan 28, 2026?"
             target_date = self._extract_market_date(market)
             if not target_date:
-                logger.info(f"📊 SKIP {market_ticker}: could not extract date from ticker/title")
+                logger.debug(f"📊 SKIP {market_ticker}: could not extract date from ticker/title")
                 return None
             
             # Verify date is reasonable (not too far in past/future)
@@ -815,13 +815,13 @@ class WeatherDailyStrategy(TradingStrategy):
             
             max_days = Config.MAX_MARKET_DATE_DAYS
             if days_diff < -1 or days_diff > max_days:  # Allow -1 (yesterday) to max_days
-                logger.info(f"📊 SKIP {market_ticker}: date too far (today ± {max_days}d, got {days_diff}d)")
+                logger.debug(f"📊 SKIP {market_ticker}: date too far (today ± {max_days}d, got {days_diff}d)")
                 return None
             
             # Extract temperature threshold from market title (single float or (low, high) range)
             threshold = self.extract_threshold(market)
             if not threshold:
-                logger.info(f"📊 SKIP {market_ticker}: could not extract temp threshold from title")
+                logger.debug(f"📊 SKIP {market_ticker}: could not extract temp threshold from title")
                 return None
             
             # CRITICAL: Check if outcome is already determined by today's observations
@@ -888,7 +888,7 @@ class WeatherDailyStrategy(TradingStrategy):
                                     reason = f"Observed low {observed_extreme:.1f}°F already below threshold {threshold}°F (NO certain)"
                     
                     if outcome_determined:
-                        logger.info(f"📊 SKIP {market_ticker}: outcome already determined — {reason}")
+                        logger.debug(f"📊 SKIP {market_ticker}: outcome already determined — {reason}")
                         
                         # Mark this market for exclusion from future scans
                         if hasattr(self, '_bot_ref') and self._bot_ref:
@@ -921,7 +921,7 @@ class WeatherDailyStrategy(TradingStrategy):
             forecasts = self.weather_agg.get_all_forecasts(series_ticker, target_date)
             
             if not forecasts:
-                logger.info(f"📊 SKIP {market_ticker}: no forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
+                logger.debug(f"📊 SKIP {market_ticker}: no forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
                 return None
             
             # Log market type for LOW vs HIGH debugging
@@ -938,7 +938,7 @@ class WeatherDailyStrategy(TradingStrategy):
             min_deg = getattr(Config, 'MIN_DEGREES_FROM_THRESHOLD', 0)
             if min_deg > 0 and not isinstance(threshold, tuple):
                 if abs(mean_forecast - threshold) < min_deg:
-                    logger.info(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° within {min_deg}° of threshold {threshold}° (reduce coin-flip losses)")
+                    logger.debug(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° within {min_deg}° of threshold {threshold}° (reduce coin-flip losses)")
                     return None
             
             # Create temperature ranges around the forecast (2-degree brackets)
@@ -953,7 +953,7 @@ class WeatherDailyStrategy(TradingStrategy):
             )
             
             if not prob_dist:
-                logger.info(f"📊 SKIP {market_ticker}: could not build probability distribution")
+                logger.debug(f"📊 SKIP {market_ticker}: could not build probability distribution")
                 return None
             
             # Calculate our probability for this market
@@ -1002,7 +1002,7 @@ class WeatherDailyStrategy(TradingStrategy):
             no_orders = orderbook.get('orderbook', {}).get('no', [])
             
             if not yes_orders or not no_orders:
-                logger.info(f"📊 SKIP {market_ticker}: empty orderbook (no yes/no orders)")
+                logger.debug(f"📊 SKIP {market_ticker}: empty orderbook (no yes/no orders)")
                 return None
             
             # Use market prices as fallback
@@ -1022,7 +1022,7 @@ class WeatherDailyStrategy(TradingStrategy):
 
             # EARLY PRICE CHECK: Skip if BOTH sides are too expensive (saves calculation time)
             if best_yes_ask > Config.MAX_BUY_PRICE_CENTS and best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                logger.info(f"📊 SKIP {market_ticker}: both YES ({best_yes_ask}¢) and NO ({best_no_ask}¢) exceed max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                logger.debug(f"📊 SKIP {market_ticker}: both YES ({best_yes_ask}¢) and NO ({best_no_ask}¢) exceed max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                 return None
 
             # Calculate edge for YES side using ASK price (what we'd actually pay)
@@ -1069,7 +1069,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # CRITICAL FIX: Check if we already have a resting order on THIS EXACT ticker
             # This prevents the bug where we place multiple orders on the same ticker every scan
             if self._has_resting_order_on_ticker(market_ticker):
-                logger.info(f"📊 SKIP {market_ticker}: already have resting order on this ticker")
+                logger.debug(f"📊 SKIP {market_ticker}: already have resting order on this ticker")
                 return None
 
             # Check existing exposure on this BASE MARKET BEFORE placing new orders
@@ -1086,12 +1086,12 @@ class WeatherDailyStrategy(TradingStrategy):
             # HARD BLOCK: If we're already at or over dollar limit, skip this market
             # This enforces the $5 limit even if existing orders already exceeded it
             if existing_dollars >= Config.MAX_DOLLARS_PER_MARKET:
-                logger.info(f"📊 SKIP {market_ticker}: already at dollar limit ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f} for {base_market}")
+                logger.debug(f"📊 SKIP {market_ticker}: already at dollar limit ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f} for {base_market}")
                 return None
 
             # If we're at or over contract limits, skip this market
             if contracts_remaining == 0:
-                logger.info(f"📊 SKIP {market_ticker}: at BASE MARKET position limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f}) for {base_market}")
+                logger.debug(f"📊 SKIP {market_ticker}: at BASE MARKET position limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f}) for {base_market}")
                 return None
 
             logger.debug(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining for BASE MARKET {base_market} (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
@@ -1109,7 +1109,7 @@ class WeatherDailyStrategy(TradingStrategy):
             )
             if skip_todays_market_past_report:
                 market_type = "high" if is_high_market else "low" if is_low_market else "temperature"
-                logger.info(f"📊 SKIP {market_ticker}: today's market past report time — {market_type} of day likely already occurred (no new buys)")
+                logger.debug(f"📊 SKIP {market_ticker}: today's market past report time — {market_type} of day likely already occurred (no new buys)")
                 return None
             
             # DUAL STRATEGY: Check both conservative and longshot modes
@@ -1192,14 +1192,14 @@ class WeatherDailyStrategy(TradingStrategy):
                     
                     # Skip if no room or below minimum order size
                     if position_size <= 0:
-                        logger.info(f"📊 SKIP {market_ticker}: longshot YES ok but no capacity (position_size=0)")
+                        logger.debug(f"📊 SKIP {market_ticker}: longshot YES ok but no capacity (position_size=0)")
                         return None
                     if position_size < Config.MIN_ORDER_CONTRACTS:
-                        logger.info(f"📊 SKIP {market_ticker}: longshot YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                        logger.debug(f"📊 SKIP {market_ticker}: longshot YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
                         return None
                     
                     if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.info(f"📊 SKIP {market_ticker}: longshot YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                        logger.debug(f"📊 SKIP {market_ticker}: longshot YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                         # Fall through to check NO side (don't return yet)
                     else:
                         # Apply portfolio-wide correlation adjustment via risk manager
@@ -1207,7 +1207,7 @@ class WeatherDailyStrategy(TradingStrategy):
                             position_size, market_ticker, 'yes'
                         )
                         if position_size <= 0:
-                            logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                            logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
                             return None
 
                         # Determine execution price (market making or taker)
@@ -1365,14 +1365,14 @@ class WeatherDailyStrategy(TradingStrategy):
                         logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
 
                     if position_size <= 0:
-                        logger.info(f"📊 SKIP {market_ticker}: longshot NO ok but no capacity (position_size=0)")
+                        logger.debug(f"📊 SKIP {market_ticker}: longshot NO ok but no capacity (position_size=0)")
                         return None
                     if position_size < Config.MIN_ORDER_CONTRACTS:
-                        logger.info(f"📊 SKIP {market_ticker}: longshot NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                        logger.debug(f"📊 SKIP {market_ticker}: longshot NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
                         return None
                     
                     if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.info(f"📊 SKIP {market_ticker}: longshot NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                        logger.debug(f"📊 SKIP {market_ticker}: longshot NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                         return None  # EXPLICIT: Don't trade above price limit
 
                     # Apply portfolio-wide correlation adjustment via risk manager
@@ -1380,7 +1380,7 @@ class WeatherDailyStrategy(TradingStrategy):
                         position_size, market_ticker, 'no'
                     )
                     if position_size <= 0:
-                        logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                        logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
                         return None
 
                     # Determine execution price (market making or taker)
@@ -1539,14 +1539,14 @@ class WeatherDailyStrategy(TradingStrategy):
                     logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
 
                 if position_size <= 0:
-                    logger.info(f"📊 SKIP {market_ticker}: conservative YES ok but no capacity (position_size=0)")
+                    logger.debug(f"📊 SKIP {market_ticker}: conservative YES ok but no capacity (position_size=0)")
                     return None
                 if position_size < Config.MIN_ORDER_CONTRACTS:
-                    logger.info(f"📊 SKIP {market_ticker}: conservative YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                    logger.debug(f"📊 SKIP {market_ticker}: conservative YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
                     return None
                 
                 if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.info(f"📊 SKIP {market_ticker}: conservative YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                    logger.debug(f"📊 SKIP {market_ticker}: conservative YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                     return None  # EXPLICIT: Don't trade above price limit
 
                 # Apply portfolio-wide correlation adjustment via risk manager
@@ -1554,7 +1554,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     position_size, market_ticker, 'yes'
                 )
                 if position_size <= 0:
-                    logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                    logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
                     return None
 
                 # Determine execution price (market making or taker)
@@ -1706,14 +1706,14 @@ class WeatherDailyStrategy(TradingStrategy):
                     logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
 
                 if position_size <= 0:
-                    logger.info(f"📊 SKIP {market_ticker}: conservative NO ok but no capacity (position_size=0)")
+                    logger.debug(f"📊 SKIP {market_ticker}: conservative NO ok but no capacity (position_size=0)")
                     return None
                 if position_size < Config.MIN_ORDER_CONTRACTS:
-                    logger.info(f"📊 SKIP {market_ticker}: conservative NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+                    logger.debug(f"📊 SKIP {market_ticker}: conservative NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
                     return None
                 
                 if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.info(f"📊 SKIP {market_ticker}: conservative NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+                    logger.debug(f"📊 SKIP {market_ticker}: conservative NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
                     return None  # EXPLICIT: Don't trade above price limit
 
                 # Apply portfolio-wide correlation adjustment via risk manager
@@ -1721,7 +1721,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     position_size, market_ticker, 'no'
                 )
                 if position_size <= 0:
-                    logger.info(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+                    logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
                     return None
 
                 # Determine execution price (market making or taker)
@@ -1817,7 +1817,7 @@ class WeatherDailyStrategy(TradingStrategy):
                 reason = f"edge ok, best EV ${best_ev:.4f} < ${self.min_ev_threshold}"
             else:
                 reason = "no side met edge/EV/confidence"
-            logger.info(f"📊 SKIP {market_ticker}: {reason}")
+            logger.debug(f"📊 SKIP {market_ticker}: {reason}")
             return None
             
         except Exception as e:
