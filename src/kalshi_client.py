@@ -160,7 +160,7 @@ class KalshiClient:
                     if attempt < max_retries - 1:
                         retry_after = e.response.headers.get('Retry-After')
                         wait_time = int(retry_after) if retry_after and retry_after.isdigit() else min(60, 5 * (2 ** attempt))
-                        logger.warning(f"Rate limited (429), waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        logger.debug(f"Rate limited (429), waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                         time.sleep(wait_time)
                         continue
                 raise
@@ -188,7 +188,7 @@ class KalshiClient:
                     if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
                         self._on_rate_limited()
                         wait_time = min(60, 2 ** (attempt + 2))
-                        logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        logger.debug(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
                     time.sleep(wait_time)
@@ -212,7 +212,7 @@ class KalshiClient:
                     if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
                         self._on_rate_limited()
                         wait_time = min(60, 2 ** (attempt + 2))
-                        logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        logger.debug(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
                     time.sleep(wait_time)
@@ -236,7 +236,7 @@ class KalshiClient:
                     if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
                         self._on_rate_limited()
                         wait_time = min(60, 2 ** (attempt + 2))
-                        logger.warning(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        logger.debug(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                     else:
                         wait_time = 2 ** attempt
                     time.sleep(wait_time)
