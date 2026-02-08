@@ -74,6 +74,7 @@ class TradingStrategy:
             
             total_contracts = 0
             total_dollars = 0.0
+            sides_held = set()
 
             # Get ACTUAL current positions (not historical fills)
             # Check ALL thresholds for this base market
@@ -89,6 +90,14 @@ class TradingStrategy:
                             # 'position' field is the net contract count (can be negative for short)
                             contracts = abs(position.get('position', 0))
                             total_contracts += contracts
+
+                            # Track which sides we hold (for contradictory position detection)
+                            if contracts > 0:
+                                pos_val = position.get('position', 0)
+                                if pos_val > 0:
+                                    sides_held.add('yes')
+                                elif pos_val < 0:
+                                    sides_held.add('no')
 
                             # Use market_exposure from API (actual dollars at risk)
                             # This is the real cost basis, not an estimate
@@ -126,13 +135,15 @@ class TradingStrategy:
                 return {
                     'total_contracts': Config.MAX_CONTRACTS_PER_MARKET,
                     'total_dollars': Config.MAX_DOLLARS_PER_MARKET,
-                    'base_market': base_market
+                    'base_market': base_market,
+                    'sides_held': sides_held
                 }
 
             return {
                 'total_contracts': total_contracts,
                 'total_dollars': total_dollars,
-                'base_market': base_market  # Include for logging
+                'base_market': base_market,
+                'sides_held': sides_held
             }
 
         except Exception as e:
@@ -141,7 +152,8 @@ class TradingStrategy:
             return {
                 'total_contracts': Config.MAX_CONTRACTS_PER_MARKET,
                 'total_dollars': Config.MAX_DOLLARS_PER_MARKET,
-                'base_market': market_ticker
+                'base_market': market_ticker,
+                'sides_held': set()
             }
     
     def should_trade(self, market: Dict) -> bool:
@@ -756,6 +768,12 @@ class WeatherDailyStrategy(TradingStrategy):
         if not is_weather:
             return False
 
+        # Hard-disable check (takes precedence over everything)
+        city_code = series_ticker.replace('KXHIGH', '').replace('KXLOW', '') if series_ticker else ''
+        if city_code.upper() in Config.DISABLED_CITIES:
+            logger.debug(f"📊 SKIP {ticker}: city {city_code} is hard-disabled")
+            return False
+
         # Check if city is adaptively disabled (poor performance)
         if self.adaptive_manager and series_ticker:
             if not self.adaptive_manager.is_city_enabled(series_ticker):
@@ -788,7 +806,8 @@ class WeatherDailyStrategy(TradingStrategy):
             market_ticker = market.get('ticker', '')
             
             # Check if we have an active position to exit
-            if market_ticker in self.active_positions:
+            # Skip when called from _check_exit to avoid infinite recursion
+            if market_ticker in self.active_positions and not getattr(self, '_checking_exit', False):
                 exit_decision = self._check_exit(market, orderbook, market_ticker)
                 if exit_decision:
                     return exit_decision
@@ -1101,6 +1120,9 @@ class WeatherDailyStrategy(TradingStrategy):
                 logger.debug(f"📊 SKIP {market_ticker}: at BASE MARKET position limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET} contracts, ${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f}) for {base_market}")
                 return None
 
+            # Track which sides we already hold on this base market (for contradictory position detection)
+            existing_sides = existing_exposure.get('sides_held', set())
+
             logger.debug(f"✅ {market_ticker}: {contracts_remaining} contracts, ${dollars_remaining:.2f} remaining for BASE MARKET {base_market} (current: {existing_contracts} contracts, ${existing_dollars:.2f})")
             
             # Skip ALL new trades on today's markets once the extreme (high/low) of day has likely occurred.
@@ -1126,9 +1148,10 @@ class WeatherDailyStrategy(TradingStrategy):
             if self.longshot_enabled:
                 # Check YES side for longshot opportunity
                 # Use ASK price to check if it's cheap enough
-                if (best_yes_ask <= self.longshot_max_price and 
-                    our_prob >= (self.longshot_min_prob / 100.0) and 
-                    yes_edge >= self.longshot_min_edge):
+                if (best_yes_ask <= self.longshot_max_price and
+                    our_prob >= (self.longshot_min_prob / 100.0) and
+                    yes_edge >= self.longshot_min_edge and
+                    'no' not in existing_sides):  # Skip if already holding NO (contradictory)
                     
                     # HYBRID POSITION SIZING: Kelly for high confidence, confidence scoring otherwise
                     # Check confidence: only use Kelly if CI doesn't overlap with market price
@@ -1300,9 +1323,10 @@ class WeatherDailyStrategy(TradingStrategy):
 
                 # Check NO side for longshot opportunity
                 # Use ASK price to check if it's cheap enough
-                if (best_no_ask <= self.longshot_max_price and 
-                    no_prob >= (self.longshot_min_prob / 100.0) and 
-                    no_edge >= self.longshot_min_edge):
+                if (best_no_ask <= self.longshot_max_price and
+                    no_prob >= (self.longshot_min_prob / 100.0) and
+                    no_edge >= self.longshot_min_edge and
+                    'yes' not in existing_sides):  # Skip if already holding YES (contradictory)
                     
                     # HYBRID POSITION SIZING: Kelly for high confidence, confidence scoring otherwise
                     # Check confidence: only use Kelly if CI doesn't overlap with market price
@@ -1478,7 +1502,9 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # Get required edge based on price (scaled edge for expensive contracts)
             required_yes_edge = self._get_required_edge(best_yes_ask)
-            if yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_yes):
+            if (yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
+                    and (not self.require_high_confidence or high_confidence_yes)
+                    and 'no' not in existing_sides):  # Skip if already holding NO (contradictory)
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and our_prob > 0.7 and (ci_lower_yes > best_yes_ask / 100.0)
@@ -1645,7 +1671,9 @@ class WeatherDailyStrategy(TradingStrategy):
 
             # Get required edge based on price (scaled edge for expensive contracts)
             required_no_edge = self._get_required_edge(best_no_ask)
-            if no_edge >= required_no_edge and no_ev >= self.min_ev_threshold and (not self.require_high_confidence or high_confidence_no):
+            if (no_edge >= required_no_edge and no_ev >= self.min_ev_threshold
+                    and (not self.require_high_confidence or high_confidence_no)
+                    and 'yes' not in existing_sides):  # Skip if already holding YES (contradictory)
                 # HYBRID POSITION SIZING for conservative trades
                 # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
                 use_kelly = len(forecasts) >= 2 and no_prob > 0.7 and (ci_lower_no > best_no_ask / 100.0)
@@ -1926,6 +1954,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # Exit condition 3: Edge disappeared (re-evaluate market)
             # Re-run strategy evaluation to check if edge still exists
             try:
+                self._checking_exit = True
                 decisions = self.get_trade_decision(market, orderbook)
                 # If we get a decision for the same side, edge still exists
                 # If no decision or different side, edge is gone
@@ -1958,7 +1987,9 @@ class WeatherDailyStrategy(TradingStrategy):
                         logger.debug(f"Edge gone on {market_ticker} but holding (loss: {profit_pct:.1f}%)")
             except Exception as e:
                 logger.debug(f"Could not re-evaluate edge for {market_ticker}: {e}")
-            
+            finally:
+                self._checking_exit = False
+
             return None
             
         except Exception as e:

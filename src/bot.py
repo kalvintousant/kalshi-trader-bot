@@ -145,21 +145,26 @@ class KalshiTradingBot:
 
         # Calculate daily P&L for weather markets only
         # P&L = (current exposure + settlements) - (starting exposure + fills cost)
-        if self.starting_weather_exposure is not None:
-            todays_fills_cost = self._get_todays_weather_fills_cost()
-            todays_settlements = self._get_todays_weather_settlements()
-
-            # Total invested = starting exposure + new buys today
-            total_invested = self.starting_weather_exposure + todays_fills_cost
-            # Total return = current exposure + settlements received
-            total_return = current_weather_exposure + todays_settlements
-
-            self.daily_pnl = total_return - total_invested
-        else:
-            # First check of the day - set starting value
-            self.starting_weather_exposure = current_weather_exposure
+        if self.starting_weather_exposure is None:
+            # First check after restart - back-calculate starting exposure from
+            # today's fills/settlements so the loss limit survives restarts.
+            # starting_exposure = current_exposure + fills_cost - settlements
             self.today_start_timestamp = int(datetime.combine(datetime.now().date(), datetime.min.time()).timestamp() * 1000)
-            self.daily_pnl = 0
+            todays_fills = self._get_todays_weather_fills_cost()
+            todays_settlements = self._get_todays_weather_settlements()
+            self.starting_weather_exposure = current_weather_exposure + todays_fills - todays_settlements
+            logger.info(f"Reconstructed starting exposure: ${self.starting_weather_exposure:.2f} (current=${current_weather_exposure:.2f}, fills=${todays_fills:.2f}, settlements=${todays_settlements:.2f})")
+            # Fall through to compute actual P&L (don't assume $0)
+
+        todays_fills_cost = self._get_todays_weather_fills_cost()
+        todays_settlements = self._get_todays_weather_settlements()
+
+        # Total invested = starting exposure + new buys today
+        total_invested = self.starting_weather_exposure + todays_fills_cost
+        # Total return = current exposure + settlements received
+        total_return = current_weather_exposure + todays_settlements
+
+        self.daily_pnl = total_return - total_invested
 
         # Check if we've hit the loss limit
         if self.daily_pnl <= -Config.MAX_DAILY_LOSS:
@@ -472,11 +477,7 @@ class KalshiTradingBot:
                     self._scan_skipped_count += 1
                     continue
 
-                # Pace API calls: 250ms between each market evaluation
-                if i > 0:
-                    time.sleep(0.25)
-
-                # Quick filter check before expensive orderbook call
+                # Quick filter check before expensive orderbook call (no API calls, so no pacing needed)
                 should_trade = any(strategy.should_trade(market) for strategy in self.strategy_manager.strategies)
                 if not should_trade:
                     ticker = market.get('ticker', 'unknown')
@@ -495,6 +496,16 @@ class KalshiTradingBot:
                     continue
                 
                 markets_evaluated += 1
+
+                # Re-check daily loss limit before each evaluation (prevents trading during long scans)
+                if self.check_daily_loss_limit():
+                    logger.warning("Pausing trading mid-scan due to daily loss limit")
+                    break
+
+                # Pace API calls: 250ms between markets that actually get evaluated
+                if markets_evaluated > 1:
+                    time.sleep(0.25)
+
                 logger.debug(f"Evaluating market: {market.get('ticker', 'unknown')} - {market.get('title', 'unknown')[:50]}")
                 
                 # Evaluate market with all strategies

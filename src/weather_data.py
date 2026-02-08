@@ -152,6 +152,11 @@ class WeatherDataAggregator:
         # Positive bias = model runs hot, negative = model runs cold
         self.model_bias = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
 
+        # Seed LAX warm bias from observed forecast errors (coastal marine layer)
+        for source in self.source_weights:
+            self.model_bias[source]['LAX'][1] = 2.0  # January
+            self.model_bias[source]['LAX'][2] = 2.0  # February
+
         # Historical forecast error tracking
         # Format: {series_ticker: {month: [errors...]}}
         self.forecast_error_history = defaultdict(lambda: defaultdict(list))

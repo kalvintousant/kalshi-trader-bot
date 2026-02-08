@@ -13,8 +13,8 @@ class Config:
     # Trading Settings
     MAX_POSITION_SIZE = int(os.getenv('MAX_POSITION_SIZE', '10'))
     MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '10'))  # $10 max daily loss limit
-    MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '15'))  # Max contracts per market (reduced from 25)
-    MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '3.0'))  # Max dollars per market (reduced from $15 to $3)
+    MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '10'))  # Max contracts per base market
+    MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '5.0'))  # Max dollars per base market
     # Skip placing an order if computed size would be below this (avoids many 1-contract orders).
     MIN_ORDER_CONTRACTS = int(os.getenv('MIN_ORDER_CONTRACTS', '1'))  # 1 = allow 1-contract orders; 2+ = require at least that many
     ENABLED_STRATEGIES = os.getenv('ENABLED_STRATEGIES', 'weather_daily').split(',')
@@ -123,6 +123,9 @@ class Config:
     MAX_SOURCE_RMSE = float(os.getenv('MAX_SOURCE_RMSE', '4.0'))
     # Enable/disable persisting learned state (biases, errors) across restarts
     PERSIST_LEARNING = os.getenv('PERSIST_LEARNING', 'true').lower() == 'true'
+
+    # Hard-disabled cities (bypasses all other filters — will never trade)
+    DISABLED_CITIES = {c.strip() for c in os.getenv('DISABLED_CITIES', 'DEN').split(',') if c.strip()}
 
     # Market Tickers
     # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles

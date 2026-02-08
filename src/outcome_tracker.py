@@ -86,7 +86,8 @@ class OutcomeTracker:
                 if not ticker_fills:
                     continue
                 try:
-                    market = self.client.get_market(market_ticker)
+                    market_response = self.client.get_market(market_ticker)
+                    market = market_response.get('market', market_response)  # Unwrap nested response
                     status = market.get('status', '').lower()
                     if status in ['closed', 'finalized', 'settled']:
                         settled_positions.append({
