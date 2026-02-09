@@ -33,6 +33,7 @@ class KalshiTradingBot:
         self.last_reset_date = datetime.now().date()
         self.starting_weather_exposure = None  # Track starting weather position value for daily P&L
         self.today_start_timestamp = None  # Timestamp for filtering today's fills/settlements
+        self._last_loss_limit_log = None  # Throttle loss limit log to once per hour
         
         # Track seen markets to detect new ones quickly
         self.seen_markets: Set[str] = set()
@@ -168,10 +169,13 @@ class KalshiTradingBot:
 
         # Check if we've hit the loss limit
         if self.daily_pnl <= -Config.MAX_DAILY_LOSS:
-            logger.critical(f"⛔ Daily loss limit reached (weather markets only)!")
-            logger.critical(f"Starting weather exposure: ${self.starting_weather_exposure:.2f}")
-            logger.critical(f"Current weather exposure: ${current_weather_exposure:.2f}")
-            logger.critical(f"Weather P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+            now = datetime.now()
+            if self._last_loss_limit_log is None or (now - self._last_loss_limit_log).total_seconds() >= 3600:
+                logger.critical(f"⛔ Daily loss limit reached (weather markets only)!")
+                logger.critical(f"Starting weather exposure: ${self.starting_weather_exposure:.2f}")
+                logger.critical(f"Current weather exposure: ${current_weather_exposure:.2f}")
+                logger.critical(f"Weather P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+                self._last_loss_limit_log = now
             return True
         return False
     
@@ -384,7 +388,6 @@ class KalshiTradingBot:
     def scan_and_trade(self):
         """Scan markets and execute trades"""
         if self.check_daily_loss_limit():
-            logger.warning("Pausing trading due to daily loss limit")
             return
 
         logger.debug(f"Scanning markets at {datetime.now()}")
@@ -499,7 +502,6 @@ class KalshiTradingBot:
 
                 # Re-check daily loss limit before each evaluation (prevents trading during long scans)
                 if self.check_daily_loss_limit():
-                    logger.warning("Pausing trading mid-scan due to daily loss limit")
                     break
 
                 # Pace API calls: 250ms between markets that actually get evaluated
