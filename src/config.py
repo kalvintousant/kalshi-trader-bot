@@ -21,14 +21,14 @@ class Config:
     
     # Weather Strategy Parameters
     # Conservative strategy
-    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '8.0'))  # Minimum edge % to trade (raised from 5% to filter marginal trades)
-    MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.01'))  # Minimum EV in dollars
+    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '15.0'))  # Minimum edge % to trade (raised to 15% until probability model validated)
+    MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.05'))  # Minimum EV in dollars (meaningful buffer above noise)
     # If True, only trade when confidence interval does NOT overlap market price (stricter).
     # If False (default), trade when edge/EV meet thresholds even if CI overlaps (more trades, higher risk).
     REQUIRE_HIGH_CONFIDENCE = os.getenv('REQUIRE_HIGH_CONFIDENCE', 'false').lower() == 'true'
     
     # Longshot strategy
-    LONGSHOT_ENABLED = os.getenv('LONGSHOT_ENABLED', 'true').lower() == 'true'
+    LONGSHOT_ENABLED = os.getenv('LONGSHOT_ENABLED', 'false').lower() == 'true'  # Disabled until probability model validated
     LONGSHOT_MAX_PRICE = int(os.getenv('LONGSHOT_MAX_PRICE', '10'))  # Only consider if market price ≤ 10¢
     LONGSHOT_MIN_EDGE = float(os.getenv('LONGSHOT_MIN_EDGE', '30.0'))  # Require massive edge (30%+)
     LONGSHOT_MIN_PROB = float(os.getenv('LONGSHOT_MIN_PROB', '50.0'))  # Our probability must be ≥ 50%
@@ -38,9 +38,9 @@ class Config:
     
     # Market filtering
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
-    MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '3'))  # Max days in future for forecasts
+    MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '1'))  # 1-day horizon: only trade today/tomorrow (forecasts most accurate)
     # Never buy at or above this price (cents). Data shows 51-75¢ entries lose money (42% win rate).
-    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '50'))  # Cap at 50¢ - profitable win rates at 1-50¢ entries
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '40'))  # Cap at 40¢ - reduce exposure on expensive contracts
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
     MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '2.0'))  # Skip trades within 2°F of threshold (reduces coin-flip losses)
@@ -107,22 +107,34 @@ class Config:
     EV_PROPORTIONAL_ENABLED = os.getenv('EV_PROPORTIONAL_ENABLED', 'true').lower() == 'true'
     EV_BASELINE_LONGSHOT = float(os.getenv('EV_BASELINE_LONGSHOT', '0.05'))  # $0.05 baseline
     EV_BASELINE_CONSERVATIVE = float(os.getenv('EV_BASELINE_CONSERVATIVE', '0.02'))  # $0.02 baseline
+
+    # 5. Fee-Aware Sizing: Adjust position size based on price band profitability
+    # Historical data shows: 0% win rate <10¢, sweet spot at 15-40¢, diminishing returns above
+    FEE_AWARE_SIZING_ENABLED = os.getenv('FEE_AWARE_SIZING_ENABLED', 'true').lower() == 'true'
+    FEE_AWARE_SWEET_LOW = int(os.getenv('FEE_AWARE_SWEET_LOW', '15'))   # Sweet spot lower bound (cents)
+    FEE_AWARE_SWEET_HIGH = int(os.getenv('FEE_AWARE_SWEET_HIGH', '40'))  # Sweet spot upper bound (cents)
+    FEE_AWARE_SWEET_MULTIPLIER = float(os.getenv('FEE_AWARE_SWEET_MULTIPLIER', '1.5'))  # Boost in sweet spot
+    FEE_AWARE_CHEAP_MULTIPLIER = float(os.getenv('FEE_AWARE_CHEAP_MULTIPLIER', '0.5'))  # Reduce for cheap contracts
+    FEE_AWARE_EXPENSIVE_MULTIPLIER = float(os.getenv('FEE_AWARE_EXPENSIVE_MULTIPLIER', '0.75'))  # Reduce for expensive
     
     # Adaptive Learning Settings
     # Enable/disable adaptive city management (auto-disable poor performers)
     ADAPTIVE_ENABLED = os.getenv('ADAPTIVE_ENABLED', 'true').lower() == 'true'
-    # Minimum trades before evaluating city performance
-    ADAPTIVE_MIN_TRADES = int(os.getenv('ADAPTIVE_MIN_TRADES', '20'))
-    # Disable city if win rate falls below this threshold (40% = 0.40)
-    ADAPTIVE_DISABLE_WIN_RATE = float(os.getenv('ADAPTIVE_DISABLE_WIN_RATE', '0.40'))
-    # How long to disable a city (in hours)
-    ADAPTIVE_DISABLE_HOURS = int(os.getenv('ADAPTIVE_DISABLE_HOURS', '24'))
+    # Minimum trades before evaluating city performance (lowered from 20 for faster response)
+    ADAPTIVE_MIN_TRADES = int(os.getenv('ADAPTIVE_MIN_TRADES', '10'))
+    # Disable city if win rate falls below this threshold (raised from 40% — need >50% to be profitable)
+    ADAPTIVE_DISABLE_WIN_RATE = float(os.getenv('ADAPTIVE_DISABLE_WIN_RATE', '0.50'))
+    # How long to disable a city (in hours) — extended from 24h to 72h for meaningful cooldown
+    ADAPTIVE_DISABLE_HOURS = int(os.getenv('ADAPTIVE_DISABLE_HOURS', '72'))
     # How often to check if disabled cities should be re-enabled (in hours)
     ADAPTIVE_REENABLE_CHECK_HOURS = int(os.getenv('ADAPTIVE_REENABLE_CHECK_HOURS', '6'))
     # Maximum source RMSE before marking unreliable (in degrees F)
     MAX_SOURCE_RMSE = float(os.getenv('MAX_SOURCE_RMSE', '4.0'))
     # Enable/disable persisting learned state (biases, errors) across restarts
     PERSIST_LEARNING = os.getenv('PERSIST_LEARNING', 'true').lower() == 'true'
+
+    # Paper Trading Mode (simulate trades without placing real orders)
+    PAPER_TRADING = os.getenv('PAPER_TRADING', 'false').lower() == 'true'
 
     # Hard-disabled cities (bypasses all other filters — will never trade)
     DISABLED_CITIES = {c.strip() for c in os.getenv('DISABLED_CITIES', 'DEN').split(',') if c.strip()}

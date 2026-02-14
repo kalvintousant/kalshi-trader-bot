@@ -139,6 +139,14 @@ class TradingStrategy:
                     'sides_held': sides_held
                 }
 
+            # In paper mode, add paper positions to real exposure
+            if Config.PAPER_TRADING and hasattr(self, '_paper_positions'):
+                pp = self._paper_positions.get(base_market)
+                if pp:
+                    total_contracts += pp['contracts']
+                    total_dollars += pp['dollars']
+                    sides_held |= pp['sides']
+
             return {
                 'total_contracts': total_contracts,
                 'total_dollars': total_dollars,
@@ -164,41 +172,121 @@ class TradingStrategy:
         """Get trading decision: {'action': 'buy'/'sell', 'side': 'yes'/'no', 'count': int, 'price': int}"""
         raise NotImplementedError
     
+    def _check_contradictory_position(self, market_ticker: str, side: str) -> bool:
+        """
+        HARD CHECK: Block if we already hold the opposite side on this ticker
+        or any ticker in the same event/base market.
+
+        Returns True if contradictory position exists (trade should be BLOCKED).
+        """
+        opposite_side = 'no' if side == 'yes' else 'yes'
+
+        # Extract base market (e.g., KXHIGHNY-26FEB07 from KXHIGHNY-26FEB07-T24)
+        parts = market_ticker.split('-')
+        base_market = '-'.join(parts[:2]) if len(parts) >= 2 else market_ticker
+
+        try:
+            positions = self.client.get_positions()
+            for position in positions:
+                pos_ticker = position.get('ticker', '')
+                pos_count = position.get('position', 0)
+                if pos_count == 0:
+                    continue
+
+                # Check if position is on the same base market
+                pos_parts = pos_ticker.split('-')
+                pos_base = '-'.join(pos_parts[:2]) if len(pos_parts) >= 2 else pos_ticker
+
+                if pos_base == base_market:
+                    # Determine which side this position is on
+                    # Positive position = YES, Negative position = NO
+                    held_side = 'yes' if pos_count > 0 else 'no'
+
+                    if held_side == opposite_side:
+                        logger.warning(
+                            f"⛔ CONTRADICTORY POSITION BLOCKED: "
+                            f"Cannot buy {side.upper()} on {market_ticker} — "
+                            f"already hold {held_side.upper()} on {pos_ticker} "
+                            f"({abs(pos_count)} contracts) in same market {base_market}"
+                        )
+                        return True
+        except Exception as e:
+            # If we can't verify positions, BLOCK to be safe
+            logger.warning(f"⛔ Cannot verify positions for {market_ticker}, blocking trade: {e}")
+            return True
+
+        # Also check resting orders for the opposite side
+        try:
+            orders = self.client.get_orders(status='resting', use_cache=False)
+            for order in orders:
+                order_ticker = order.get('ticker', '')
+                order_parts = order_ticker.split('-')
+                order_base = '-'.join(order_parts[:2]) if len(order_parts) >= 2 else order_ticker
+
+                if order_base == base_market and order.get('side') == opposite_side:
+                    remaining = order.get('remaining_count', 0)
+                    if remaining > 0:
+                        logger.warning(
+                            f"⛔ CONTRADICTORY ORDER BLOCKED: "
+                            f"Cannot buy {side.upper()} on {market_ticker} — "
+                            f"already have resting {opposite_side.upper()} order on {order_ticker} "
+                            f"({remaining} contracts) in same market {base_market}"
+                        )
+                        return True
+        except Exception as e:
+            logger.warning(f"Could not check resting orders for contradictory positions: {e}")
+            # Don't block here — position check above is the primary guard
+
+        return False
+
     def execute_trade(self, decision: Dict, market_ticker: str) -> Optional[Dict]:
         """Execute a trade"""
         try:
+            # CRITICAL: Hard block on contradictory positions BEFORE anything else
+            trade_side = decision.get('side', '')
+            if self._check_contradictory_position(market_ticker, trade_side):
+                return None
+
             # CRITICAL: Re-check exposure limits RIGHT BEFORE placing order
             # This prevents multiple strategies/scans from over-trading the same market
             existing_exposure = self._get_market_exposure(market_ticker)
             existing_contracts = existing_exposure['total_contracts']
             existing_dollars = existing_exposure['total_dollars']
             base_market = existing_exposure.get('base_market', market_ticker)
-            
+
             # Check if we would exceed limits with this trade
             new_count = decision.get('count', 0)
             new_price = decision.get('price', 0)
-            new_dollars = (new_count * new_price) / 100.0
-            
+
             # Never buy at 100¢ (no value)
             if new_price > Config.MAX_BUY_PRICE_CENTS:
                 logger.warning(f"⛔ BLOCKED trade on {market_ticker}: price {new_price}¢ > MAX_BUY_PRICE_CENTS ({Config.MAX_BUY_PRICE_CENTS})")
                 return None
-            
+
+            # Cap quantity to remaining contract capacity
+            contracts_remaining = max(0, Config.MAX_CONTRACTS_PER_MARKET - existing_contracts)
+            if contracts_remaining <= 0:
+                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: at contract limit ({existing_contracts}/{Config.MAX_CONTRACTS_PER_MARKET}) for {base_market}")
+                return None
+
+            # Cap quantity to remaining dollar capacity
+            dollars_remaining = max(0, Config.MAX_DOLLARS_PER_MARKET - existing_dollars)
+            dollar_cap_contracts = int(dollars_remaining * 100 / new_price) if new_price > 0 else contracts_remaining
+            if dollar_cap_contracts <= 0:
+                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: at dollar limit (${existing_dollars:.2f}/${Config.MAX_DOLLARS_PER_MARKET:.2f}) for {base_market}")
+                return None
+
+            # Apply the tighter of both caps
+            capped_count = min(new_count, contracts_remaining, dollar_cap_contracts)
+            if capped_count < new_count:
+                logger.info(f"📉 Capped trade on {market_ticker}: {new_count} → {capped_count} contracts (contract limit: {contracts_remaining}, dollar limit: {dollar_cap_contracts})")
+                decision['count'] = capped_count
+                new_count = capped_count
+
+            new_dollars = (new_count * new_price) / 100.0
+
             # Log pre-trade exposure for debugging
             logger.debug(f"Pre-trade check {market_ticker}: {existing_contracts} contracts, ${existing_dollars:.2f} | Adding: {new_count} @ {new_price}¢ = ${new_dollars:.2f}")
-
-            # Block if EITHER limit would be exceeded by this trade
-            # Uses > (not >=) to allow trading UP TO the limit (e.g., 3 contracts allowed, block 4th)
-            # NOTE: Limits apply to BASE MARKET (e.g., KXHIGHMIA-26FEB01) not per-threshold
-            if existing_contracts + new_count > Config.MAX_CONTRACTS_PER_MARKET:
-                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed BASE MARKET contract limit")
-                logger.warning(f"   Base market {base_market}: {existing_contracts} + {new_count} = {existing_contracts + new_count} > {Config.MAX_CONTRACTS_PER_MARKET}")
-                return None
-
-            if existing_dollars + new_dollars > Config.MAX_DOLLARS_PER_MARKET:
-                logger.warning(f"⛔ BLOCKED trade on {market_ticker}: Would exceed BASE MARKET dollar limit")
-                logger.warning(f"   Base market {base_market}: ${existing_dollars:.2f} + ${new_dollars:.2f} = ${existing_dollars + new_dollars:.2f} > ${Config.MAX_DOLLARS_PER_MARKET:.2f}")
-                return None
             
             # Set price for the side we're trading (YES or NO)
             price = decision.get('price', 0)
@@ -208,22 +296,48 @@ class TradingStrategy:
             else:
                 yes_price = None
                 no_price = price
-            
-            try:
-                order = self.client.create_order(
-                    ticker=market_ticker,
-                    action=decision['action'],
-                    side=decision['side'],
-                    count=decision['count'],
-                    order_type='limit',
-                    yes_price=yes_price,
-                    no_price=no_price,
-                    client_order_id=str(uuid.uuid4())
-                )
-            finally:
-                # ALWAYS invalidate orders cache after order attempt (success or failure)
-                # This ensures subsequent exposure checks see accurate order state
-                self.client.invalidate_orders_cache()
+
+            if Config.PAPER_TRADING:
+                # Paper mode: create mock order without hitting Kalshi API
+                order = {
+                    'order_id': f"PAPER-{uuid.uuid4()}",
+                    'status': 'executed',
+                    'ticker': market_ticker,
+                    'side': decision['side'],
+                    'count': decision['count'],
+                    'yes_price': yes_price,
+                    'no_price': no_price,
+                    'created_time': datetime.now().isoformat(),
+                    'paper': True
+                }
+
+                # Track paper exposure locally for limit enforcement
+                if not hasattr(self, '_paper_positions'):
+                    self._paper_positions = {}
+                parts = market_ticker.split('-')
+                base = '-'.join(parts[:2]) if len(parts) >= 2 else market_ticker
+                pp = self._paper_positions.setdefault(base, {'contracts': 0, 'dollars': 0.0, 'sides': set()})
+                pp['contracts'] += decision['count']
+                pp['dollars'] += decision['count'] * price / 100.0
+                pp['sides'].add(decision['side'])
+
+                logger.info(f"📝 PAPER TRADE: {decision['action'].upper()} {decision['count']} {decision['side'].upper()} @ {price}¢ | {market_ticker}")
+            else:
+                try:
+                    order = self.client.create_order(
+                        ticker=market_ticker,
+                        action=decision['action'],
+                        side=decision['side'],
+                        count=decision['count'],
+                        order_type='limit',
+                        yes_price=yes_price,
+                        no_price=no_price,
+                        client_order_id=str(uuid.uuid4())
+                    )
+                finally:
+                    # ALWAYS invalidate orders cache after order attempt (success or failure)
+                    # This ensures subsequent exposure checks see accurate order state
+                    self.client.invalidate_orders_cache()
 
             # Store trade in data store for backtesting
             try:
@@ -241,20 +355,21 @@ class TradingStrategy:
             except Exception as store_err:
                 logger.debug(f"Could not store trade in data store: {store_err}")
 
-            # Track order with market maker for requote management
-            order_type = decision.get('order_type', 'taker')
-            if hasattr(self, 'market_maker') and order_type == 'maker':
-                try:
-                    self.market_maker.track_order(
-                        order_id=order.get('order_id'),
-                        ticker=market_ticker,
-                        side=decision['side'],
-                        price=decision.get('price', 0),
-                        count=decision['count'],
-                        order_type=order_type
-                    )
-                except Exception as track_err:
-                    logger.debug(f"Could not track order with market maker: {track_err}")
+            # Track order with market maker for requote management (skip in paper mode)
+            if not Config.PAPER_TRADING:
+                order_type = decision.get('order_type', 'taker')
+                if hasattr(self, 'market_maker') and order_type == 'maker':
+                    try:
+                        self.market_maker.track_order(
+                            order_id=order.get('order_id'),
+                            ticker=market_ticker,
+                            side=decision['side'],
+                            price=decision.get('price', 0),
+                            count=decision['count'],
+                            order_type=order_type
+                        )
+                    except Exception as track_err:
+                        logger.debug(f"Could not track order with market maker: {track_err}")
 
             # Enhanced trade notification
             order_id = order.get('order_id', 'N/A')
@@ -464,10 +579,28 @@ class WeatherDailyStrategy(TradingStrategy):
         except ImportError as e:
             logger.warning(f"Could not load AdaptiveCityManager: {e}")
 
+        # Cross-threshold consistency: collect best decision per base market,
+        # then trade only the highest-EV threshold per city+date.
+        self._pending_decisions = {}  # {base_market: (decision_dict, market_ticker)}
+
+        # Drawdown protector — progressive loss protection
+        self.drawdown_protector = None
+        try:
+            from .drawdown_protector import DrawdownProtector
+            self.drawdown_protector = DrawdownProtector()
+            status = self.drawdown_protector.get_status()
+            if status['consecutive_losses'] > 0:
+                logger.info(f"📉 Drawdown protector: {status['level']} ({status['consecutive_losses']} consecutive losses)")
+            else:
+                logger.info("📊 Drawdown protector ENABLED — will reduce size on consecutive losses")
+        except ImportError as e:
+            logger.warning(f"Could not load DrawdownProtector: {e}")
+
     def _get_required_edge(self, price: int) -> float:
         """
-        Calculate required edge threshold based on entry price.
+        Calculate required edge threshold based on entry price and drawdown state.
         Expensive contracts require more edge to be profitable.
+        During drawdowns, edge requirements are tightened further.
 
         Args:
             price: Entry price in cents
@@ -476,15 +609,59 @@ class WeatherDailyStrategy(TradingStrategy):
             Required edge percentage
         """
         if not self.scaled_edge_enabled:
-            return self.min_edge_threshold
-
-        if price <= self.scaled_edge_price_threshold:
-            # Below threshold, use normal edge requirement
-            return self.min_edge_threshold
+            base = self.min_edge_threshold
+        elif price <= self.scaled_edge_price_threshold:
+            base = self.min_edge_threshold
         else:
-            # Above threshold, scale up edge requirement
-            # E.g., at 50¢ with 35¢ threshold and 1.5x multiplier: 8% * 1.5 = 12%
-            return self.min_edge_threshold * self.scaled_edge_multiplier
+            base = self.min_edge_threshold * self.scaled_edge_multiplier
+
+        # Apply drawdown edge multiplier (raises threshold during losing streaks)
+        if self.drawdown_protector:
+            base *= self.drawdown_protector.get_edge_multiplier()
+
+        return base
+
+    def clear_pending_decisions(self):
+        """Clear pending decisions at the start of each scan."""
+        self._pending_decisions = {}
+
+    def get_pending_decisions(self) -> List[Dict]:
+        """Return and clear all pending cross-threshold decisions.
+
+        For each base market (city+date), returns only the decision with the
+        highest EV. This ensures we trade the most mispriced threshold instead
+        of whichever threshold we happened to evaluate first.
+        """
+        results = []
+        for base_market, (decision, market_ticker) in self._pending_decisions.items():
+            decision['strategy'] = self.name
+            decision['market_ticker'] = market_ticker
+            results.append(decision)
+        self._pending_decisions = {}
+        return results
+
+    def _defer_decision(self, decision: Dict, market_ticker: str):
+        """Store a decision for cross-threshold comparison.
+
+        Only keeps the highest-EV decision per base market (city+date).
+        """
+        parts = market_ticker.split('-')
+        base_market = '-'.join(parts[:2]) if len(parts) >= 2 else market_ticker
+
+        existing = self._pending_decisions.get(base_market)
+        if existing is None or decision['ev'] > existing[0]['ev']:
+            if existing:
+                old_ticker = existing[1]
+                logger.info(
+                    f"🔄 Cross-threshold: {market_ticker} EV ${decision['ev']:.4f} beats "
+                    f"{old_ticker} EV ${existing[0]['ev']:.4f} for {base_market}"
+                )
+            self._pending_decisions[base_market] = (decision, market_ticker)
+        else:
+            logger.debug(
+                f"📊 Cross-threshold: {market_ticker} EV ${decision['ev']:.4f} worse than "
+                f"{existing[1]} EV ${existing[0]['ev']:.4f} for {base_market}, skipping"
+            )
 
     def _calculate_time_decay_factor(self, target_date: datetime, series_ticker: str) -> float:
         """
@@ -644,6 +821,261 @@ class WeatherDailyStrategy(TradingStrategy):
         liquidity_cap = int(available_contracts * Config.LIQUIDITY_CAP_PERCENT)
 
         return max(1, liquidity_cap)  # At least 1 contract
+
+    def _pick_best_candidate(self, yes_candidate, no_candidate):
+        """Given two candidate decisions, return the one with better edge."""
+        if yes_candidate and no_candidate:
+            if yes_candidate['edge'] >= no_candidate['edge']:
+                return yes_candidate
+            return no_candidate
+        return yes_candidate or no_candidate
+
+    def _build_side_decision(self, side, edge, ev, prob, ask_price, ci_lower, ci_upper,
+                             is_longshot, market_ticker, forecasts, mean_forecast,
+                             threshold, target_date, series_ticker, is_high_market,
+                             orderbook, contracts_remaining, dollars_remaining,
+                             existing_sides, yes_edge, yes_ev, no_edge, no_ev):
+        """Evaluate one side (yes/no) and return a trade decision dict or None.
+
+        Handles: contradictory position check, position sizing (EV-proportional / Kelly / Confidence),
+        time decay, correlation, adaptive multipliers, liquidity/dollar/contract caps,
+        MIN_ORDER_CONTRACTS, MAX_BUY_PRICE_CENTS, risk manager, order routing, logging.
+        """
+        opposite_side = 'no' if side == 'yes' else 'yes'
+        strategy_mode = 'longshot' if is_longshot else 'conservative'
+        mode_label = 'LONGSHOT' if is_longshot else 'Conservative'
+
+        # Contradictory position check
+        if opposite_side in existing_sides:
+            return None
+
+        # Determine Kelly usage based on mode
+        if is_longshot:
+            use_kelly = (ci_lower > ask_price / 100.0 or ci_upper < ask_price / 100.0)
+        else:
+            use_kelly = len(forecasts) >= 2 and prob > 0.7 and (ci_lower > ask_price / 100.0)
+
+        # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
+        if Config.EV_PROPORTIONAL_ENABLED:
+            base_position = self._calculate_ev_proportional_size(ev, is_longshot=is_longshot)
+            logger.debug(f"EV-proportional sizing: EV=${ev:.4f}, position={base_position}")
+        elif use_kelly and len(forecasts) >= 2:
+            payout_ratio = 1.0 / (ask_price / 100.0)
+            kelly_fractional = 0.5 if is_longshot else 0.25
+            kelly_fraction = self.weather_agg.kelly_fraction(prob, payout_ratio, fractional=kelly_fractional)
+            portfolio = self.client.get_portfolio()
+            portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
+            kelly_position = int(kelly_fraction * portfolio_value / (ask_price / 100.0))
+            if is_longshot:
+                base_position = min(kelly_position, self.max_position_size * 5)
+            else:
+                base_position = min(max(kelly_position, self.max_position_size), self.max_position_size * 2)
+            logger.debug(f"{mode_label} Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
+        else:
+            ci_width = ci_upper - ci_lower
+            confidence = self.weather_agg.calculate_confidence_score(
+                edge=edge, ci_width=ci_width, num_forecasts=len(forecasts),
+                ev=ev, is_longshot=is_longshot
+            )
+            if is_longshot:
+                confidence_multiplier = 1 + (confidence * 4)  # 1x to 5x
+                base_position = int(self.max_position_size * confidence_multiplier)
+                base_position = min(base_position, self.max_position_size * 5)
+            else:
+                confidence_multiplier = 0.5 + (confidence * 1.0)  # 0.5x to 1.5x
+                base_position = int(self.max_position_size * confidence_multiplier)
+                base_position = max(1, min(base_position, self.max_position_size * 2))
+            logger.debug(f"{mode_label} Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
+
+        # Apply time decay factor
+        if Config.TIME_DECAY_ENABLED:
+            time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
+            base_position = max(1, int(base_position * time_factor))
+            logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
+
+        # Apply correlation adjustment
+        if Config.CORRELATION_ADJUSTMENT_ENABLED:
+            corr_data = self._get_correlated_exposure(market_ticker)
+            base_position = max(1, int(base_position * corr_data['correlation_factor']))
+            if corr_data['correlation_factor'] < 1.0:
+                logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
+
+        # Apply adaptive city multiplier
+        if self.adaptive_manager and series_ticker:
+            adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
+            if adaptive_multiplier != 1.0:
+                base_position = max(1, int(base_position * adaptive_multiplier))
+                logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
+
+        # Apply fee-aware sizing: boost in 15-40¢ sweet spot, reduce outside
+        if getattr(Config, 'FEE_AWARE_SIZING_ENABLED', False):
+            if ask_price < Config.FEE_AWARE_SWEET_LOW:
+                fee_mult = Config.FEE_AWARE_CHEAP_MULTIPLIER
+            elif ask_price <= Config.FEE_AWARE_SWEET_HIGH:
+                fee_mult = Config.FEE_AWARE_SWEET_MULTIPLIER
+            else:
+                fee_mult = Config.FEE_AWARE_EXPENSIVE_MULTIPLIER
+            base_position = max(1, int(base_position * fee_mult))
+            if fee_mult != 1.0:
+                logger.debug(f"Fee-aware sizing: price {ask_price}¢, multiplier {fee_mult:.2f}x, adjusted position={base_position}")
+
+        # Apply drawdown protector
+        if self.drawdown_protector:
+            if self.drawdown_protector.is_trading_paused():
+                logger.warning(f"⛔ DRAWDOWN PAUSED: skipping {market_ticker} ({self.drawdown_protector.consecutive_losses} consecutive losses)")
+                return None
+            dd_mult = self.drawdown_protector.get_position_multiplier()
+            if dd_mult < 1.0:
+                base_position = max(1, int(base_position * dd_mult))
+                logger.debug(f"Drawdown multiplier: {dd_mult:.2f}x, adjusted position={base_position}")
+
+        # Calculate liquidity cap
+        if Config.LIQUIDITY_CAP_ENABLED:
+            liquidity_cap = self._calculate_liquidity_cap(orderbook, side, int(ask_price))
+        else:
+            liquidity_cap = self.max_position_size * 10
+
+        # Cap by remaining contract count, dollars, and liquidity
+        dollar_cap_contracts = int(dollars_remaining * 100 / ask_price) if ask_price > 0 else contracts_remaining
+        position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
+
+        if liquidity_cap < base_position:
+            logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
+
+        # Skip if no room or below minimum order size
+        if position_size <= 0:
+            logger.debug(f"📊 SKIP {market_ticker}: {strategy_mode} {side.upper()} ok but no capacity (position_size=0)")
+            return None
+        if position_size < Config.MIN_ORDER_CONTRACTS:
+            logger.debug(f"📊 SKIP {market_ticker}: {strategy_mode} {side.upper()} size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
+            return None
+
+        if ask_price > Config.MAX_BUY_PRICE_CENTS:
+            logger.debug(f"📊 SKIP {market_ticker}: {strategy_mode} {side.upper()} ask {ask_price}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
+            return None
+
+        # Apply portfolio-wide correlation adjustment via risk manager
+        position_size = self.risk_manager.adjust_position_size(
+            position_size, market_ticker, side
+        )
+        if position_size <= 0:
+            logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
+            return None
+
+        # Determine execution price (market making or taker)
+        execution_price = ask_price
+        order_type = 'taker'
+        if self.market_making_enabled and hasattr(self, 'order_router'):
+            routes = self.order_router.route_order(
+                side=side, count=position_size, orderbook=orderbook,
+                our_fair_value=int(prob * 100), edge=edge,
+                urgency=Config.MM_ORDER_URGENCY
+            )
+            if routes:
+                execution_price = routes[0]['price']
+                order_type = routes[0]['type']
+                if order_type == 'maker':
+                    logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {ask_price}¢, saving {ask_price - execution_price}¢)")
+
+        # Build enhanced decision with analysis data
+        # NOTE: active_positions write and INFO logging happen in caller
+        # after _pick_best_candidate, so only the winning side is recorded/logged.
+        time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
+        corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
+
+        decision = {
+            'action': 'buy',
+            'side': side,
+            'count': position_size,
+            'price': execution_price,
+            'edge': edge,
+            'ev': ev,
+            'strategy_mode': strategy_mode,
+            'order_type': order_type,
+            'our_probability': prob,
+            'mean_forecast': mean_forecast,
+            'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper,
+            'time_decay_factor': time_factor,
+            'num_sources': len(forecasts),
+            'threshold': str(threshold),
+            'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
+            # Internal fields for _finalize_decision (not used by order execution)
+            '_use_kelly': use_kelly,
+            '_ask_price': ask_price,
+            '_corr_factor': corr_data['correlation_factor'],
+            '_liquidity_cap': liquidity_cap,
+            '_yes_edge': yes_edge,
+            '_yes_ev': yes_ev,
+            '_no_edge': no_edge,
+            '_no_ev': no_ev,
+            '_is_longshot': is_longshot,
+            '_series_ticker': series_ticker,
+        }
+
+        return decision
+
+    def _finalize_decision(self, decision, market_ticker):
+        """Record active position, log trade info, and log decision for analysis.
+
+        Called only for the winning candidate after _pick_best_candidate.
+        """
+        side = decision['side']
+        is_longshot = decision['_is_longshot']
+        strategy_mode = decision['strategy_mode']
+        execution_price = decision['price']
+        position_size = decision['count']
+        prob = decision['our_probability']
+        edge = decision['edge']
+        ev = decision['ev']
+        ci_lower = decision['ci_lower']
+        ci_upper = decision['ci_upper']
+        use_kelly = decision['_use_kelly']
+        ask_price = decision['_ask_price']
+        series_ticker = decision['_series_ticker']
+        target_date_str = decision['target_date']
+
+        # INFO-level trade announcement (only for the winning side)
+        confidence_str = f"CI: [{ci_lower:.1%}, {ci_upper:.1%}]" if use_kelly else ""
+        if is_longshot:
+            logger.info(f"🎯 LONGSHOT {side.upper()} {market_ticker}: Ask {ask_price}¢ (cheap!), Our Prob: {prob:.1%} {confidence_str}, Edge: {edge:.1f}%, EV: ${ev:.4f} (with fees)")
+            logger.info(f"💰 Asymmetric play: Risk ${execution_price/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/execution_price):.1f}x)")
+        else:
+            logger.info(f"✓ Conservative {side.upper()} {market_ticker}: Edge: {edge:.2f}%, EV: ${ev:.4f} (with fees), Our Prob: {prob:.2%} CI: [{ci_lower:.1%}, {ci_upper:.1%}], Price: {execution_price}¢")
+
+        # Record position for exit logic
+        self.active_positions[market_ticker] = {
+            'side': side,
+            'entry_price': execution_price,
+            'entry_time': datetime.now(),
+            'count': position_size,
+            'edge': edge,
+            'ev': ev,
+            'strategy_mode': strategy_mode
+        }
+
+        # Log detailed trade decision for analysis
+        decision_label = f"{strategy_mode}_{side}"
+        self._log_trade_decision(market_ticker, {
+            'decision': decision_label,
+            'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
+                         for f, s, t in self.weather_agg.forecast_metadata.get(
+                             f"{series_ticker}_{target_date_str}", [])],
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper,
+            'time_decay_factor': decision['time_decay_factor'],
+            'correlation_factor': decision['_corr_factor'],
+            'liquidity_cap': decision['_liquidity_cap'],
+            'yes_edge': decision['_yes_edge'],
+            'yes_ev': decision['_yes_ev'],
+            'no_edge': decision['_no_edge'],
+            'no_ev': decision['_no_ev'],
+            'threshold': decision['threshold'],
+            'target_date': target_date_str,
+            'is_longshot': is_longshot,
+            'series_ticker': series_ticker
+        })
 
     def _calculate_ev_proportional_size(self, ev: float, is_longshot: bool) -> int:
         """
@@ -914,13 +1346,24 @@ class WeatherDailyStrategy(TradingStrategy):
                                     reason = f"Observed low {observed_extreme:.1f}°F already below threshold {threshold}°F (NO certain)"
                     
                     if outcome_determined:
-                        logger.debug(f"📊 SKIP {market_ticker}: outcome already determined — {reason}")
-                        
-                        # Mark this market for exclusion from future scans
+                        # OBSERVATION-BASED TRADING: Instead of just skipping,
+                        # try to buy the winning side if the market hasn't fully
+                        # priced in the certainty yet. This is the highest-edge
+                        # strategy — zero forecast uncertainty, pure market inefficiency.
+                        obs_decision = self._try_observation_trade(
+                            market, orderbook, market_ticker, series_ticker,
+                            threshold, target_date, is_high_market,
+                            observed_extreme, reason
+                        )
+                        if obs_decision:
+                            return obs_decision
+
+                        # No observation trade available — skip and exclude
+                        logger.debug(f"📊 SKIP {market_ticker}: outcome determined, no price edge — {reason}")
+
                         if hasattr(self, '_bot_ref') and self._bot_ref:
                             self._bot_ref.determined_outcome_markets.add(market_ticker)
-                            logger.debug(f"🚫 Added {market_ticker} to exclusion list (will skip in future scans)")
-                        
+
                         # Cancel any resting orders for this market since outcome is certain
                         try:
                             all_orders = self.client.get_orders(status='resting', use_cache=False)
@@ -936,11 +1379,10 @@ class WeatherDailyStrategy(TradingStrategy):
                                             logger.info(f"   ✅ Cancelled order {order_id}")
                                         except Exception as cancel_error:
                                             logger.warning(f"   ⚠️  Failed to cancel order {order_id}: {cancel_error}")
-                                # Invalidate cache after cancellations
                                 self.client.invalidate_orders_cache()
                         except Exception as e:
                             logger.warning(f"Failed to fetch/cancel orders for {market_ticker}: {e}")
-                        
+
                         return None
             
             # Get forecasts from all available sources
@@ -1035,16 +1477,16 @@ class WeatherDailyStrategy(TradingStrategy):
             yes_market_price = market.get('yes_price', 50)
             no_market_price = market.get('no_price', 50)
             
-            # For BUYING: we need to pay the ASK price (what sellers want)
-            # ASK = lowest price someone will sell at = last entry in sorted orderbook
-            # BID = highest price someone will buy at = first entry in sorted orderbook
-            best_yes_ask = yes_orders[-1][0] if len(yes_orders) > 0 else yes_market_price  # Lowest YES ask
-            best_no_ask = no_orders[-1][0] if len(no_orders) > 0 else no_market_price    # Lowest NO ask
-            
-            # Also get bids for reference (what other buyers are paying)
-            # Arrays are sorted ASCENDING, so best bid (highest) is LAST element [-1]
+            # Kalshi orderbook: each side lists BIDS (what buyers will pay) sorted ascending
+            # The [-1] entry is the HIGHEST BID (best bid), not the ask
+            # ASK for one side = 100 - best BID for the other side
+            # Example: if best NO bid is 40, then YES ask = 100 - 40 = 60
             best_yes_bid = yes_orders[-1][0] if yes_orders else yes_market_price
             best_no_bid = no_orders[-1][0] if no_orders else no_market_price
+
+            # Calculate actual ASK prices (what we'd pay to buy)
+            best_yes_ask = 100 - best_no_bid  # YES ask = 100 - NO bid
+            best_no_ask = 100 - best_yes_bid  # NO ask = 100 - YES bid
 
             # EARLY PRICE CHECK: Skip if BOTH sides are too expensive (saves calculation time)
             if best_yes_ask > Config.MAX_BUY_PRICE_CENTS and best_no_ask > Config.MAX_BUY_PRICE_CENTS:
@@ -1145,698 +1587,70 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # LONGSHOT MODE: Hunt for extreme mispricings (0.1-10% odds with massive edges)
             # Inspired by successful Polymarket bot: buy cheap certainty
+            common_args = dict(
+                market_ticker=market_ticker, forecasts=forecasts, mean_forecast=mean_forecast,
+                threshold=threshold, target_date=target_date, series_ticker=series_ticker,
+                is_high_market=is_high_market, orderbook=orderbook,
+                contracts_remaining=contracts_remaining, dollars_remaining=dollars_remaining,
+                existing_sides=existing_sides, yes_edge=yes_edge, yes_ev=yes_ev,
+                no_edge=no_edge, no_ev=no_ev
+            )
+
             if self.longshot_enabled:
-                # Check YES side for longshot opportunity
-                # Use ASK price to check if it's cheap enough
+                yes_candidate = None
+                no_candidate = None
+
                 if (best_yes_ask <= self.longshot_max_price and
                     our_prob >= (self.longshot_min_prob / 100.0) and
-                    yes_edge >= self.longshot_min_edge and
-                    'no' not in existing_sides):  # Skip if already holding NO (contradictory)
-                    
-                    # HYBRID POSITION SIZING: Kelly for high confidence, confidence scoring otherwise
-                    # Check confidence: only use Kelly if CI doesn't overlap with market price
-                    use_kelly = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
-                    
-                    # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
-                    if Config.EV_PROPORTIONAL_ENABLED:
-                        base_position = self._calculate_ev_proportional_size(yes_ev, is_longshot=True)
-                        logger.debug(f"EV-proportional sizing: EV=${yes_ev:.4f}, position={base_position}")
-                    elif use_kelly and len(forecasts) >= 2:
-                        # HIGH CONFIDENCE: Use Kelly Criterion for optimal position sizing
-                        payout_ratio = 1.0 / (best_yes_ask / 100.0)  # Payout / Stake
-                        kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.5)
-                        # Get portfolio value for Kelly calculation
-                        portfolio = self.client.get_portfolio()
-                        portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
-                        kelly_position = int(kelly_fraction * portfolio_value / (best_yes_ask / 100.0))
-                        base_position = min(kelly_position, self.max_position_size * 5)
-                        logger.debug(f"Using Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
-                    else:
-                        # LOWER CONFIDENCE: Use confidence scoring for conservative sizing
-                        ci_width = ci_upper_yes - ci_lower_yes
-                        confidence = self.weather_agg.calculate_confidence_score(
-                            edge=yes_edge,
-                            ci_width=ci_width,
-                            num_forecasts=len(forecasts),
-                            ev=yes_ev,
-                            is_longshot=True
-                        )
-                        # Scale by confidence: 0.1 confidence = 1x base, 1.0 confidence = 5x base
-                        confidence_multiplier = 1 + (confidence * 4)  # 1x to 5x
-                        base_position = int(self.max_position_size * confidence_multiplier)
-                        base_position = min(base_position, self.max_position_size * 5)  # Cap at 5x
-                        logger.debug(f"Using Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
+                    yes_edge >= self.longshot_min_edge):
+                    yes_candidate = self._build_side_decision(
+                        'yes', yes_edge, yes_ev, our_prob, best_yes_ask,
+                        ci_lower_yes, ci_upper_yes, is_longshot=True, **common_args)
 
-                    # Apply time decay factor (reduce size for markets further from temperature extreme)
-                    if Config.TIME_DECAY_ENABLED:
-                        time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
-                        base_position = max(1, int(base_position * time_factor))
-                        logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
-
-                    # Apply correlation adjustment (reduce size when holding correlated positions)
-                    if Config.CORRELATION_ADJUSTMENT_ENABLED:
-                        corr_data = self._get_correlated_exposure(market_ticker)
-                        base_position = max(1, int(base_position * corr_data['correlation_factor']))
-                        if corr_data['correlation_factor'] < 1.0:
-                            logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
-
-                    # Apply adaptive city multiplier (scale by historical win rate)
-                    if self.adaptive_manager and series_ticker:
-                        adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
-                        if adaptive_multiplier != 1.0:
-                            base_position = max(1, int(base_position * adaptive_multiplier))
-                            logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
-
-                    # Calculate liquidity cap
-                    if Config.LIQUIDITY_CAP_ENABLED:
-                        liquidity_cap = self._calculate_liquidity_cap(orderbook, 'yes', int(best_yes_ask))
-                    else:
-                        liquidity_cap = self.max_position_size * 10  # Effectively no cap
-
-                    # Cap by REMAINING contract count, dollars, and liquidity
-                    dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
-                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
-
-                    if liquidity_cap < base_position:
-                        logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
-                    
-                    # Skip if no room or below minimum order size
-                    if position_size <= 0:
-                        logger.debug(f"📊 SKIP {market_ticker}: longshot YES ok but no capacity (position_size=0)")
-                        return None
-                    if position_size < Config.MIN_ORDER_CONTRACTS:
-                        logger.debug(f"📊 SKIP {market_ticker}: longshot YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
-                        return None
-                    
-                    if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.debug(f"📊 SKIP {market_ticker}: longshot YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                        # Fall through to check NO side (don't return yet)
-                    else:
-                        # Apply portfolio-wide correlation adjustment via risk manager
-                        position_size = self.risk_manager.adjust_position_size(
-                            position_size, market_ticker, 'yes'
-                        )
-                        if position_size <= 0:
-                            logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
-                            return None
-
-                        # Determine execution price (market making or taker)
-                        execution_price = best_yes_ask
-                        order_type = 'taker'
-                        if self.market_making_enabled and hasattr(self, 'order_router'):
-                            routes = self.order_router.route_order(
-                                side='yes',
-                                count=position_size,
-                                orderbook=orderbook,
-                                our_fair_value=int(our_prob * 100),
-                                edge=yes_edge,
-                                urgency=Config.MM_ORDER_URGENCY
-                            )
-                            if routes:
-                                execution_price = routes[0]['price']
-                                order_type = routes[0]['type']
-                                if order_type == 'maker':
-                                    logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_yes_ask}¢, saving {best_yes_ask - execution_price}¢)")
-
-                        confidence_str = f"CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}]" if use_kelly else ""
-                        logger.info(f"🎯 LONGSHOT YES {market_ticker}: Ask {best_yes_ask}¢ (cheap!), Our Prob: {our_prob:.1%} {confidence_str}, Edge: {yes_edge:.1f}%, EV: ${yes_ev:.4f} (with fees)")
-                        logger.info(f"💰 Asymmetric play: Risk ${execution_price/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/execution_price):.1f}x)")
-
-                        # Record position for exit logic
-                        self.active_positions[market_ticker] = {
-                            'side': 'yes',
-                            'entry_price': execution_price,
-                            'entry_time': datetime.now(),
-                            'count': position_size,
-                            'edge': yes_edge,
-                            'ev': yes_ev,
-                            'strategy_mode': 'longshot'
-                        }
-
-                        # Build enhanced decision with analysis data
-                        time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
-                        corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
-
-                        decision = {
-                            'action': 'buy',
-                            'side': 'yes',
-                            'count': position_size,
-                            'price': execution_price,
-                            'edge': yes_edge,
-                            'ev': yes_ev,
-                            'strategy_mode': 'longshot',
-                            'order_type': order_type,
-                            # Enhanced fields for analysis
-                            'our_probability': our_prob,
-                            'mean_forecast': mean_forecast,
-                            'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
-                            'ci_lower': ci_lower_yes,
-                            'ci_upper': ci_upper_yes,
-                            'time_decay_factor': time_factor,
-                            'num_sources': len(forecasts),
-                            'threshold': str(threshold),
-                            'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
-                        }
-
-                        # Log detailed trade decision for analysis
-                        self._log_trade_decision(market_ticker, {
-                            'decision': 'longshot_yes',
-                            'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
-                                         for f, s, t in self.weather_agg.forecast_metadata.get(
-                                             f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
-                            'ci_lower': ci_lower_yes,
-                            'ci_upper': ci_upper_yes,
-                            'time_decay_factor': time_factor,
-                            'correlation_factor': corr_data['correlation_factor'],
-                            'liquidity_cap': liquidity_cap,
-                            'yes_edge': yes_edge,
-                            'yes_ev': yes_ev,
-                            'no_edge': no_edge,
-                            'no_ev': no_ev,
-                            'threshold': str(threshold),
-                            'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
-                            'is_longshot': True,
-                            'series_ticker': series_ticker
-                        })
-
-                        return decision
-
-                # Check NO side for longshot opportunity
-                # Use ASK price to check if it's cheap enough
                 if (best_no_ask <= self.longshot_max_price and
                     no_prob >= (self.longshot_min_prob / 100.0) and
-                    no_edge >= self.longshot_min_edge and
-                    'yes' not in existing_sides):  # Skip if already holding YES (contradictory)
-                    
-                    # HYBRID POSITION SIZING: Kelly for high confidence, confidence scoring otherwise
-                    # Check confidence: only use Kelly if CI doesn't overlap with market price
-                    use_kelly = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
-                    
-                    # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
-                    if Config.EV_PROPORTIONAL_ENABLED:
-                        base_position = self._calculate_ev_proportional_size(no_ev, is_longshot=True)
-                        logger.debug(f"EV-proportional sizing: EV=${no_ev:.4f}, position={base_position}")
-                    elif use_kelly and len(forecasts) >= 2:
-                        # HIGH CONFIDENCE: Use Kelly Criterion for optimal position sizing
-                        payout_ratio = 1.0 / (best_no_ask / 100.0)  # Payout / Stake
-                        kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.5)
-                        # Get portfolio value for Kelly calculation
-                        portfolio = self.client.get_portfolio()
-                        portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
-                        kelly_position = int(kelly_fraction * portfolio_value / (best_no_ask / 100.0))
-                        base_position = min(kelly_position, self.max_position_size * 5)
-                        logger.debug(f"Using Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
-                    else:
-                        # LOWER CONFIDENCE: Use confidence scoring for conservative sizing
-                        ci_width = ci_upper_no - ci_lower_no
-                        confidence = self.weather_agg.calculate_confidence_score(
-                            edge=no_edge,
-                            ci_width=ci_width,
-                            num_forecasts=len(forecasts),
-                            ev=no_ev,
-                            is_longshot=True
-                        )
-                        # Scale by confidence: 0.1 confidence = 1x base, 1.0 confidence = 5x base
-                        confidence_multiplier = 1 + (confidence * 4)  # 1x to 5x
-                        base_position = int(self.max_position_size * confidence_multiplier)
-                        base_position = min(base_position, self.max_position_size * 5)  # Cap at 5x
-                        logger.debug(f"Using Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
+                    no_edge >= self.longshot_min_edge):
+                    no_candidate = self._build_side_decision(
+                        'no', no_edge, no_ev, no_prob, best_no_ask,
+                        ci_lower_no, ci_upper_no, is_longshot=True, **common_args)
 
-                    # Apply time decay factor (reduce size for markets further from temperature extreme)
-                    if Config.TIME_DECAY_ENABLED:
-                        time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
-                        base_position = max(1, int(base_position * time_factor))
-                        logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
-
-                    # Apply correlation adjustment (reduce size when holding correlated positions)
-                    if Config.CORRELATION_ADJUSTMENT_ENABLED:
-                        corr_data = self._get_correlated_exposure(market_ticker)
-                        base_position = max(1, int(base_position * corr_data['correlation_factor']))
-                        if corr_data['correlation_factor'] < 1.0:
-                            logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
-
-                    # Apply adaptive city multiplier (scale by historical win rate)
-                    if self.adaptive_manager and series_ticker:
-                        adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
-                        if adaptive_multiplier != 1.0:
-                            base_position = max(1, int(base_position * adaptive_multiplier))
-                            logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
-
-                    # Calculate liquidity cap
-                    if Config.LIQUIDITY_CAP_ENABLED:
-                        liquidity_cap = self._calculate_liquidity_cap(orderbook, 'no', int(best_no_ask))
-                    else:
-                        liquidity_cap = self.max_position_size * 10  # Effectively no cap
-
-                    # Cap by REMAINING contract count, dollars, and liquidity
-                    dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
-                    position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
-
-                    if liquidity_cap < base_position:
-                        logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
-
-                    if position_size <= 0:
-                        logger.debug(f"📊 SKIP {market_ticker}: longshot NO ok but no capacity (position_size=0)")
-                        return None
-                    if position_size < Config.MIN_ORDER_CONTRACTS:
-                        logger.debug(f"📊 SKIP {market_ticker}: longshot NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
-                        return None
-                    
-                    if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                        logger.debug(f"📊 SKIP {market_ticker}: longshot NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                        return None  # EXPLICIT: Don't trade above price limit
-
-                    # Apply portfolio-wide correlation adjustment via risk manager
-                    position_size = self.risk_manager.adjust_position_size(
-                        position_size, market_ticker, 'no'
-                    )
-                    if position_size <= 0:
-                        logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
-                        return None
-
-                    # Determine execution price (market making or taker)
-                    execution_price = best_no_ask
-                    order_type = 'taker'
-                    if self.market_making_enabled and hasattr(self, 'order_router'):
-                        routes = self.order_router.route_order(
-                            side='no',
-                            count=position_size,
-                            orderbook=orderbook,
-                            our_fair_value=int(no_prob * 100),
-                            edge=no_edge,
-                            urgency=Config.MM_ORDER_URGENCY
-                        )
-                        if routes:
-                            execution_price = routes[0]['price']
-                            order_type = routes[0]['type']
-                            if order_type == 'maker':
-                                logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_no_ask}¢, saving {best_no_ask - execution_price}¢)")
-
-                    confidence_str = f"CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}]" if use_kelly else ""
-                    logger.info(f"🎯 LONGSHOT NO {market_ticker}: Ask {best_no_ask}¢ (cheap!), Our Prob: {no_prob:.1%} {confidence_str}, Edge: {no_edge:.1f}%, EV: ${no_ev:.4f} (with fees)")
-                    logger.info(f"💰 Asymmetric play: Risk ${execution_price/100 * position_size:.2f} for ${1.00 * position_size:.2f} payout ({(100/execution_price):.1f}x)")
-
-                    # Record position for exit logic
-                    self.active_positions[market_ticker] = {
-                        'side': 'no',
-                        'entry_price': execution_price,
-                        'entry_time': datetime.now(),
-                        'count': position_size,
-                        'edge': no_edge,
-                        'ev': no_ev,
-                        'strategy_mode': 'longshot'
-                    }
-
-                    # Build enhanced decision with analysis data
-                    time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
-                    corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
-
-                    decision = {
-                        'action': 'buy',
-                        'side': 'no',
-                        'count': position_size,
-                        'price': execution_price,
-                        'edge': no_edge,
-                        'ev': no_ev,
-                        'strategy_mode': 'longshot',
-                        'order_type': order_type,
-                        # Enhanced fields for analysis
-                        'our_probability': no_prob,
-                        'mean_forecast': mean_forecast,
-                        'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
-                        'ci_lower': ci_lower_no,
-                        'ci_upper': ci_upper_no,
-                        'time_decay_factor': time_factor,
-                        'num_sources': len(forecasts),
-                        'threshold': str(threshold),
-                        'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
-                    }
-
-                    # Log detailed trade decision for analysis
-                    self._log_trade_decision(market_ticker, {
-                        'decision': 'longshot_no',
-                        'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
-                                     for f, s, t in self.weather_agg.forecast_metadata.get(
-                                         f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
-                        'ci_lower': ci_lower_no,
-                        'ci_upper': ci_upper_no,
-                        'time_decay_factor': time_factor,
-                        'correlation_factor': corr_data['correlation_factor'],
-                        'liquidity_cap': liquidity_cap,
-                        'yes_edge': yes_edge,
-                        'yes_ev': yes_ev,
-                        'no_edge': no_edge,
-                        'no_ev': no_ev,
-                        'threshold': str(threshold),
-                        'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
-                        'is_longshot': True,
-                        'series_ticker': series_ticker
-                    })
-
-                    return decision
+                decision = self._pick_best_candidate(yes_candidate, no_candidate)
+                if decision:
+                    self._finalize_decision(decision, market_ticker)
+                    # Defer to cross-threshold comparison: keep best EV per base market
+                    self._defer_decision(decision, market_ticker)
+                    return None  # Deferred — bot.py flushes best decisions after scan
 
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             # Optionally require confidence interval to not overlap market price (REQUIRE_HIGH_CONFIDENCE)
             high_confidence_yes = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
             high_confidence_no = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
-            
+
             # Get required edge based on price (scaled edge for expensive contracts)
             required_yes_edge = self._get_required_edge(best_yes_ask)
-            if (yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
-                    and (not self.require_high_confidence or high_confidence_yes)
-                    and 'no' not in existing_sides):  # Skip if already holding NO (contradictory)
-                # HYBRID POSITION SIZING for conservative trades
-                # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
-                use_kelly = len(forecasts) >= 2 and our_prob > 0.7 and (ci_lower_yes > best_yes_ask / 100.0)
-
-                # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
-                if Config.EV_PROPORTIONAL_ENABLED:
-                    base_position = self._calculate_ev_proportional_size(yes_ev, is_longshot=False)
-                    logger.debug(f"EV-proportional sizing: EV=${yes_ev:.4f}, position={base_position}")
-                elif use_kelly:
-                    # HIGH CONFIDENCE: Kelly Criterion with very conservative fractional (0.25)
-                    payout_ratio = 1.0 / (best_yes_ask / 100.0)
-                    kelly_fraction = self.weather_agg.kelly_fraction(our_prob, payout_ratio, fractional=0.25)
-                    portfolio = self.client.get_portfolio()
-                    portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
-                    kelly_position = int(kelly_fraction * portfolio_value / (best_yes_ask / 100.0))
-                    base_position = min(max(kelly_position, self.max_position_size), self.max_position_size * 2)
-                    logger.debug(f"Conservative Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
-                else:
-                    # LOWER CONFIDENCE: Use confidence scoring
-                    ci_width = ci_upper_yes - ci_lower_yes
-                    confidence = self.weather_agg.calculate_confidence_score(
-                        edge=yes_edge,
-                        ci_width=ci_width,
-                        num_forecasts=len(forecasts),
-                        ev=yes_ev,
-                        is_longshot=False
-                    )
-                    # Conservative: 0.5 confidence = 1x, 1.0 confidence = 1.5x
-                    confidence_multiplier = 0.5 + (confidence * 1.0)  # 0.5x to 1.5x
-                    base_position = int(self.max_position_size * confidence_multiplier)
-                    base_position = max(1, min(base_position, self.max_position_size * 2))
-                    logger.debug(f"Conservative Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
-
-                # Apply time decay factor (reduce size for markets further from temperature extreme)
-                if Config.TIME_DECAY_ENABLED:
-                    time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
-                    base_position = max(1, int(base_position * time_factor))
-                    logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
-
-                # Apply correlation adjustment (reduce size when holding correlated positions)
-                if Config.CORRELATION_ADJUSTMENT_ENABLED:
-                    corr_data = self._get_correlated_exposure(market_ticker)
-                    base_position = max(1, int(base_position * corr_data['correlation_factor']))
-                    if corr_data['correlation_factor'] < 1.0:
-                        logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
-
-                # Apply adaptive city multiplier (scale by historical win rate)
-                if self.adaptive_manager and series_ticker:
-                    adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
-                    if adaptive_multiplier != 1.0:
-                        base_position = max(1, int(base_position * adaptive_multiplier))
-                        logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
-
-                # Calculate liquidity cap
-                if Config.LIQUIDITY_CAP_ENABLED:
-                    liquidity_cap = self._calculate_liquidity_cap(orderbook, 'yes', int(best_yes_ask))
-                else:
-                    liquidity_cap = self.max_position_size * 10  # Effectively no cap
-
-                # Cap by REMAINING capacity, dollars, and liquidity
-                dollar_cap_contracts = int(dollars_remaining * 100 / best_yes_ask) if best_yes_ask > 0 else contracts_remaining
-                position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
-
-                if liquidity_cap < base_position:
-                    logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
-
-                if position_size <= 0:
-                    logger.debug(f"📊 SKIP {market_ticker}: conservative YES ok but no capacity (position_size=0)")
-                    return None
-                if position_size < Config.MIN_ORDER_CONTRACTS:
-                    logger.debug(f"📊 SKIP {market_ticker}: conservative YES size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
-                    return None
-                
-                if best_yes_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.debug(f"📊 SKIP {market_ticker}: conservative YES ask {best_yes_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                    return None  # EXPLICIT: Don't trade above price limit
-
-                # Apply portfolio-wide correlation adjustment via risk manager
-                position_size = self.risk_manager.adjust_position_size(
-                    position_size, market_ticker, 'yes'
-                )
-                if position_size <= 0:
-                    logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
-                    return None
-
-                # Determine execution price (market making or taker)
-                execution_price = best_yes_ask
-                order_type = 'taker'
-                if self.market_making_enabled and hasattr(self, 'order_router'):
-                    routes = self.order_router.route_order(
-                        side='yes',
-                        count=position_size,
-                        orderbook=orderbook,
-                        our_fair_value=int(our_prob * 100),
-                        edge=yes_edge,
-                        urgency=Config.MM_ORDER_URGENCY
-                    )
-                    if routes:
-                        execution_price = routes[0]['price']
-                        order_type = routes[0]['type']
-                        if order_type == 'maker':
-                            logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_yes_ask}¢, saving {best_yes_ask - execution_price}¢)")
-
-                logger.info(f"✓ Conservative YES {market_ticker}: Edge: {yes_edge:.2f}%, EV: ${yes_ev:.4f} (with fees), Our Prob: {our_prob:.2%} CI: [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}], Price: {execution_price}¢")
-
-                # Record position for exit logic
-                self.active_positions[market_ticker] = {
-                    'side': 'yes',
-                    'entry_price': execution_price,
-                    'entry_time': datetime.now(),
-                    'count': position_size,
-                    'edge': yes_edge,
-                    'ev': yes_ev,
-                    'strategy_mode': 'conservative'
-                }
-
-                # Build enhanced decision with analysis data
-                time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
-                corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
-
-                decision = {
-                    'action': 'buy',
-                    'side': 'yes',
-                    'count': position_size,
-                    'price': execution_price,
-                    'edge': yes_edge,
-                    'ev': yes_ev,
-                    'strategy_mode': 'conservative',
-                    'order_type': order_type,
-                    # Enhanced fields for analysis
-                    'our_probability': our_prob,
-                    'mean_forecast': mean_forecast,
-                    'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
-                    'ci_lower': ci_lower_yes,
-                    'ci_upper': ci_upper_yes,
-                    'time_decay_factor': time_factor,
-                    'num_sources': len(forecasts),
-                    'threshold': str(threshold),
-                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
-                }
-
-                # Log detailed trade decision for analysis
-                self._log_trade_decision(market_ticker, {
-                    'decision': 'conservative_yes',
-                    'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
-                                 for f, s, t in self.weather_agg.forecast_metadata.get(
-                                     f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
-                    'ci_lower': ci_lower_yes,
-                    'ci_upper': ci_upper_yes,
-                    'time_decay_factor': time_factor,
-                    'correlation_factor': corr_data['correlation_factor'],
-                    'liquidity_cap': liquidity_cap,
-                    'yes_edge': yes_edge,
-                    'yes_ev': yes_ev,
-                    'no_edge': no_edge,
-                    'no_ev': no_ev,
-                    'threshold': str(threshold),
-                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
-                    'is_longshot': False,
-                    'series_ticker': series_ticker
-                })
-
-                return decision
-
-            # Get required edge based on price (scaled edge for expensive contracts)
             required_no_edge = self._get_required_edge(best_no_ask)
+
+            yes_candidate = None
+            no_candidate = None
+
+            if (yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
+                    and (not self.require_high_confidence or high_confidence_yes)):
+                yes_candidate = self._build_side_decision(
+                    'yes', yes_edge, yes_ev, our_prob, best_yes_ask,
+                    ci_lower_yes, ci_upper_yes, is_longshot=False, **common_args)
+
             if (no_edge >= required_no_edge and no_ev >= self.min_ev_threshold
-                    and (not self.require_high_confidence or high_confidence_no)
-                    and 'yes' not in existing_sides):  # Skip if already holding YES (contradictory)
-                # HYBRID POSITION SIZING for conservative trades
-                # Use Kelly for high confidence (2+ sources, high prob), confidence scoring otherwise
-                use_kelly = len(forecasts) >= 2 and no_prob > 0.7 and (ci_lower_no > best_no_ask / 100.0)
+                    and (not self.require_high_confidence or high_confidence_no)):
+                no_candidate = self._build_side_decision(
+                    'no', no_edge, no_ev, no_prob, best_no_ask,
+                    ci_lower_no, ci_upper_no, is_longshot=False, **common_args)
 
-                # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
-                if Config.EV_PROPORTIONAL_ENABLED:
-                    base_position = self._calculate_ev_proportional_size(no_ev, is_longshot=False)
-                    logger.debug(f"EV-proportional sizing: EV=${no_ev:.4f}, position={base_position}")
-                elif use_kelly:
-                    # HIGH CONFIDENCE: Kelly Criterion with very conservative fractional (0.25)
-                    payout_ratio = 1.0 / (best_no_ask / 100.0)
-                    kelly_fraction = self.weather_agg.kelly_fraction(no_prob, payout_ratio, fractional=0.25)
-                    portfolio = self.client.get_portfolio()
-                    portfolio_value = (portfolio.get('balance', 0) + portfolio.get('portfolio_value', 0)) / 100.0
-                    kelly_position = int(kelly_fraction * portfolio_value / (best_no_ask / 100.0))
-                    base_position = min(max(kelly_position, self.max_position_size), self.max_position_size * 2)
-                    logger.debug(f"Conservative Kelly: fraction={kelly_fraction:.3f}, position={base_position}")
-                else:
-                    # LOWER CONFIDENCE: Use confidence scoring
-                    ci_width = ci_upper_no - ci_lower_no
-                    confidence = self.weather_agg.calculate_confidence_score(
-                        edge=no_edge,
-                        ci_width=ci_width,
-                        num_forecasts=len(forecasts),
-                        ev=no_ev,
-                        is_longshot=False
-                    )
-                    # Conservative: 0.5 confidence = 1x, 1.0 confidence = 1.5x
-                    confidence_multiplier = 0.5 + (confidence * 1.0)  # 0.5x to 1.5x
-                    base_position = int(self.max_position_size * confidence_multiplier)
-                    base_position = max(1, min(base_position, self.max_position_size * 2))
-                    logger.debug(f"Conservative Confidence: score={confidence:.3f}, multiplier={confidence_multiplier:.2f}x, position={base_position}")
-
-                # Apply time decay factor (reduce size for markets further from temperature extreme)
-                if Config.TIME_DECAY_ENABLED:
-                    time_factor = self._calculate_time_decay_factor(target_date, series_ticker)
-                    base_position = max(1, int(base_position * time_factor))
-                    logger.debug(f"Time decay: factor={time_factor:.2f}, adjusted position={base_position}")
-
-                # Apply correlation adjustment (reduce size when holding correlated positions)
-                if Config.CORRELATION_ADJUSTMENT_ENABLED:
-                    corr_data = self._get_correlated_exposure(market_ticker)
-                    base_position = max(1, int(base_position * corr_data['correlation_factor']))
-                    if corr_data['correlation_factor'] < 1.0:
-                        logger.debug(f"Correlation adjustment: factor={corr_data['correlation_factor']:.2f}, correlated contracts={corr_data['total_contracts']}")
-
-                # Apply adaptive city multiplier (scale by historical win rate)
-                if self.adaptive_manager and series_ticker:
-                    adaptive_multiplier = self.adaptive_manager.get_position_multiplier(series_ticker)
-                    if adaptive_multiplier != 1.0:
-                        base_position = max(1, int(base_position * adaptive_multiplier))
-                        logger.debug(f"Adaptive multiplier: {adaptive_multiplier:.2f}x, adjusted position={base_position}")
-
-                # Calculate liquidity cap
-                if Config.LIQUIDITY_CAP_ENABLED:
-                    liquidity_cap = self._calculate_liquidity_cap(orderbook, 'no', int(best_no_ask))
-                else:
-                    liquidity_cap = self.max_position_size * 10  # Effectively no cap
-
-                # Cap by REMAINING capacity, dollars, and liquidity
-                dollar_cap_contracts = int(dollars_remaining * 100 / best_no_ask) if best_no_ask > 0 else contracts_remaining
-                position_size = min(base_position, contracts_remaining, dollar_cap_contracts, liquidity_cap)
-
-                if liquidity_cap < base_position:
-                    logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
-
-                if position_size <= 0:
-                    logger.debug(f"📊 SKIP {market_ticker}: conservative NO ok but no capacity (position_size=0)")
-                    return None
-                if position_size < Config.MIN_ORDER_CONTRACTS:
-                    logger.debug(f"📊 SKIP {market_ticker}: conservative NO size {position_size} < MIN_ORDER_CONTRACTS ({Config.MIN_ORDER_CONTRACTS})")
-                    return None
-                
-                if best_no_ask > Config.MAX_BUY_PRICE_CENTS:
-                    logger.debug(f"📊 SKIP {market_ticker}: conservative NO ask {best_no_ask}¢ exceeds max price ({Config.MAX_BUY_PRICE_CENTS}¢)")
-                    return None  # EXPLICIT: Don't trade above price limit
-
-                # Apply portfolio-wide correlation adjustment via risk manager
-                position_size = self.risk_manager.adjust_position_size(
-                    position_size, market_ticker, 'no'
-                )
-                if position_size <= 0:
-                    logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
-                    return None
-
-                # Determine execution price (market making or taker)
-                execution_price = best_no_ask
-                order_type = 'taker'
-                if self.market_making_enabled and hasattr(self, 'order_router'):
-                    routes = self.order_router.route_order(
-                        side='no',
-                        count=position_size,
-                        orderbook=orderbook,
-                        our_fair_value=int(no_prob * 100),
-                        edge=no_edge,
-                        urgency=Config.MM_ORDER_URGENCY
-                    )
-                    if routes:
-                        execution_price = routes[0]['price']
-                        order_type = routes[0]['type']
-                        if order_type == 'maker':
-                            logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {best_no_ask}¢, saving {best_no_ask - execution_price}¢)")
-
-                logger.info(f"✓ Conservative NO {market_ticker}: Edge: {no_edge:.2f}%, EV: ${no_ev:.4f} (with fees), Our Prob: {no_prob:.2%} CI: [{ci_lower_no:.1%}, {ci_upper_no:.1%}], Price: {execution_price}¢")
-
-                # Record position for exit logic
-                self.active_positions[market_ticker] = {
-                    'side': 'no',
-                    'entry_price': execution_price,
-                    'entry_time': datetime.now(),
-                    'count': position_size,
-                    'edge': no_edge,
-                    'ev': no_ev,
-                    'strategy_mode': 'conservative'
-                }
-
-                # Build enhanced decision with analysis data
-                time_factor = self._calculate_time_decay_factor(target_date, series_ticker) if Config.TIME_DECAY_ENABLED else 1.0
-                corr_data = self._get_correlated_exposure(market_ticker) if Config.CORRELATION_ADJUSTMENT_ENABLED else {'correlation_factor': 1.0}
-
-                decision = {
-                    'action': 'buy',
-                    'side': 'no',
-                    'count': position_size,
-                    'price': execution_price,
-                    'edge': no_edge,
-                    'ev': no_ev,
-                    'strategy_mode': 'conservative',
-                    'order_type': order_type,
-                    # Enhanced fields for analysis
-                    'our_probability': no_prob,
-                    'mean_forecast': mean_forecast,
-                    'forecast_std': float(np.std(forecasts)) if len(forecasts) > 1 else 0,
-                    'ci_lower': ci_lower_no,
-                    'ci_upper': ci_upper_no,
-                    'time_decay_factor': time_factor,
-                    'num_sources': len(forecasts),
-                    'threshold': str(threshold),
-                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else ''
-                }
-
-                # Log detailed trade decision for analysis
-                self._log_trade_decision(market_ticker, {
-                    'decision': 'conservative_no',
-                    'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
-                                 for f, s, t in self.weather_agg.forecast_metadata.get(
-                                     f"{series_ticker}_{target_date.strftime('%Y-%m-%d')}", [])],
-                    'ci_lower': ci_lower_no,
-                    'ci_upper': ci_upper_no,
-                    'time_decay_factor': time_factor,
-                    'correlation_factor': corr_data['correlation_factor'],
-                    'liquidity_cap': liquidity_cap,
-                    'yes_edge': yes_edge,
-                    'yes_ev': yes_ev,
-                    'no_edge': no_edge,
-                    'no_ev': no_ev,
-                    'threshold': str(threshold),
-                    'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
-                    'is_longshot': False,
-                    'series_ticker': series_ticker
-                })
-
-                return decision
+            decision = self._pick_best_candidate(yes_candidate, no_candidate)
+            if decision:
+                self._finalize_decision(decision, market_ticker)
+                # Defer to cross-threshold comparison: keep best EV per base market
+                self._defer_decision(decision, market_ticker)
+                return None  # Deferred — bot.py flushes best decisions after scan
 
             # Diagnostic: log why we didn't trade (helps debug "no purchases")
             best_edge = max(yes_edge, no_edge)
@@ -1859,6 +1673,135 @@ class WeatherDailyStrategy(TradingStrategy):
             logger.error(f"Error in get_trade_decision: {e}", exc_info=True)
             return None
     
+    def _try_observation_trade(self, market, orderbook, market_ticker, series_ticker,
+                                threshold, target_date, is_high_market,
+                                observed_extreme, reason) -> Optional[Dict]:
+        """
+        Observation-based trading: when the outcome is already determined by
+        real-time NWS observations, buy the winning side if the market price
+        hasn't caught up yet.
+
+        This is the highest-edge strategy — zero forecast uncertainty.
+        We only need the market to be mispriced relative to a known outcome.
+
+        Only trades if:
+        - We don't already hold a position on this market
+        - The winning side can be bought for <= 95¢ (at least 5¢ profit)
+        - No contradictory position exists
+        """
+        try:
+            # Determine which side is the winner
+            is_range_market = isinstance(threshold, tuple)
+            market_title = market.get('title', '').lower()
+
+            if is_range_market:
+                # For range markets: if outcome is determined, the answer is NO
+                # (temp went outside the range)
+                winning_side = 'no'
+            else:
+                is_above_market = 'above' in market_title or '>' in market_title
+                if is_high_market:
+                    if is_above_market:
+                        winning_side = 'yes' if observed_extreme > threshold else 'no'
+                    else:
+                        winning_side = 'no' if observed_extreme >= threshold else 'yes'
+                else:  # LOW market
+                    if is_above_market:
+                        winning_side = 'yes' if observed_extreme > threshold else 'no'
+                    else:
+                        winning_side = 'yes' if observed_extreme <= threshold else 'no'
+
+            # Get orderbook prices
+            yes_orders = orderbook.get('orderbook', {}).get('yes', [])
+            no_orders = orderbook.get('orderbook', {}).get('no', [])
+            if not yes_orders or not no_orders:
+                return None
+
+            best_yes_bid = yes_orders[-1][0] if yes_orders else 50
+            best_no_bid = no_orders[-1][0] if no_orders else 50
+            best_yes_ask = 100 - best_no_bid
+            best_no_ask = 100 - best_yes_bid
+
+            ask_price = best_yes_ask if winning_side == 'yes' else best_no_ask
+
+            # Only trade if there's meaningful profit (at least 5¢ after fees)
+            # Fees are ~7% on winnings, so at 95¢ we'd profit ~5¢ - 0.35¢ fee = 4.65¢
+            max_observation_price = 93  # At most 93¢ — gives ~7¢ gross, ~6.5¢ net profit
+            if ask_price > max_observation_price:
+                logger.debug(f"📊 SKIP observation trade {market_ticker}: {winning_side.upper()} ask {ask_price}¢ > {max_observation_price}¢ (market already priced in)")
+                return None
+
+            # Check exposure limits
+            existing_exposure = self._get_market_exposure(market_ticker)
+            existing_contracts = existing_exposure['total_contracts']
+            existing_dollars = existing_exposure['total_dollars']
+            existing_sides = existing_exposure.get('sides_held', set())
+            contracts_remaining = max(0, Config.MAX_CONTRACTS_PER_MARKET - existing_contracts)
+            dollars_remaining = max(0, Config.MAX_DOLLARS_PER_MARKET - existing_dollars)
+
+            if contracts_remaining <= 0 or dollars_remaining <= 0:
+                return None
+
+            # Contradictory position check
+            opposite_side = 'no' if winning_side == 'yes' else 'yes'
+            if opposite_side in existing_sides:
+                return None
+
+            # Check for resting order on this ticker
+            if self._has_resting_order_on_ticker(market_ticker):
+                return None
+
+            # Position size: trade up to remaining capacity
+            dollar_cap = int(dollars_remaining * 100 / ask_price) if ask_price > 0 else contracts_remaining
+            position_size = min(contracts_remaining, dollar_cap, Config.MAX_POSITION_SIZE * 2)
+            position_size = max(1, position_size)
+
+            edge = 100.0 - ask_price  # Our probability is 100%, market price is ask_price%
+            ev = (100 - ask_price) / 100.0 * 0.93  # Net of ~7% fees
+
+            logger.info(
+                f"👁️ OBSERVATION TRADE {winning_side.upper()} {market_ticker}: "
+                f"Outcome CERTAIN (observed {observed_extreme:.1f}°F), "
+                f"Ask {ask_price}¢, Edge {edge:.0f}%, EV ${ev:.2f} | {reason}"
+            )
+
+            decision = {
+                'action': 'buy',
+                'side': winning_side,
+                'count': position_size,
+                'price': ask_price,
+                'edge': edge,
+                'ev': ev,
+                'strategy_mode': 'observation',
+                'order_type': 'taker',
+                'our_probability': 1.0,
+                'mean_forecast': observed_extreme,
+                'forecast_std': 0.0,
+                'ci_lower': 1.0,
+                'ci_upper': 1.0,
+                'time_decay_factor': 1.0,
+                'num_sources': 1,
+                'threshold': str(threshold),
+                'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
+                '_use_kelly': False,
+                '_ask_price': ask_price,
+                '_corr_factor': 1.0,
+                '_liquidity_cap': 999,
+                '_yes_edge': edge if winning_side == 'yes' else 0,
+                '_yes_ev': ev if winning_side == 'yes' else 0,
+                '_no_edge': edge if winning_side == 'no' else 0,
+                '_no_ev': ev if winning_side == 'no' else 0,
+                '_is_longshot': False,
+                '_series_ticker': series_ticker,
+            }
+
+            self._finalize_decision(decision, market_ticker)
+            return decision
+
+        except Exception as e:
+            logger.debug(f"Error in observation trade for {market_ticker}: {e}")
+            return None
+
     def _check_exit(self, market: Dict, orderbook: Dict, market_ticker: str) -> Optional[Dict]:
         """
         Check if we should exit an active weather position

@@ -110,21 +110,22 @@ MAX_POSITION_SIZE=10                           # Base contracts per order
 MAX_CONTRACTS_PER_MARKET=15                    # Max contracts per market
 MAX_DOLLARS_PER_MARKET=3.00                    # Max $ per market
 MAX_DAILY_LOSS=10                              # Daily loss limit ($)
-MAX_BUY_PRICE_CENTS=50                         # Never buy above 50 cents
+MAX_BUY_PRICE_CENTS=40                         # Never buy above 40 cents
+PAPER_TRADING=true                             # Paper trade mode (no real orders)
 
 # Strategy Parameters
-MIN_EDGE_THRESHOLD=8.0                # Minimum edge percentage (%)
-MIN_EV_THRESHOLD=0.01                 # Minimum expected value ($)
-LONGSHOT_ENABLED=true
+MIN_EDGE_THRESHOLD=15.0               # Minimum edge percentage (%)
+MIN_EV_THRESHOLD=0.05                 # Minimum expected value ($)
+LONGSHOT_ENABLED=false                # Disabled until validated
 LONGSHOT_MAX_PRICE=10                 # Maximum price for longshots (cents)
 LONGSHOT_MIN_EDGE=30                  # Minimum edge for longshots (%)
 LONGSHOT_MIN_PROB=50                  # Minimum estimated probability (%)
 
-# Adaptive Learning (NEW)
+# Adaptive Learning
 ADAPTIVE_ENABLED=true                 # Enable auto-disable of poor cities
-ADAPTIVE_MIN_TRADES=20                # Min trades before evaluating
-ADAPTIVE_DISABLE_WIN_RATE=0.40        # Disable if win rate < 40%
-ADAPTIVE_DISABLE_HOURS=24             # How long to disable (hours)
+ADAPTIVE_MIN_TRADES=10                # Min trades before evaluating
+ADAPTIVE_DISABLE_WIN_RATE=0.50        # Disable if win rate < 50%
+ADAPTIVE_DISABLE_HOURS=72             # How long to disable (hours)
 PERSIST_LEARNING=true                 # Save learned state across restarts
 MAX_SOURCE_RMSE=4.0                   # Max RMSE before marking source unreliable
 
@@ -148,10 +149,13 @@ FORECAST_CACHE_TTL=10800              # Seconds (3 hours)
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `MIN_EDGE_THRESHOLD` | Minimum edge to trigger trade | 8.0% |
+| `MIN_EDGE_THRESHOLD` | Minimum edge to trigger trade | 15.0% |
+| `MIN_EV_THRESHOLD` | Minimum expected value per trade | $0.05 |
+| `MAX_BUY_PRICE_CENTS` | Never buy above this price | 40 |
+| `PAPER_TRADING` | Paper trade mode (no real orders) | true |
 | `ADAPTIVE_ENABLED` | Enable autonomous city management | true |
-| `ADAPTIVE_DISABLE_WIN_RATE` | Disable city if win rate below | 40% |
-| `ADAPTIVE_MIN_TRADES` | Trades before evaluating city | 20 |
+| `ADAPTIVE_DISABLE_WIN_RATE` | Disable city if win rate below | 50% |
+| `ADAPTIVE_MIN_TRADES` | Trades before evaluating city | 10 |
 | `PERSIST_LEARNING` | Save learning across restarts | true |
 | `MAX_SOURCE_RMSE` | Max forecast error before unreliable | 4.0°F |
 
@@ -190,8 +194,8 @@ tail -f bot_output.log
 ### Conservative Strategy
 
 **Criteria:**
-- Edge >= 8% (scaled higher for expensive contracts)
-- Expected Value >= $0.01 (after 5% fees)
+- Edge >= 15% (scaled higher for expensive contracts)
+- Expected Value >= $0.05 (after 5% fees)
 - Multiple forecast sources agree
 
 **Position Sizing:**
@@ -306,25 +310,37 @@ is_source_reliable("weatherbit", "DEN")  # False (RMSE: 5.2°F)
    - Per-market contract cap (default: 15)
    - Per-market dollar cap (default: $3.00)
    - Tracks both filled positions AND resting orders
+   - Contradictory position blocker (prevents YES+NO on same market)
 
 2. **Daily Loss Limit**
    - Stops trading if daily P&L < -$10 (configurable)
    - Tracks weather markets only (not other activity)
+   - Works in both real and paper trading modes
    - Resets at midnight
 
-3. **Market Quality Filters**
+3. **Drawdown Protection**
+   - Progressive position reduction on consecutive losses (3/5/8/10)
+   - Automatic recovery when streak breaks
+   - Persists across bot restarts
+
+4. **Settlement Tracking**
+   - Tracks forecast vs actual outcome divergence per city
+   - Identifies systematic forecast errors by region
+   - Feeds back into adaptive city management
+
+5. **Market Quality Filters**
    - Minimum volume: 15 contracts
    - Skips determined outcomes (NWS observation check)
-   - Longshot timing cutoffs (HIGH: 4PM, LOW: 8AM local)
+   - Smart timing cutoffs (HIGH: 4PM, LOW: 8AM local)
 
-4. **Adaptive Risk**
+6. **Adaptive Risk**
    - Cities with poor performance auto-disabled
    - Position sizes reduced for uncertain cities
    - Correlation adjustment for related positions
 
-5. **API Protection**
+7. **API Protection**
    - Automatic retry with exponential backoff
-   - Rate limit handling (429 responses)
+   - Global rate limiter across all API calls
    - Cache invalidation on order changes
 
 ---
@@ -340,8 +356,11 @@ kalshi-trader-bot/
 │   ├── strategies.py          # Trading strategies, position sizing
 │   ├── kalshi_client.py       # Kalshi API client with caching
 │   ├── weather_data.py        # Multi-source forecast aggregation
-│   ├── adaptive_manager.py    # Autonomous city performance management (NEW)
+│   ├── adaptive_manager.py    # Autonomous city performance management
 │   ├── outcome_tracker.py     # Settlement tracking, learning updates
+│   ├── drawdown_protector.py  # Progressive drawdown protection
+│   ├── settlement_tracker.py  # Forecast vs outcome divergence tracking
+│   ├── dashboard.py           # Live console dashboard (color-coded)
 │   ├── market_maker.py        # Limit order posting, requoting
 │   ├── portfolio_risk.py      # Correlation-aware risk management
 │   ├── config.py              # Configuration management
@@ -349,9 +368,10 @@ kalshi-trader-bot/
 ├── data/
 │   ├── adaptive_state.json    # City performance state (auto-generated)
 │   ├── learned_state.json     # Model biases, errors (auto-generated)
-│   ├── outcomes.csv           # Trade outcome history
-│   ├── trades.csv             # Trade execution log
+│   ├── outcomes.csv           # Trade outcome history (real mode)
+│   ├── paper_outcomes.csv     # Trade outcome history (paper mode)
 │   └── source_forecasts.csv   # Per-source forecast log
+├── tools/                     # 13 diagnostic/analysis scripts
 ├── restart_bot.sh             # Production restart script
 ├── clean_start.sh             # Fresh start with cache clear
 ├── .env                       # Environment variables (not in repo)
@@ -390,7 +410,24 @@ kalshi-trader-bot/
 - Processes settled positions from Kalshi API
 - Updates forecast model with actual temperatures
 - Triggers adaptive manager updates
+- Returns settlement results to dashboard for live P&L tracking
 - Generates performance reports
+
+#### Dashboard (`src/dashboard.py`)
+- Live console dashboard with color-coded output
+- Real-time P&L, win/loss, and per-city stats
+- Trade and settlement event feed
+- Scan metrics and strategy status
+- Paper mode indicator and persistence across restarts
+
+#### Drawdown Protector (`src/drawdown_protector.py`)
+- Progressive position reduction on consecutive losses
+- Four loss levels: 3, 5, 8, 10 consecutive losses
+- Automatic recovery and multiplier adjustment
+
+#### Settlement Tracker (`src/settlement_tracker.py`)
+- Forecast vs outcome divergence tracking per city
+- Identifies systematic regional forecast errors
 
 ---
 
@@ -485,6 +522,16 @@ export LOG_LEVEL=DEBUG
 ## Development
 
 ### Recent Changes
+
+**v2.6.0 (February 2026)** - Safety Systems & Dashboard
+- Live console dashboard with P&L, W/L, per-city stats
+- Paper trading mode with full P&L tracking and settlement recovery
+- Drawdown protector with progressive loss levels
+- Settlement tracker for forecast divergence analysis
+- Contradictory position blocker
+- Tightened thresholds: edge 15%, EV $0.05, max buy 40c
+- Global API rate limiter
+- Denver disabled due to poor forecast accuracy
 
 **v2.5.0 (February 2026)** - Autonomous Learning
 - Adaptive City Manager with auto-disable/enable

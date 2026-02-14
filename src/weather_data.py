@@ -107,6 +107,7 @@ class WeatherDataAggregator:
         if self.enable_pirate_weather and self.pirate_weather_api_key: enabled_sources.append('Pirate Weather')
         if self.enable_visual_crossing and self.visual_crossing_api_key: enabled_sources.append('Visual Crossing')
         if self.enable_tomorrowio and self.tomorrowio_api_key: enabled_sources.append('Tomorrow.io')
+        self._enabled_sources = enabled_sources
         logger.info(f"🌡️ Weather sources enabled: {', '.join(enabled_sources) if enabled_sources else 'NONE'}")
 
         # Cache for forecasts (from Config)
@@ -802,6 +803,10 @@ class WeatherDataAggregator:
         
         return valid_forecasts if valid_forecasts else forecasts  # Keep all if filtering removes everything
     
+    def get_enabled_sources(self) -> list:
+        """Return list of enabled weather source names."""
+        return self._enabled_sources
+
     def get_todays_observed_high(self, series_ticker: str) -> Optional[Tuple[float, datetime]]:
         """
         Get today's observed high temperature from NWS station observations.
@@ -1362,14 +1367,11 @@ class WeatherDataAggregator:
         if total_weight > 0:
             weighted_mean = sum(temp * weight for temp, weight, _ in weighted_forecasts) / total_weight
 
-            # For probability distribution, we need individual forecasts
-            # Adjust forecasts to be closer to weighted mean based on their weights
-            adjusted_forecasts = []
-            for temp, weight, source in weighted_forecasts:
-                # Blend original forecast with weighted mean based on source reliability
-                blend_factor = weight / total_weight
-                adjusted = temp * blend_factor + weighted_mean * (1 - blend_factor)
-                adjusted_forecasts.append(adjusted)
+            # Return raw bias-corrected forecasts — do NOT blend toward the mean.
+            # The weighted mean is used for the distribution center, but individual
+            # forecasts must retain their original spread so np.std() reflects
+            # actual forecast disagreement (not artificially compressed values).
+            adjusted_forecasts = [temp for temp, weight, source in weighted_forecasts]
 
             # Store metadata for later use
             self.forecast_metadata[cache_key] = forecast_data
@@ -1481,10 +1483,11 @@ class WeatherDataAggregator:
             if series_ticker and target_date:
                 std_temp = self.get_historical_forecast_error(series_ticker, target_date.month)
             else:
-                std_temp = 2.0  # Default std if no historical data
+                std_temp = 3.5  # Default std — matches real NWS MAE of ~2.5-3.5°F
 
-        # Ensure minimum std for stability (but lower minimum when we have ensemble data)
-        min_std = 0.5 if ensemble_std is not None else 1.0
+        # Ensure minimum std for stability
+        # Real forecast uncertainty is typically 2-4°F even for next-day forecasts
+        min_std = 1.5 if ensemble_std is not None else 2.0
         std_temp = max(std_temp, min_std)
 
         # Log the uncertainty source and value
@@ -1808,7 +1811,7 @@ class WeatherDataAggregator:
             # Resample forecasts with replacement
             sample = np.random.choice(forecasts, size=len(forecasts), replace=True)
             sample_mean = np.mean(sample)
-            sample_std = np.std(sample) if len(sample) > 1 else std_forecast
+            sample_std = max(np.std(sample), 1.5) if len(sample) > 1 else std_forecast
             
             # Calculate probability for this sample
             if is_above:

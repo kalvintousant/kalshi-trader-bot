@@ -1,10 +1,12 @@
 import asyncio
+import csv
 import json
 import os
 import time
 import requests
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Set
 from src.kalshi_client import KalshiClient
 from src.strategies import StrategyManager
@@ -61,15 +63,35 @@ class KalshiTradingBot:
             if hasattr(first_strategy, 'adaptive_manager'):
                 self.adaptive_manager = first_strategy.adaptive_manager
 
+        # Get drawdown protector from first strategy (if available)
+        self.drawdown_protector = None
+        if self.strategy_manager.strategies:
+            first_strategy = self.strategy_manager.strategies[0]
+            if hasattr(first_strategy, 'drawdown_protector'):
+                self.drawdown_protector = first_strategy.drawdown_protector
+
         # Outcome tracker for learning from results
         weather_agg = self.strategy_manager.strategies[0].weather_agg if self.strategy_manager.strategies else None
-        self.outcome_tracker = OutcomeTracker(self.client, weather_agg, self.adaptive_manager) if weather_agg else None
+        self.outcome_tracker = OutcomeTracker(self.client, weather_agg, self.adaptive_manager, self.drawdown_protector) if weather_agg else None
         self.last_outcome_check = 0  # Timestamp of last outcome check
+        self._paper_session_pnl = 0.0  # Accumulated paper P&L for today
+
+        # Reconcile outcomes.csv against Kalshi settlements on startup (skip in paper mode)
+        if self.outcome_tracker and not Config.PAPER_TRADING:
+            try:
+                self.outcome_tracker.reconcile_with_kalshi()
+            except Exception as e:
+                logger.warning(f"Could not reconcile outcomes on startup: {e}")
 
         # Dashboard
         self.dashboard_enabled = os.getenv('DASHBOARD_ENABLED', 'true').lower() != 'false'
         self.dashboard_state = DashboardState()
         self.dashboard = Dashboard(self.dashboard_state)
+
+        # In paper mode, load today's P&L and settlements from CSV on startup
+        if Config.PAPER_TRADING:
+            self._paper_session_pnl = self._load_todays_paper_pnl()
+            self._load_todays_paper_settlements()
     
     def reset_daily_stats(self):
         """Reset daily statistics"""
@@ -80,6 +102,7 @@ class KalshiTradingBot:
             # Set timestamp to filter today's fills/settlements (midnight local time)
             self.today_start_timestamp = int(datetime.combine(today, datetime.min.time()).timestamp() * 1000)
             self.daily_pnl = 0
+            self._paper_session_pnl = 0.0
             self.last_reset_date = today
             logger.info(f"Daily stats reset for {today}")
             logger.info(f"Starting weather exposure: ${self.starting_weather_exposure:.2f}")
@@ -137,9 +160,70 @@ class KalshiTradingBot:
                 payout += settlement.get('revenue', 0) / 100.0
         return payout
 
+    def _load_todays_paper_pnl(self) -> float:
+        """Load today's accumulated paper P&L from paper_outcomes.csv (for restart recovery)."""
+        try:
+            outcomes_file = Path("data/paper_outcomes.csv")
+            if not outcomes_file.exists():
+                return 0.0
+            today_str = datetime.now().date().isoformat()
+            total_pnl = 0.0
+            with open(outcomes_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Match rows logged today (timestamp starts with today's date)
+                    if row.get('timestamp', '').startswith(today_str):
+                        try:
+                            pnl = float(row.get('profit_loss', 0))
+                            total_pnl += pnl
+                        except (ValueError, TypeError):
+                            pass
+            if total_pnl != 0:
+                logger.info(f"📋 Loaded today's paper P&L from CSV: ${total_pnl:.2f}")
+            return total_pnl
+        except Exception as e:
+            logger.warning(f"Could not load today's paper P&L: {e}")
+            return 0.0
+
+    def _load_todays_paper_settlements(self):
+        """Load today's paper settlements into dashboard state (for restart recovery)."""
+        try:
+            outcomes_file = Path("data/paper_outcomes.csv")
+            if not outcomes_file.exists():
+                return
+            today_str = datetime.now().date().isoformat()
+            count = 0
+            with open(outcomes_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get('timestamp', '').startswith(today_str):
+                        ticker = row.get('market_ticker', '')
+                        won = row.get('won', '') == 'YES'
+                        try:
+                            pnl = abs(float(row.get('profit_loss', 0)))
+                        except (ValueError, TypeError):
+                            pnl = 0.0
+                        self.dashboard_state.record_settlement(ticker, won, pnl)
+                        count += 1
+            if count > 0:
+                logger.info(f"📋 Loaded {count} paper settlement(s) into dashboard from CSV")
+        except Exception as e:
+            logger.warning(f"Could not load today's paper settlements: {e}")
+
     def check_daily_loss_limit(self):
         """Check if we've hit daily loss limit based on weather-only P&L"""
         self.reset_daily_stats()
+
+        # Paper mode: use accumulated paper P&L instead of Kalshi API
+        if Config.PAPER_TRADING:
+            self.daily_pnl = self._paper_session_pnl
+            if self.daily_pnl <= -Config.MAX_DAILY_LOSS:
+                now = datetime.now()
+                if self._last_loss_limit_log is None or (now - self._last_loss_limit_log).total_seconds() >= 3600:
+                    logger.critical(f"⛔ Daily loss limit reached (paper mode)! P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+                    self._last_loss_limit_log = now
+                return True
+            return False
 
         # Get current weather exposure
         current_weather_exposure = self._get_weather_exposure()
@@ -400,6 +484,11 @@ class KalshiTradingBot:
         self._scan_skipped_count = 0
         self._scan_total_count = 0
 
+        # Clear pending cross-threshold decisions from previous scan
+        for strategy in self.strategy_manager.strategies:
+            if hasattr(strategy, 'clear_pending_decisions'):
+                strategy.clear_pending_decisions()
+
         try:
             # Filter markets by relevant series FIRST to reduce API calls
             # Increase limit to catch all markets, especially new ones
@@ -537,6 +626,8 @@ class KalshiTradingBot:
                             decision.get('count', 0),
                             decision.get('price', 0),
                             market_ticker,
+                            strategy_mode=decision.get('strategy_mode', ''),
+                            edge=decision.get('edge', 0.0),
                         )
 
                         # Log trade summary
@@ -544,6 +635,37 @@ class KalshiTradingBot:
                         logger.debug(f"Active positions being tracked: {len(self.markets_being_tracked)}")
 
                         time.sleep(0.3)  # Reduced rate limiting delay
+
+            # Flush cross-threshold decisions: execute best decision per base market
+            for strategy in self.strategy_manager.strategies:
+                if not hasattr(strategy, 'get_pending_decisions'):
+                    continue
+                for decision in strategy.get_pending_decisions():
+                    strategy_name = decision.pop('strategy')
+                    market_ticker = decision.pop('market_ticker')
+
+                    if self.check_daily_loss_limit():
+                        break
+
+                    order = strategy.execute_trade(decision, market_ticker)
+                    if order:
+                        self.markets_being_tracked.add(market_ticker)
+                        self._recently_ordered_tickers[market_ticker] = time.time()
+                        self._scan_traded_count += 1
+
+                        self.dashboard_state.record_trade(
+                            decision.get('action', 'buy'),
+                            decision.get('side', '?'),
+                            decision.get('count', 0),
+                            decision.get('price', 0),
+                            market_ticker,
+                            strategy_mode=decision.get('strategy_mode', ''),
+                            edge=decision.get('edge', 0.0),
+                        )
+
+                        logger.info(f"Trade executed successfully - Market: {market_ticker}")
+                        time.sleep(0.3)
+
         except Exception as e:
             self.dashboard_state.record_error()
             logger.error(f"Error in scan_and_trade: {e}", exc_info=True)
@@ -648,10 +770,69 @@ class KalshiTradingBot:
                 exposure=exposure,
             )
             self.dashboard_state.update_positions(active_count, resting_count)
+
+            # Update strategy status (drawdown, cities, sources)
+            self._update_dashboard_strategy_status()
+
             return balance, portfolio_value
         except Exception as e:
             logger.debug(f"Could not update dashboard account: {e}")
             return None, None
+
+    def _update_dashboard_strategy_status(self):
+        """Gather strategy status info for the dashboard."""
+        try:
+            dd_level = 'NORMAL'
+            dd_consecutive = 0
+            dd_multiplier = 1.0
+            forecast_sources = 0
+            cities_enabled = []
+            cities_disabled = []
+
+            for strategy in self.strategy_manager.strategies:
+                # Drawdown protector
+                if hasattr(strategy, 'drawdown_protector') and strategy.drawdown_protector:
+                    dp = strategy.drawdown_protector
+                    status = dp.get_status()
+                    dd_level = status.get('level', 'NORMAL')
+                    dd_consecutive = status.get('consecutive_losses', 0)
+                    dd_multiplier = dp.get_position_multiplier()
+
+                # Forecast sources count
+                if hasattr(strategy, 'weather_agg'):
+                    sources = strategy.weather_agg.get_enabled_sources()
+                    forecast_sources = len(sources) if sources else 0
+
+                # Adaptive city status
+                if hasattr(strategy, 'adaptive_manager') and strategy.adaptive_manager:
+                    am = strategy.adaptive_manager
+                    seen_cities = set()
+                    for series in Config.WEATHER_SERIES:
+                        city = series.replace('KXHIGH', '').replace('KXLOW', '')
+                        if city in seen_cities:
+                            continue
+                        seen_cities.add(city)
+                        if city.upper() in Config.DISABLED_CITIES:
+                            cities_disabled.append(city)
+                        elif not am.is_city_enabled(series):
+                            cities_disabled.append(city)
+                        else:
+                            cities_enabled.append(city)
+
+            # Deduplicate city lists
+            cities_enabled = sorted(set(cities_enabled))
+            cities_disabled = sorted(set(cities_disabled))
+
+            self.dashboard_state.update_strategy_status(
+                drawdown_level=dd_level,
+                drawdown_consecutive=dd_consecutive,
+                drawdown_multiplier=dd_multiplier,
+                forecast_sources=forecast_sources,
+                cities_enabled=cities_enabled,
+                cities_disabled=cities_disabled,
+            )
+        except Exception as e:
+            logger.debug(f"Could not update strategy status: {e}")
 
     def run(self, use_websocket: bool = False):
         """Run the trading bot"""
@@ -720,8 +901,15 @@ class KalshiTradingBot:
                     outcome_check_interval = 3600  # 1 hour
                     if self.outcome_tracker and time.time() - self.last_outcome_check >= outcome_check_interval:
                         try:
-                            self.outcome_tracker.run_outcome_check()
+                            settlement_results = self.outcome_tracker.run_outcome_check() or []
                             self.last_outcome_check = time.time()
+                            for result in settlement_results:
+                                self.dashboard_state.record_settlement(result['ticker'], result['won'], result['pnl'])
+                                if Config.PAPER_TRADING:
+                                    self._paper_session_pnl += result['signed_pnl']
+                            if settlement_results:
+                                self._update_dashboard_account()
+                                self._maybe_render_dashboard(force=True)
                         except Exception as e:
                             logger.error(f"Error checking outcomes: {e}", exc_info=True)
                     
@@ -733,13 +921,16 @@ class KalshiTradingBot:
                         total_value = balance + portfolio_value
 
                         # Update weather-only daily P&L for heartbeat
-                        current_weather_exposure = self._get_weather_exposure()
-                        if self.starting_weather_exposure is not None:
-                            todays_fills_cost = self._get_todays_weather_fills_cost()
-                            todays_settlements = self._get_todays_weather_settlements()
-                            total_invested = self.starting_weather_exposure + todays_fills_cost
-                            total_return = current_weather_exposure + todays_settlements
-                            self.daily_pnl = total_return - total_invested
+                        if Config.PAPER_TRADING:
+                            self.daily_pnl = self._paper_session_pnl
+                        else:
+                            current_weather_exposure = self._get_weather_exposure()
+                            if self.starting_weather_exposure is not None:
+                                todays_fills_cost = self._get_todays_weather_fills_cost()
+                                todays_settlements = self._get_todays_weather_settlements()
+                                total_invested = self.starting_weather_exposure + todays_fills_cost
+                                total_return = current_weather_exposure + todays_settlements
+                                self.daily_pnl = total_return - total_invested
 
                         logger.info(f"❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h")
                         logger.info(f"   Account - Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")

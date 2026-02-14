@@ -20,19 +20,30 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
+from .config import Config
+
 logger = logging.getLogger(__name__)
 
 
 class OutcomeTracker:
     """Track market outcomes and forecast accuracy"""
 
-    def __init__(self, client, weather_aggregator, adaptive_manager=None):
+    def __init__(self, client, weather_aggregator, adaptive_manager=None, drawdown_protector=None):
         self.client = client
         self.weather_agg = weather_aggregator
         self.adaptive_manager = adaptive_manager
+        self.drawdown_protector = drawdown_protector
 
-        # File paths for persistent storage
-        self.outcomes_file = Path("data/outcomes.csv")
+        # Settlement divergence tracker
+        self.settlement_tracker = None
+        try:
+            from .settlement_tracker import SettlementTracker
+            self.settlement_tracker = SettlementTracker()
+        except ImportError:
+            pass
+
+        # File paths for persistent storage (paper mode uses separate file)
+        self.outcomes_file = Path("data/paper_outcomes.csv") if Config.PAPER_TRADING else Path("data/outcomes.csv")
         self.performance_file = Path("data/performance.json")
         
         # Ensure data directory exists
@@ -66,6 +77,25 @@ class OutcomeTracker:
             except Exception as e:
                 logger.warning(f"Could not load logged positions: {e}")
     
+    def _load_paper_trades(self) -> Dict[str, list]:
+        """Load paper trades from data/trades.csv, grouped by market_ticker."""
+        trades_file = Path("data/trades.csv")
+        by_ticker: Dict[str, list] = defaultdict(list)
+        if not trades_file.exists():
+            return by_ticker
+        try:
+            with open(trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    order_id = row.get('order_id', '')
+                    if order_id.startswith('PAPER-'):
+                        ticker = row.get('market_ticker', '')
+                        if ticker:
+                            by_ticker[ticker].append(row)
+        except Exception as e:
+            logger.warning(f"Could not load paper trades: {e}")
+        return by_ticker
+
     def check_settled_positions(self) -> List[Dict]:
         """
         Check portfolio for settled positions (markets that have resolved).
@@ -73,6 +103,36 @@ class OutcomeTracker:
         Returns list of settled positions (each has 'fills' list and 'market').
         """
         try:
+            if Config.PAPER_TRADING:
+                # Paper mode: reconstruct fills from trades.csv, check real settlement on Kalshi
+                paper_trades = self._load_paper_trades()
+                settled_positions = []
+                for ticker, trades in paper_trades.items():
+                    if ticker in self.logged_positions:
+                        continue
+                    try:
+                        market_response = self.client.get_market(ticker)
+                        market = market_response.get('market', market_response)
+                        status = market.get('status', '').lower()
+                        if status in ['closed', 'finalized', 'settled']:
+                            # Synthesize fill records from paper trades
+                            fills = []
+                            for t in trades:
+                                price = int(t.get('price', 0))
+                                side = t.get('side', '')
+                                fills.append({
+                                    'ticker': ticker,
+                                    'side': side,
+                                    'count': int(t.get('count', 0)),
+                                    'yes_price': price if side == 'yes' else 0,
+                                    'no_price': price if side == 'no' else 0,
+                                })
+                            settled_positions.append({'fills': fills, 'market': market})
+                            logger.info(f"Found settled paper position: {ticker} (status: {status}, {len(fills)} trade(s))")
+                    except Exception as e:
+                        logger.debug(f"Could not fetch market {ticker}: {e}")
+                return settled_positions
+
             fills = self.client.get_fills()
             # Group fills by market_ticker (same market can have many fill records)
             by_ticker: Dict[str, list] = defaultdict(list)
@@ -186,7 +246,15 @@ class OutcomeTracker:
 
             from src.weather_data import extract_threshold_from_market
             threshold = extract_threshold_from_market(market)
+
+            # Extract series_ticker from the market ticker (Kalshi market objects
+            # don't include a series_ticker field).
+            # e.g., KXHIGHNY-26FEB07-T24 → KXHIGHNY
             series_ticker = market.get('series_ticker', '')
+            if not series_ticker and market_ticker:
+                parts = market_ticker.split('-')
+                series_ticker = parts[0] if parts else ''
+
             target_date = datetime.now()  # Placeholder
             actual_temp = self.extract_actual_temperature(market)
             predicted_temp = None
@@ -255,8 +323,24 @@ class OutcomeTracker:
                 self.adaptive_manager.record_outcome(city, won, total_profit_loss)
                 logger.debug(f"Updated adaptive manager for city {city}")
 
+            # Update drawdown protector with outcome
+            if self.drawdown_protector:
+                self.drawdown_protector.record_outcome(won)
+
+            # Update settlement divergence tracker
+            if self.settlement_tracker and series_ticker:
+                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                # our_probability is not stored in fills — use 0.5 as default
+                # (will be populated correctly once outcome_tracker stores it in CSV)
+                self.settlement_tracker.record_settlement(
+                    city=city, our_probability=0.5, won=won, ticker=market_ticker
+                )
+
+            return {'ticker': market_ticker, 'won': won, 'pnl': abs(total_profit_loss), 'signed_pnl': total_profit_loss}
+
         except Exception as e:
             logger.error(f"Error logging outcome: {e}", exc_info=True)
+            return None
     
     def generate_performance_report(self) -> Dict:
         """
@@ -333,27 +417,140 @@ class OutcomeTracker:
             logger.error(f"Error generating performance report: {e}", exc_info=True)
             return {}
     
+    # Weather series prefixes (only reconcile these)
+    WEATHER_PREFIXES = ('KXHIGH', 'KXLOW')
+
+    def reconcile_with_kalshi(self):
+        """
+        Reconcile outcomes.csv against actual Kalshi weather settlements.
+
+        Fetches settlements from Kalshi API and adds missing weather entries
+        to outcomes.csv. Only processes weather markets (KXHIGH*, KXLOW*).
+
+        Kalshi settlement format:
+          yes_count, no_count: contracts held on each side
+          yes_total_cost, no_total_cost: cost basis in cents
+          revenue: total payout in cents
+          market_result: 'yes' or 'no'
+        """
+        try:
+            settlements = self.client.get_all_settlements()
+            if not settlements:
+                logger.info("No settlements found on Kalshi")
+                return
+
+            added = 0
+            skipped_non_weather = 0
+            for settlement in settlements:
+                ticker = settlement.get('ticker', '')
+                if not ticker or ticker in self.logged_positions:
+                    continue
+
+                # Only reconcile weather markets
+                series_ticker = ticker.split('-')[0] if ticker else ''
+                if not series_ticker.startswith(self.WEATHER_PREFIXES):
+                    skipped_non_weather += 1
+                    self.logged_positions.add(ticker)  # Mark as seen to avoid re-checking
+                    continue
+
+                # Determine side and count from settlement data
+                yes_count = settlement.get('yes_count', 0)
+                no_count = settlement.get('no_count', 0)
+                yes_cost = settlement.get('yes_total_cost', 0)  # cents
+                no_cost = settlement.get('no_total_cost', 0)    # cents
+                revenue = settlement.get('revenue', 0)          # cents
+                market_result = settlement.get('market_result', '').lower()
+                total_cost = yes_cost + no_cost
+
+                # Determine which side we held
+                if yes_count > 0 and no_count > 0:
+                    # Contradictory position — both sides held
+                    side = 'yes'  # Primary side
+                    count = yes_count + no_count
+                    avg_price = total_cost // count if count > 0 else 0
+                elif yes_count > 0:
+                    side = 'yes'
+                    count = yes_count
+                    avg_price = yes_cost // yes_count if yes_count > 0 else 0
+                elif no_count > 0:
+                    side = 'no'
+                    count = no_count
+                    avg_price = no_cost // no_count if no_count > 0 else 0
+                else:
+                    self.logged_positions.add(ticker)
+                    continue
+
+                # Win = we held the side that won
+                won = (side == market_result) if market_result in ('yes', 'no') else False
+                # For contradictory positions, we can't simply say we "won"
+                if yes_count > 0 and no_count > 0:
+                    won = False  # Contradictory = guaranteed loss
+
+                # P&L = revenue - total cost (in dollars)
+                profit_loss = (revenue - total_cost) / 100.0
+
+                # Extract city from series ticker
+                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+
+                with open(self.outcomes_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        settlement.get('settled_time', datetime.now().isoformat()),
+                        ticker,
+                        city,
+                        '',  # date
+                        '',  # threshold
+                        '',  # threshold_type
+                        '', '', '', '', '',  # our_probability, market_price, edge, ev, strategy_mode
+                        side,
+                        count,
+                        avg_price,
+                        market_result,
+                        '',  # actual_temp
+                        '',  # predicted_temp
+                        '',  # forecast_error
+                        'YES' if won else 'NO',
+                        f"{profit_loss:.2f}"
+                    ])
+
+                self.logged_positions.add(ticker)
+                added += 1
+
+            if added > 0:
+                logger.info(f"📊 Reconciliation: added {added} weather settlement(s) to outcomes.csv (skipped {skipped_non_weather} non-weather)")
+            else:
+                logger.info(f"📊 Reconciliation: outcomes.csv is up to date (skipped {skipped_non_weather} non-weather)")
+
+        except Exception as e:
+            logger.error(f"Error reconciling with Kalshi: {e}", exc_info=True)
+
     def run_outcome_check(self):
         """
-        Main method to check for settled positions and log outcomes
-        Should be called periodically (e.g., once per hour)
+        Main method to check for settled positions and log outcomes.
+        Should be called periodically (e.g., once per hour).
+        Returns list of settlement result dicts (ticker, won, pnl, signed_pnl).
         """
         logger.info("🔍 Checking for settled positions...")
-        
+
         settled = self.check_settled_positions()
-        
+
         if not settled:
             logger.info("No new settled positions found")
-            return
-        
+            return []
+
         logger.info(f"Found {len(settled)} settled position(s) to process")
-        
+
+        results = []
         for position in settled:
-            self.log_outcome(position)
-        
+            result = self.log_outcome(position)
+            if result:
+                results.append(result)
+
         # Generate updated performance report
         report = self.generate_performance_report()
-        
+
         if report and 'overall' in report:
             overall = report['overall']
             logger.info(f"📊 Performance Update: {overall['wins']}W-{overall['losses']}L ({overall['win_rate']:.1%}) | P&L: ${overall['total_pnl']:.2f}")
+
+        return results
