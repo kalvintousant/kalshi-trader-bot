@@ -151,7 +151,7 @@ class Config:
     PAPER_TRADING = os.getenv('PAPER_TRADING', 'false').lower() == 'true'
 
     # Hard-disabled cities (bypasses all other filters — will never trade)
-    DISABLED_CITIES = {c.strip() for c in os.getenv('DISABLED_CITIES', 'DEN').split(',') if c.strip()}
+    DISABLED_CITIES = {c.strip() for c in os.getenv('DISABLED_CITIES', '').split(',') if c.strip()}
 
     # Market Tickers
     # High and Low temperature markets for NYC, Chicago, Miami, Austin, Los Angeles
@@ -162,7 +162,7 @@ class Config:
         'KXHIGHMIA', 'KXLOWMIA',    # Miami
         'KXHIGHAUS', 'KXLOWAUS',    # Austin
         'KXHIGHLAX', 'KXLOWLAX',    # Los Angeles
-        # 'KXHIGHDEN', 'KXLOWDEN'   # Denver - DISABLED
+        'KXHIGHDEN', 'KXLOWDEN',    # Denver (re-enabled for paper trading; range losses were the issue, not thresholds)
     ]
     
     @classmethod

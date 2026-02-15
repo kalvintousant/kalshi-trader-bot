@@ -82,6 +82,10 @@ class DashboardState:
         # Per-city stats {city: {wins, losses, pnl}}
         self.city_stats = {}
 
+        # Per-type stats {type: {wins, losses, pnl}} — 'threshold' vs 'range'
+        self.type_stats = {'threshold': {'wins': 0, 'losses': 0, 'pnl': 0.0},
+                           'range': {'wins': 0, 'losses': 0, 'pnl': 0.0}}
+
         # Recent activity (ring buffer)
         self.recent_events: deque = deque(maxlen=8)
 
@@ -155,6 +159,16 @@ class DashboardState:
             else:
                 cs['losses'] += 1
             cs['pnl'] += pnl if won else -abs(pnl)
+
+        # Update per-type stats (threshold vs range)
+        parts = ticker.split('-')
+        market_type = 'threshold' if len(parts) >= 3 and parts[-1].startswith('T') else 'range'
+        ts_stats = self.type_stats[market_type]
+        if won:
+            ts_stats['wins'] += 1
+        else:
+            ts_stats['losses'] += 1
+        ts_stats['pnl'] += pnl if won else -abs(pnl)
 
         ts = datetime.now().strftime('%H:%M:%S')
         if won:
@@ -305,6 +319,30 @@ class Dashboard:
                 stats_str = f"{c['dim']}--{c['reset']}"
 
             lines.append(f" {c['bright']}{city.ljust(5)}{c['reset']} {status_tag}  {stats_str}")
+
+        # ── Threshold vs Range P&L ──
+        th = s.type_stats['threshold']
+        rg = s.type_stats['range']
+        th_settled = th['wins'] + th['losses']
+        rg_settled = rg['wins'] + rg['losses']
+
+        type_parts = []
+        if th_settled > 0:
+            th_wr = th['wins'] / th_settled * 100
+            th_wr_c = c['green'] if th_wr >= 50 else c['red']
+            th_pnl_c = c['green'] if th['pnl'] >= 0 else c['red']
+            type_parts.append(f" {c['bright']}THRESH{c['reset']} {th_wr_c}{th_wr:.0f}%{c['reset']} ({th['wins']}W/{th['losses']}L) {th_pnl_c}${th['pnl']:+.2f}{c['reset']}")
+
+        if rg_settled > 0:
+            rg_wr = rg['wins'] / rg_settled * 100
+            rg_wr_c = c['green'] if rg_wr >= 50 else c['red']
+            rg_pnl_c = c['green'] if rg['pnl'] >= 0 else c['red']
+            type_parts.append(f" {c['bright']}RANGE{c['reset']}  {rg_wr_c}{rg_wr:.0f}%{c['reset']} ({rg['wins']}W/{rg['losses']}L) {rg_pnl_c}${rg['pnl']:+.2f}{c['reset']}")
+
+        if type_parts:
+            lines.append(SEP)
+            for tp in type_parts:
+                lines.append(tp)
 
         # ── Drawdown warning (only shown when active — matches Crypto Bot) ──
         if s.drawdown_level == 'PAUSED':
