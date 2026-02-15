@@ -21,8 +21,8 @@ class Config:
     
     # Weather Strategy Parameters
     # Conservative strategy
-    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '15.0'))  # Minimum edge % to trade (raised to 15% until probability model validated)
-    MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.05'))  # Minimum EV in dollars (meaningful buffer above noise)
+    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '8.0'))  # Minimum edge % to trade (relaxed to 8% for paper trading volume)
+    MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.02'))  # Minimum EV in dollars (relaxed for paper trading data collection)
     # If True, only trade when confidence interval does NOT overlap market price (stricter).
     # If False (default), trade when edge/EV meet thresholds even if CI overlaps (more trades, higher risk).
     REQUIRE_HIGH_CONFIDENCE = os.getenv('REQUIRE_HIGH_CONFIDENCE', 'false').lower() == 'true'
@@ -40,11 +40,25 @@ class Config:
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '1'))  # 1-day horizon: only trade today/tomorrow (forecasts most accurate)
     # Never buy at or above this price (cents). Data shows 51-75¢ entries lose money (42% win rate).
-    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '40'))  # Cap at 40¢ - reduce exposure on expensive contracts
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '55'))  # Allow moderately priced contracts; scaled edge still guards >35c
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
-    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '2.0'))  # Skip trades within 2°F of threshold (reduces coin-flip losses)
-    
+    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '1.0'))  # Skip trades within 1°F of threshold (relaxed from 2.0 for volume)
+
+    # Forecast quality gates
+    MIN_FORECAST_SOURCES = int(os.getenv('MIN_FORECAST_SOURCES', '2'))  # Need >=2 independent forecasts (rate-limited sources often 429)
+    MIN_FORECAST_SPREAD = float(os.getenv('MIN_FORECAST_SPREAD', '0.5'))  # Minimum std across forecasts (°F) — blocks correlated sources
+
+    # Range market boundary guard
+    RANGE_BOUNDARY_MIN_DISTANCE = float(os.getenv('RANGE_BOUNDARY_MIN_DISTANCE', '3.0'))  # Skip range markets when forecast is within 3°F of boundary
+
+    # Range market controls (range markets have 0% WR in real trading — disabled by default)
+    RANGE_MARKETS_ENABLED = os.getenv('RANGE_MARKETS_ENABLED', 'false').lower() == 'true'
+    RANGE_MAX_BUY_PRICE_CENTS = int(os.getenv('RANGE_MAX_BUY_PRICE_CENTS', '25'))  # Lower ceiling than global 40c
+    RANGE_MIN_EDGE_MULTIPLIER = float(os.getenv('RANGE_MIN_EDGE_MULTIPLIER', '2.0'))  # Require 2x normal edge (30% vs 15%)
+    RANGE_MAX_PROBABILITY = float(os.getenv('RANGE_MAX_PROBABILITY', '0.40'))  # Cap computed probability (realistic for 2°F bin)
+    RANGE_MIN_STD_FLOOR = float(os.getenv('RANGE_MIN_STD_FLOOR', '3.0'))  # Higher std floor than threshold markets
+
     # Caching
     ORDERBOOK_CACHE_TTL = int(os.getenv('ORDERBOOK_CACHE_TTL', '3'))  # 3 seconds
     PORTFOLIO_CACHE_TTL = int(os.getenv('PORTFOLIO_CACHE_TTL', '10'))  # 10 seconds
@@ -77,7 +91,7 @@ class Config:
     # Scaled Edge Requirements (require more edge for expensive contracts)
     SCALED_EDGE_ENABLED = os.getenv('SCALED_EDGE_ENABLED', 'true').lower() == 'true'
     SCALED_EDGE_PRICE_THRESHOLD = int(os.getenv('SCALED_EDGE_PRICE_THRESHOLD', '35'))  # Apply scaling above 35¢
-    SCALED_EDGE_MULTIPLIER = float(os.getenv('SCALED_EDGE_MULTIPLIER', '1.5'))  # Require 1.5x edge for expensive contracts
+    SCALED_EDGE_MULTIPLIER = float(os.getenv('SCALED_EDGE_MULTIPLIER', '1.2'))  # Require 1.2x edge for expensive contracts (relaxed from 1.5)
 
     # Market Making Mode (post limit orders at better prices instead of paying the ask)
     MARKET_MAKING_ENABLED = os.getenv('MARKET_MAKING_ENABLED', 'true').lower() == 'true'
@@ -91,7 +105,7 @@ class Config:
     # 1. Time Decay: Reduce position size based on hours until temperature extreme
     TIME_DECAY_ENABLED = os.getenv('TIME_DECAY_ENABLED', 'true').lower() == 'true'
     TIME_DECAY_MIN_FACTOR = float(os.getenv('TIME_DECAY_MIN_FACTOR', '0.5'))  # Min 50% of base size
-    HIGH_EXTREME_HOUR = int(os.getenv('HIGH_EXTREME_HOUR', '16'))  # 4 PM local for daily highs
+    HIGH_EXTREME_HOUR = int(os.getenv('HIGH_EXTREME_HOUR', '18'))  # 6 PM local for daily highs (extended from 4 PM; outcome check handles observed extremes)
     LOW_EXTREME_HOUR = int(os.getenv('LOW_EXTREME_HOUR', '6'))  # 6 AM local for daily lows
 
     # 2. Correlation Adjustment: Reduce size when holding correlated positions (same city/date)

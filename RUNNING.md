@@ -3,13 +3,13 @@
 ## Start (kills any existing bot first)
 
 ```bash
-cd "/Users/kalvintousant/Documents/Cursor Projects/Weather Trader Bot" && pkill -f "python3.*src/bot.py" 2>/dev/null; sleep 1 && caffeinate -i env PYTHONPATH=. python3 -B -u src/bot.py
+cd "/Users/kalvintousant/Documents/Cursor Projects/Weather Trader Bot" && pkill -f "bot\.py" 2>/dev/null; sleep 1 && caffeinate -i env PYTHONPATH=. python3 -B -u src/bot.py
 ```
 
 ## Start in background (with log file)
 
 ```bash
-cd "/Users/kalvintousant/Documents/Cursor Projects/Weather Trader Bot" && pkill -f "python3.*src/bot.py" 2>/dev/null; sleep 1 && nohup caffeinate -i env PYTHONPATH=. python3 -B -u src/bot.py > bot_output.log 2>&1 &
+cd "/Users/kalvintousant/Documents/Cursor Projects/Weather Trader Bot" && pkill -f "bot\.py" 2>/dev/null; sleep 1 && nohup caffeinate -i env PYTHONPATH=. python3 -B -u src/bot.py > bot_output.log 2>&1 &
 ```
 
 ## Monitor
@@ -28,7 +28,7 @@ tail -f bot_output.log
 ## Stop
 
 ```bash
-pkill -f "python3.*src/bot.py"
+pkill -f "bot\.py"
 ```
 
 ## Analysis tools

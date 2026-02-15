@@ -96,6 +96,23 @@ class OutcomeTracker:
             logger.warning(f"Could not load paper trades: {e}")
         return by_ticker
 
+    def _lookup_trade_probability(self, market_ticker: str, side: str) -> float:
+        """Look up our original probability for a trade from trades.csv."""
+        trades_file = Path("data/trades.csv")
+        if not trades_file.exists():
+            return 0.5
+        try:
+            with open(trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get('market_ticker') == market_ticker and row.get('side', '').lower() == side:
+                        prob = row.get('our_probability', '')
+                        if prob:
+                            return float(prob)
+        except Exception as e:
+            logger.debug(f"Could not look up probability for {market_ticker}: {e}")
+        return 0.5  # Default fallback
+
     def check_settled_positions(self) -> List[Dict]:
         """
         Check portfolio for settled positions (markets that have resolved).
@@ -273,6 +290,20 @@ class OutcomeTracker:
                 )
                 logger.info(f"📊 Updated forecast model biases for {series_ticker} (actual: {actual_temp:.1f}°F)")
 
+                # Store actual in ForecastTracker to close the accuracy feedback loop
+                try:
+                    from .forecast_weighting import get_forecast_tracker
+                    tracker = get_forecast_tracker()
+                    city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                    is_high = series_ticker.startswith('KXHIGH')
+                    tracker.store_actual(
+                        city, target_date.strftime('%Y-%m-%d'),
+                        actual_high=actual_temp if is_high else None,
+                        actual_low=actual_temp if not is_high else None
+                    )
+                except Exception:
+                    pass
+
             result = market.get('result', '').lower()
             total_count = 0
             total_profit_loss = 0.0
@@ -330,10 +361,10 @@ class OutcomeTracker:
             # Update settlement divergence tracker
             if self.settlement_tracker and series_ticker:
                 city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
-                # our_probability is not stored in fills — use 0.5 as default
-                # (will be populated correctly once outcome_tracker stores it in CSV)
+                # Look up our original probability from trades.csv
+                our_prob = self._lookup_trade_probability(market_ticker, side)
                 self.settlement_tracker.record_settlement(
-                    city=city, our_probability=0.5, won=won, ticker=market_ticker
+                    city=city, our_probability=our_prob, won=won, ticker=market_ticker
                 )
 
             return {'ticker': market_ticker, 'won': won, 'pnl': abs(total_profit_loss), 'signed_pnl': total_profit_loss}

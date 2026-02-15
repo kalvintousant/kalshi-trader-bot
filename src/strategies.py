@@ -27,7 +27,7 @@ class TradingStrategy:
     
     def _has_resting_order_on_ticker(self, ticker: str) -> bool:
         """
-        Check if we already have a resting order on this EXACT ticker.
+        Check if we already have a resting order or paper position on this EXACT ticker.
 
         This prevents placing duplicate orders on the same ticker every scan cycle.
         The base market limit check prevents over-exposure to a market, but this
@@ -37,9 +37,15 @@ class TradingStrategy:
             ticker: The exact ticker to check (e.g., KXHIGHLAX-26JAN28-B69.5)
 
         Returns:
-            True if there's already a resting order on this exact ticker
+            True if there's already a resting order or paper position on this exact ticker
         """
         try:
+            # In paper mode, check local paper ticker set first
+            if Config.PAPER_TRADING:
+                if hasattr(self, '_paper_tickers') and ticker in self._paper_tickers:
+                    return True
+                return False
+
             orders = self.client.get_orders(status='resting', use_cache=False)
             for order in orders:
                 if order.get('ticker') == ticker:
@@ -314,12 +320,15 @@ class TradingStrategy:
                 # Track paper exposure locally for limit enforcement
                 if not hasattr(self, '_paper_positions'):
                     self._paper_positions = {}
+                if not hasattr(self, '_paper_tickers'):
+                    self._paper_tickers = set()
                 parts = market_ticker.split('-')
                 base = '-'.join(parts[:2]) if len(parts) >= 2 else market_ticker
                 pp = self._paper_positions.setdefault(base, {'contracts': 0, 'dollars': 0.0, 'sides': set()})
                 pp['contracts'] += decision['count']
                 pp['dollars'] += decision['count'] * price / 100.0
                 pp['sides'].add(decision['side'])
+                self._paper_tickers.add(market_ticker)
 
                 logger.info(f"📝 PAPER TRADE: {decision['action'].upper()} {decision['count']} {decision['side'].upper()} @ {price}¢ | {market_ticker}")
             else:
@@ -582,6 +591,20 @@ class WeatherDailyStrategy(TradingStrategy):
         # Cross-threshold consistency: collect best decision per base market,
         # then trade only the highest-EV threshold per city+date.
         self._pending_decisions = {}  # {base_market: (decision_dict, market_ticker)}
+
+        # Settlement divergence tracker — reduce confidence for overconfident cities
+        self.settlement_tracker = None
+        try:
+            from .settlement_tracker import SettlementTracker
+            self.settlement_tracker = SettlementTracker()
+            divergences = self.settlement_tracker.get_all_divergences()
+            adjusted = {c: d['confidence_adjustment'] for c, d in divergences.items() if d['confidence_adjustment'] < 1.0}
+            if adjusted:
+                logger.info(f"📊 Settlement tracker: confidence adjustments: {adjusted}")
+            else:
+                logger.info("📊 Settlement tracker ENABLED — will dampen overconfident city probabilities")
+        except ImportError as e:
+            logger.warning(f"Could not load SettlementTracker: {e}")
 
         # Drawdown protector — progressive loss protection
         self.drawdown_protector = None
@@ -998,7 +1021,8 @@ class WeatherDailyStrategy(TradingStrategy):
             'ci_lower': ci_lower,
             'ci_upper': ci_upper,
             'time_decay_factor': time_factor,
-            'num_sources': len(forecasts),
+            'num_sources': len(set(s for _, s, _ in self.weather_agg.forecast_metadata.get(
+                f"{series_ticker}_{target_date.strftime('%Y-%m-%d') if target_date else ''}", []))) or len(forecasts),
             'threshold': str(threshold),
             'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
             # Internal fields for _finalize_decision (not used by order execution)
@@ -1387,28 +1411,57 @@ class WeatherDailyStrategy(TradingStrategy):
             
             # Get forecasts from all available sources
             forecasts = self.weather_agg.get_all_forecasts(series_ticker, target_date)
-            
+
             if not forecasts:
                 logger.debug(f"📊 SKIP {market_ticker}: no forecasts for {series_ticker} on {target_date.strftime('%Y-%m-%d')}")
                 return None
-            
+
             # Log market type for LOW vs HIGH debugging
             market_type = "LOW temp" if is_low_market else "HIGH temp"
             mean_forecast = sum(forecasts) / len(forecasts)
             logger.debug(f"Evaluating {market_type} market {market_ticker}: {len(forecasts)} forecasts, mean={mean_forecast:.1f}°F, threshold={threshold}")
-            
+
+            # --- FORECAST QUALITY GATE ---
+            # Block trades when forecast diversity is too low (identical sources → overconfidence)
+            min_sources = getattr(Config, 'MIN_FORECAST_SOURCES', 3)
+            if len(forecasts) < min_sources:
+                logger.debug(f"📊 SKIP {market_ticker}: only {len(forecasts)} forecast source(s), need >={min_sources}")
+                return None
+            forecast_spread = float(np.std(forecasts))
+            min_spread = getattr(Config, 'MIN_FORECAST_SPREAD', 0.1)
+            if forecast_spread < min_spread:
+                logger.debug(f"📊 SKIP {market_ticker}: forecast spread {forecast_spread:.2f}°F < {min_spread}°F (sources agree too perfectly, likely same upstream)")
+                return None
+
             # Build temperature ranges (2-degree brackets as mentioned in guide)
             # Kalshi weather markets typically have 6 brackets
             # We'll create a fine-grained distribution first, then map to brackets
             mean_forecast = sum(forecasts) / len(forecasts)
-            
+
             # Skip single-threshold markets when forecast is too close to threshold (high uncertainty)
             min_deg = getattr(Config, 'MIN_DEGREES_FROM_THRESHOLD', 0)
             if min_deg > 0 and not isinstance(threshold, tuple):
                 if abs(mean_forecast - threshold) < min_deg:
                     logger.debug(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° within {min_deg}° of threshold {threshold}° (reduce coin-flip losses)")
                     return None
-            
+
+            # --- NEAR-BOUNDARY GUARD (range markets) ---
+            # Skip range markets where the mean forecast is close to the range boundary.
+            # A small forecast error (1-2°F) can flip the outcome entirely when the mean
+            # is near the range edge, turning a "confident" bet into a max loss.
+            if isinstance(threshold, tuple):
+                range_low, range_high = threshold
+                dist_to_range = min(abs(mean_forecast - range_low), abs(mean_forecast - range_high))
+                boundary_min_dist = getattr(Config, 'RANGE_BOUNDARY_MIN_DISTANCE', 3.0)
+                if dist_to_range < boundary_min_dist:
+                    logger.debug(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° only {dist_to_range:.1f}° from range ({range_low}-{range_high}°F) — near-boundary coin flip")
+                    return None
+
+                # Master disable for range markets (0% WR in real trading)
+                if not getattr(Config, 'RANGE_MARKETS_ENABLED', False):
+                    logger.debug(f"📊 SKIP {market_ticker}: range markets disabled (RANGE_MARKETS_ENABLED=false)")
+                    return None
+
             # Create temperature ranges around the forecast (2-degree brackets)
             temp_ranges = []
             base_temp = int(mean_forecast) - 10  # Start 10 degrees below
@@ -1416,8 +1469,10 @@ class WeatherDailyStrategy(TradingStrategy):
                 temp_ranges.append((base_temp + i * 2, base_temp + (i + 1) * 2))
             
             # Build probability distribution with dynamic std and historical data
+            is_range = isinstance(threshold, tuple)
             prob_dist = self.weather_agg.build_probability_distribution(
-                forecasts, temp_ranges, series_ticker, target_date
+                forecasts, temp_ranges, series_ticker, target_date,
+                is_range_market=is_range
             )
             
             if not prob_dist:
@@ -1439,6 +1494,9 @@ class WeatherDailyStrategy(TradingStrategy):
                         bracket_width = temp_max - temp_min
                         overlap_frac = (overlap_max - overlap_min) / bracket_width if bracket_width > 0 else 0
                         our_prob += prob * overlap_frac
+                # Cap range probability at realistic ceiling (2°F bin rarely >40%)
+                range_max_prob = getattr(Config, 'RANGE_MAX_PROBABILITY', 0.40)
+                our_prob = min(our_prob, range_max_prob)
                 is_above_market = True  # used only for CI; use midpoint for approximate CI
                 threshold_for_ci = (range_low + range_high) / 2.0
             else:
@@ -1460,6 +1518,19 @@ class WeatherDailyStrategy(TradingStrategy):
                             overlap = (threshold - temp_min) / (temp_max - temp_min) if (temp_max - temp_min) > 0 else 0
                             our_prob += prob * overlap
             
+            # Apply settlement divergence confidence adjustment
+            # Reduces our_prob for cities where we've been systematically overconfident
+            if self.settlement_tracker:
+                try:
+                    city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                    div_stats = self.settlement_tracker.get_city_divergence(city)
+                    conf_adj = div_stats.get('confidence_adjustment', 1.0)
+                    if conf_adj < 1.0:
+                        logger.debug(f"📊 Settlement divergence for {city}: prob {our_prob:.3f} * {conf_adj:.2f} = {our_prob * conf_adj:.3f}")
+                        our_prob *= conf_adj
+                except Exception:
+                    pass
+
             # Get market prices (reuse from earlier calculation if available)
             # Get orderbook data
             # Kalshi orderbook format: [[price, quantity], ...] sorted by price ASCENDING
@@ -1630,17 +1701,30 @@ class WeatherDailyStrategy(TradingStrategy):
             required_yes_edge = self._get_required_edge(best_yes_ask)
             required_no_edge = self._get_required_edge(best_no_ask)
 
+            # Range markets: require higher edge and enforce lower price cap
+            if is_range_market:
+                range_edge_mult = getattr(Config, 'RANGE_MIN_EDGE_MULTIPLIER', 2.0)
+                required_yes_edge *= range_edge_mult
+                required_no_edge *= range_edge_mult
+                range_max_price = getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25)
+                if best_yes_ask > range_max_price:
+                    logger.debug(f"📊 SKIP {market_ticker} YES: ask {best_yes_ask}¢ > range cap {range_max_price}¢")
+                if best_no_ask > range_max_price:
+                    logger.debug(f"📊 SKIP {market_ticker} NO: ask {best_no_ask}¢ > range cap {range_max_price}¢")
+
             yes_candidate = None
             no_candidate = None
 
             if (yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
-                    and (not self.require_high_confidence or high_confidence_yes)):
+                    and (not self.require_high_confidence or high_confidence_yes)
+                    and (not is_range_market or best_yes_ask <= getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25))):
                 yes_candidate = self._build_side_decision(
                     'yes', yes_edge, yes_ev, our_prob, best_yes_ask,
                     ci_lower_yes, ci_upper_yes, is_longshot=False, **common_args)
 
             if (no_edge >= required_no_edge and no_ev >= self.min_ev_threshold
-                    and (not self.require_high_confidence or high_confidence_no)):
+                    and (not self.require_high_confidence or high_confidence_no)
+                    and (not is_range_market or best_no_ask <= getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25))):
                 no_candidate = self._build_side_decision(
                     'no', no_edge, no_ev, no_prob, best_no_ask,
                     ci_lower_no, ci_upper_no, is_longshot=False, **common_args)
