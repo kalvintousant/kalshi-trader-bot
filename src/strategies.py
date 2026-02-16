@@ -16,6 +16,24 @@ from .backtester import get_data_store
 logger = logging.getLogger(__name__)
 
 
+def _parse_date_from_ticker(ticker: str) -> str:
+    """Extract ISO date from ticker like KXHIGHCHI-26FEB16-T60 → '2026-02-16'."""
+    import re
+    parts = ticker.split('-')
+    if len(parts) < 2:
+        return ''
+    m = re.match(r'(\d{2})([A-Z]{3})(\d{2})', parts[1])
+    if not m:
+        return ''
+    yy, mon, dd = m.group(1), m.group(2), m.group(3)
+    months = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
+              'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
+    mm = months.get(mon, '')
+    if not mm:
+        return ''
+    return f'20{yy}-{mm}-{dd}'
+
+
 class TradingStrategy:
     """Base class for trading strategies"""
 
@@ -662,7 +680,9 @@ class WeatherDailyStrategy(TradingStrategy):
                     ticker = row.get('market_ticker', '')
                     if not ticker or ticker in settled_tickers:
                         continue
-                    target_date = row.get('target_date', '')
+                    target_date = row.get('target_date', '').strip()
+                    if not target_date:
+                        target_date = _parse_date_from_ticker(ticker)
                     if target_date and target_date < today_str:
                         continue
 

@@ -239,7 +239,9 @@ class KalshiTradingBot:
                     ticker = row.get('market_ticker', '')
                     if not ticker or ticker in settled_tickers:
                         continue
-                    target_date = row.get('target_date', '')
+                    target_date = row.get('target_date', '').strip()
+                    if not target_date:
+                        target_date = self._parse_date_from_ticker(ticker)
                     if target_date and target_date < today_str:
                         continue
                     side = row.get('side', 'yes')
@@ -264,6 +266,24 @@ class KalshiTradingBot:
                 logger.info(f"📋 Loaded {count} paper position(s) into dashboard from trades.csv")
         except Exception as e:
             logger.warning(f"Could not load paper positions to dashboard: {e}")
+
+    @staticmethod
+    def _parse_date_from_ticker(ticker: str) -> str:
+        """Extract ISO date from ticker like KXHIGHCHI-26FEB16-T60 → '2026-02-16'."""
+        import re
+        parts = ticker.split('-')
+        if len(parts) < 2:
+            return ''
+        m = re.match(r'(\d{2})([A-Z]{3})(\d{2})', parts[1])
+        if not m:
+            return ''
+        yy, mon, dd = m.group(1), m.group(2), m.group(3)
+        months = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
+                  'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
+        mm = months.get(mon, '')
+        if not mm:
+            return ''
+        return f'20{yy}-{mm}-{dd}'
 
     def check_daily_loss_limit(self):
         """Check if we've hit daily loss limit based on weather-only P&L"""
