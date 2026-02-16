@@ -58,6 +58,11 @@ class Config:
     MIN_FORECAST_SOURCES = int(os.getenv('MIN_FORECAST_SOURCES', '2'))  # Need >=2 independent forecasts (rate-limited sources often 429)
     MIN_FORECAST_SPREAD = float(os.getenv('MIN_FORECAST_SPREAD', '0.5'))  # Minimum std across forecasts (°F) — blocks correlated sources
 
+    # Forecast direction gate: only trade when the forecast mean supports the bet direction
+    # For "below" markets (YES = temp < T): require forecast mean < threshold
+    # For "above" markets (YES = temp > T): require forecast mean > threshold
+    REQUIRE_FORECAST_DIRECTION = os.getenv('REQUIRE_FORECAST_DIRECTION', 'true').lower() == 'true'
+
     # Range market boundary guard
     RANGE_BOUNDARY_MIN_DISTANCE = float(os.getenv('RANGE_BOUNDARY_MIN_DISTANCE', '3.0'))  # Skip range markets when forecast is within 3°F of boundary
 

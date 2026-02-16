@@ -1808,14 +1808,33 @@ class WeatherDailyStrategy(TradingStrategy):
             yes_candidate = None
             no_candidate = None
 
-            if (yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
+            # Forecast direction gate: only allow bets where the forecast mean
+            # supports the trade direction.  For "below" markets (is_above_market=False):
+            #   YES = temp < threshold → need mean_forecast < threshold
+            #   NO  = temp >= threshold → need mean_forecast >= threshold
+            # For "above" markets (is_above_market=True):
+            #   YES = temp > threshold → need mean_forecast > threshold
+            #   NO  = temp <= threshold → need mean_forecast <= threshold
+            forecast_supports_yes = True
+            forecast_supports_no = True
+            if getattr(Config, 'REQUIRE_FORECAST_DIRECTION', True) and not is_range_market:
+                if is_above_market:
+                    forecast_supports_yes = mean_forecast > threshold
+                    forecast_supports_no = mean_forecast <= threshold
+                else:
+                    forecast_supports_yes = mean_forecast < threshold
+                    forecast_supports_no = mean_forecast >= threshold
+
+            if (forecast_supports_yes
+                    and yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
                     and (not self.require_high_confidence or high_confidence_yes)
                     and (not is_range_market or best_yes_ask <= getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25))):
                 yes_candidate = self._build_side_decision(
                     'yes', yes_edge, yes_ev, our_prob, best_yes_ask,
                     ci_lower_yes, ci_upper_yes, is_longshot=False, **common_args)
 
-            if (no_edge >= required_no_edge and no_ev >= self.min_ev_threshold
+            if (forecast_supports_no
+                    and no_edge >= required_no_edge and no_ev >= self.min_ev_threshold
                     and (not self.require_high_confidence or high_confidence_no)
                     and (not is_range_market or best_no_ask <= getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25))):
                 no_candidate = self._build_side_decision(
@@ -1833,7 +1852,11 @@ class WeatherDailyStrategy(TradingStrategy):
             best_edge = max(yes_edge, no_edge)
             best_ev = max(yes_ev, no_ev)
             min_required_edge = min(required_yes_edge, required_no_edge)
-            if yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_yes:
+            if not forecast_supports_yes and yes_edge >= required_yes_edge:
+                reason = f"YES edge {yes_edge:.1f}% but forecast {mean_forecast:.1f}°F wrong side of {threshold}°F"
+            elif not forecast_supports_no and no_edge >= required_no_edge:
+                reason = f"NO edge {no_edge:.1f}% but forecast {mean_forecast:.1f}°F wrong side of {threshold}°F"
+            elif yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_yes:
                 reason = f"YES edge {yes_edge:.1f}% EV ${yes_ev:.4f} ok but CI overlaps ask (REQUIRE_HIGH_CONFIDENCE=false to allow)"
             elif no_edge >= required_no_edge and no_ev >= self.min_ev_threshold and self.require_high_confidence and not high_confidence_no:
                 reason = f"NO edge {no_edge:.1f}% EV ${no_ev:.4f} ok but CI overlaps ask (REQUIRE_HIGH_CONFIDENCE=false to allow)"
