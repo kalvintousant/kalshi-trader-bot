@@ -80,15 +80,13 @@ class OutcomeTracker:
     def _load_paper_trades(self) -> Dict[str, list]:
         """Load paper trades from data/trades.csv, grouped by market_ticker.
 
-        Deduplicates by ticker — in paper mode only one trade per ticker is
-        intentional (the first one); later entries on the same ticker were
-        caused by restarts before the persistence fix.
+        Collects ALL trades per ticker so settlement aggregates the full
+        position (multiple buys at different prices/times).
         """
         trades_file = Path("data/trades.csv")
         by_ticker: Dict[str, list] = defaultdict(list)
         if not trades_file.exists():
             return by_ticker
-        seen_tickers = set()
         try:
             with open(trades_file, 'r') as f:
                 reader = csv.DictReader(f)
@@ -96,8 +94,7 @@ class OutcomeTracker:
                     order_id = row.get('order_id', '')
                     if order_id.startswith('PAPER-'):
                         ticker = row.get('market_ticker', '')
-                        if ticker and ticker not in seen_tickers:
-                            seen_tickers.add(ticker)
+                        if ticker:
                             by_ticker[ticker].append(row)
         except Exception as e:
             logger.warning(f"Could not load paper trades: {e}")
