@@ -1668,7 +1668,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # For "above" markets, YES = temp > threshold; for "below", YES = temp < threshold
             # For range markets we use midpoint for approximate CI
             prob_ci_yes, (ci_lower_yes, ci_upper_yes) = self.weather_agg.calculate_confidence_interval(
-                forecasts, threshold_for_ci, is_above=is_above_market
+                forecasts, threshold_for_ci, is_above=is_above_market, min_std=2.0
             )
             prob_ci_no = 1.0 - prob_ci_yes
             ci_lower_no = 1.0 - ci_upper_yes

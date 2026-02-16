@@ -1881,17 +1881,19 @@ class WeatherDataAggregator:
             ev = (win_prob * payout) - (loss_prob * stake)
         return ev
     
-    def calculate_confidence_interval(self, forecasts: List[float], threshold: float, 
-                                    n_samples: int = 1000, is_above: bool = True) -> Tuple[float, Tuple[float, float]]:
+    def calculate_confidence_interval(self, forecasts: List[float], threshold: float,
+                                    n_samples: int = 1000, is_above: bool = True,
+                                    min_std: float = 2.0) -> Tuple[float, Tuple[float, float]]:
         """
         Calculate probability with confidence interval using bootstrap sampling
-        
+
         Args:
             forecasts: List of temperature forecasts
             threshold: Temperature threshold
             n_samples: Number of bootstrap samples
             is_above: True for "above threshold", False for "below threshold"
-        
+            min_std: Minimum standard deviation floor (matches no-ensemble uncertainty floor)
+
         Returns:
             (mean_probability, (ci_lower, ci_upper)) where CI is 95% confidence interval
         """
@@ -1900,14 +1902,14 @@ class WeatherDataAggregator:
         
         probs = []
         mean_forecast = np.mean(forecasts)
-        std_forecast = np.std(forecasts) if len(forecasts) > 1 else 2.0
-        
+        std_forecast = max(np.std(forecasts), min_std) if len(forecasts) > 1 else min_std
+
         for _ in range(n_samples):
             # Resample forecasts with replacement
             sample = np.random.choice(forecasts, size=len(forecasts), replace=True)
             sample_mean = np.mean(sample)
-            sample_std = max(np.std(sample), 1.5) if len(sample) > 1 else std_forecast
-            
+            sample_std = max(np.std(sample), min_std) if len(sample) > 1 else std_forecast
+
             # Calculate probability for this sample
             if is_above:
                 # Probability that temp > threshold
@@ -1915,6 +1917,8 @@ class WeatherDataAggregator:
             else:
                 # Probability that temp < threshold
                 prob = stats.norm.cdf(threshold, sample_mean, sample_std)
+            # Cap: no weather forecast is 100% or 0% certain
+            prob = max(0.01, min(0.99, prob))
             probs.append(prob)
         
         # Calculate mean and 95% confidence interval
