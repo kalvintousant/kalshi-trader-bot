@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 from collections import defaultdict
+from .config import extract_city_code
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +131,8 @@ class AdaptiveCityManager:
             logger.error(f"Could not save adaptive state: {e}")
 
     def _extract_city_from_ticker(self, series_ticker: str) -> str:
-        """Extract city code from series ticker (e.g., KXHIGHNY -> NY)"""
-        return series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+        """Extract city code from series ticker (e.g., KXHIGHNY -> NY, KXHIGHTDAL -> DAL)"""
+        return extract_city_code(series_ticker)
 
     def is_city_enabled(self, series_ticker: str) -> bool:
         """

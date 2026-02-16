@@ -41,6 +41,10 @@ class KalshiClient:
         self.orders_cache = {}  # {status: (orders_list, timestamp)}
         self.orders_cache_ttl = 90  # seconds (increased from 45s to reduce API calls)
 
+        # Cache for market lists (markets don't change within a scan window)
+        self.markets_cache = {}  # {cache_key: (markets_list, timestamp)}
+        self.markets_cache_ttl = 90  # seconds
+
         # Global rate limiter — token bucket
         # Conservative: 2 req/s sustained, burst of 5
         self._rate_limit_tokens = 5.0
@@ -248,15 +252,27 @@ class KalshiClient:
         """Get series information"""
         return self._get(f"/series/{series_ticker}")
     
-    def get_markets(self, series_ticker: Optional[str] = None, 
+    def get_markets(self, series_ticker: Optional[str] = None,
                     status: str = 'open', limit: int = 100) -> List[Dict]:
-        """Get markets, optionally filtered by series"""
+        """Get markets, optionally filtered by series. Cached for 90s."""
+        cache_key = f"{series_ticker or 'all'}_{status}_{limit}"
+        if cache_key in self.markets_cache:
+            cached_markets, cached_time = self.markets_cache[cache_key]
+            if (time.time() - cached_time) < self.markets_cache_ttl:
+                return cached_markets
+
         params = {'status': status, 'limit': limit}
         if series_ticker:
             params['series_ticker'] = series_ticker
-        
+
         response = self._get('/markets', params=params)
-        return response.get('markets', [])
+        markets = response.get('markets', [])
+        self.markets_cache[cache_key] = (markets, time.time())
+        return markets
+
+    def invalidate_markets_cache(self):
+        """Invalidate the markets cache. Call on daily reset or when new markets expected."""
+        self.markets_cache.clear()
     
     def get_market_orderbook(self, market_ticker: str, use_cache: bool = True) -> Dict:
         """Get orderbook for a specific market with caching"""

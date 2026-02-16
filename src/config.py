@@ -3,6 +3,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def extract_city_code(series_ticker: str) -> str:
+    """Extract city code from series ticker (e.g., KXHIGHNY -> NY, KXHIGHTDAL -> DAL)."""
+    for prefix in ('KXHIGHT', 'KXLOWT', 'KXHIGH', 'KXLOW'):
+        if series_ticker.startswith(prefix):
+            return series_ticker[len(prefix):]
+    return series_ticker
+
+
 class Config:
     # API Credentials
     API_KEY_ID = os.getenv('KALSHI_API_KEY_ID')
@@ -162,7 +171,18 @@ class Config:
         'KXHIGHMIA', 'KXLOWMIA',    # Miami
         'KXHIGHAUS', 'KXLOWAUS',    # Austin
         'KXHIGHLAX', 'KXLOWLAX',    # Los Angeles
-        'KXHIGHDEN', 'KXLOWDEN',    # Denver (re-enabled for paper trading; range losses were the issue, not thresholds)
+        'KXHIGHDEN', 'KXLOWDEN',    # Denver
+        'KXHIGHPHIL', 'KXLOWTPHIL', # Philadelphia (HIGH + LOW)
+        'KXHIGHTDAL',               # Dallas (HIGH only)
+        'KXHIGHTBOS',               # Boston (HIGH only)
+        'KXHIGHTATL',               # Atlanta (HIGH only)
+        'KXHIGHTHOU',               # Houston (HIGH only)
+        'KXHIGHTSEA',               # Seattle (HIGH only)
+        'KXHIGHTPHX',               # Phoenix (HIGH only)
+        'KXHIGHTMIN',               # Minneapolis (HIGH only)
+        'KXHIGHTDC',                # Washington DC (HIGH only)
+        'KXHIGHTOKC',               # Oklahoma City (HIGH only)
+        'KXHIGHTSFO',               # San Francisco (HIGH only)
     ]
     
     @classmethod

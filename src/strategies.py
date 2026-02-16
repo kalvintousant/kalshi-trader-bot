@@ -5,7 +5,7 @@ import numpy as np
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from .kalshi_client import KalshiClient
-from .config import Config
+from .config import Config, extract_city_code
 from .weather_data import WeatherDataAggregator, extract_threshold_from_market
 from .market_maker import MarketMaker, SmartOrderRouter
 from .portfolio_risk import CorrelationAwareRisk
@@ -22,9 +22,19 @@ class TradingStrategy:
         self.client = client
         self.name = self.__class__.__name__
 
+        # Resting orders snapshot — set by bot.py at start of each scan cycle
+        # to avoid fetching resting orders per-market (single-threaded, can't change mid-scan)
+        self._resting_orders_snapshot = None
+
         # Data store for backtesting (shared instance)
         self.data_store = get_data_store()
     
+    def _get_resting_orders(self) -> List[Dict]:
+        """Return resting orders from snapshot if available, else fetch from API."""
+        if self._resting_orders_snapshot is not None:
+            return self._resting_orders_snapshot
+        return self.client.get_orders(status='resting', use_cache=False)
+
     def _has_resting_order_on_ticker(self, ticker: str) -> bool:
         """
         Check if we already have a resting order or paper position on this EXACT ticker.
@@ -46,7 +56,7 @@ class TradingStrategy:
                     return True
                 return False
 
-            orders = self.client.get_orders(status='resting', use_cache=False)
+            orders = self._get_resting_orders()
             for order in orders:
                 if order.get('ticker') == ticker:
                     return True
@@ -114,10 +124,9 @@ class TradingStrategy:
             except Exception as e:
                 logger.debug(f"Could not fetch positions for {base_market}: {e}")
 
-            # Get resting (open) orders - use_cache=False for fresh data!
-            # This is critical: stale cache was causing duplicate orders
+            # Get resting (open) orders from scan snapshot (or fresh API call)
             try:
-                orders = self.client.get_orders(status='resting', use_cache=False)
+                orders = self._get_resting_orders()
                 for order in orders:
                     order_ticker = order.get('ticker', '')
                     # Check if this order belongs to our base market
@@ -223,7 +232,7 @@ class TradingStrategy:
 
         # Also check resting orders for the opposite side
         try:
-            orders = self.client.get_orders(status='resting', use_cache=False)
+            orders = self._get_resting_orders()
             for order in orders:
                 order_ticker = order.get('ticker', '')
                 order_parts = order_ticker.split('-')
@@ -763,8 +772,9 @@ class WeatherDailyStrategy(TradingStrategy):
         date_part = parts[1]  # e.g., 26FEB01
 
         # Find correlated series (HIGH/LOW for same city)
-        city_code = series.replace('KXHIGH', '').replace('KXLOW', '')
-        correlated_series = [f'KXHIGH{city_code}', f'KXLOW{city_code}']
+        city_code = extract_city_code(series)
+        correlated_series = [f'KXHIGH{city_code}', f'KXLOW{city_code}',
+                             f'KXHIGHT{city_code}', f'KXLOWT{city_code}']
 
         total_contracts = 0
         total_dollars = 0.0
@@ -787,7 +797,7 @@ class WeatherDailyStrategy(TradingStrategy):
 
         try:
             # Also check resting orders
-            orders = self.client.get_orders(status='resting', use_cache=False)
+            orders = self._get_resting_orders()
             for order in orders:
                 order_ticker = order.get('ticker', '')
                 order_parts = order_ticker.split('-')
@@ -1225,7 +1235,7 @@ class WeatherDailyStrategy(TradingStrategy):
             return False
 
         # Hard-disable check (takes precedence over everything)
-        city_code = series_ticker.replace('KXHIGH', '').replace('KXLOW', '') if series_ticker else ''
+        city_code = extract_city_code(series_ticker) if series_ticker else ''
         if city_code.upper() in Config.DISABLED_CITIES:
             logger.debug(f"📊 SKIP {ticker}: city {city_code} is hard-disabled")
             return False
@@ -1233,7 +1243,7 @@ class WeatherDailyStrategy(TradingStrategy):
         # Check if city is adaptively disabled (poor performance)
         if self.adaptive_manager and series_ticker:
             if not self.adaptive_manager.is_city_enabled(series_ticker):
-                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                city = extract_city_code(series_ticker)
                 logger.debug(f"📊 SKIP {ticker}: city {city} adaptively disabled (poor win rate)")
                 return False
 
@@ -1522,7 +1532,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # Reduces our_prob for cities where we've been systematically overconfident
             if self.settlement_tracker:
                 try:
-                    city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                    city = extract_city_code(series_ticker)
                     div_stats = self.settlement_tracker.get_city_divergence(city)
                     conf_adj = div_stats.get('confidence_adjustment', 1.0)
                     if conf_adj < 1.0:

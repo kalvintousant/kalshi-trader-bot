@@ -13,6 +13,7 @@ Enhanced with additional data sources:
 """
 import os
 import re
+import time
 import requests
 import logging
 import struct
@@ -26,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from scipy import stats
 from dotenv import load_dotenv
+from .config import extract_city_code
 
 load_dotenv()
 
@@ -62,6 +64,29 @@ class WeatherDataAggregator:
         # Denver - Denver International Airport (DENHIGH contract - likely DEN)
         'KXHIGHDEN': {'lat': 39.8561, 'lon': -104.6737, 'name': 'Denver International Airport'},
         'KXLOWDEN': {'lat': 39.8561, 'lon': -104.6737, 'name': 'Denver International Airport'},
+        # Philadelphia - Philadelphia International Airport
+        'KXHIGHPHIL': {'lat': 39.8721, 'lon': -75.2411, 'name': 'Philadelphia International Airport'},
+        'KXLOWTPHIL': {'lat': 39.8721, 'lon': -75.2411, 'name': 'Philadelphia International Airport'},
+        # Dallas - DFW Airport
+        'KXHIGHTDAL': {'lat': 32.8968, 'lon': -97.0380, 'name': 'DFW Airport'},
+        # Boston - Boston Logan Airport
+        'KXHIGHTBOS': {'lat': 42.3656, 'lon': -71.0096, 'name': 'Boston Logan Airport'},
+        # Atlanta - Hartsfield-Jackson Airport
+        'KXHIGHTATL': {'lat': 33.6407, 'lon': -84.4277, 'name': 'Hartsfield-Jackson Airport'},
+        # Houston - Houston Hobby Airport
+        'KXHIGHTHOU': {'lat': 29.6454, 'lon': -95.2789, 'name': 'Houston Hobby Airport'},
+        # Seattle - Seattle-Tacoma Airport
+        'KXHIGHTSEA': {'lat': 47.4502, 'lon': -122.3088, 'name': 'Seattle-Tacoma Airport'},
+        # Phoenix - Phoenix Sky Harbor Airport
+        'KXHIGHTPHX': {'lat': 33.4373, 'lon': -112.0078, 'name': 'Phoenix Sky Harbor Airport'},
+        # Minneapolis - MSP Airport
+        'KXHIGHTMIN': {'lat': 44.8848, 'lon': -93.2223, 'name': 'MSP Airport'},
+        # Washington DC - Reagan National Airport
+        'KXHIGHTDC': {'lat': 38.8512, 'lon': -77.0402, 'name': 'Reagan National Airport'},
+        # Oklahoma City - Will Rogers Airport
+        'KXHIGHTOKC': {'lat': 35.3931, 'lon': -97.6007, 'name': 'Will Rogers Airport'},
+        # San Francisco - SFO Airport
+        'KXHIGHTSFO': {'lat': 37.6213, 'lon': -122.3790, 'name': 'SFO Airport'},
     }
     
     # IANA timezones for each city (used to determine "local time" for high-of-day cutoff)
@@ -72,6 +97,17 @@ class WeatherDataAggregator:
         'KXHIGHAUS': 'America/Chicago', 'KXLOWAUS': 'America/Chicago',
         'KXHIGHLAX': 'America/Los_Angeles', 'KXLOWLAX': 'America/Los_Angeles',
         'KXHIGHDEN': 'America/Denver', 'KXLOWDEN': 'America/Denver',
+        'KXHIGHPHIL': 'America/New_York', 'KXLOWTPHIL': 'America/New_York',
+        'KXHIGHTDAL': 'America/Chicago',
+        'KXHIGHTBOS': 'America/New_York',
+        'KXHIGHTATL': 'America/New_York',
+        'KXHIGHTHOU': 'America/Chicago',
+        'KXHIGHTSEA': 'America/Los_Angeles',
+        'KXHIGHTPHX': 'America/Phoenix',
+        'KXHIGHTMIN': 'America/Chicago',
+        'KXHIGHTDC': 'America/New_York',
+        'KXHIGHTOKC': 'America/Chicago',
+        'KXHIGHTSFO': 'America/Los_Angeles',
     }
     
     # Local hour (24h) after which we assume the high of the day has occurred (longshot value is minimal)
@@ -129,6 +165,12 @@ class WeatherDataAggregator:
 
         # Ensemble data cache (stores full ensemble for uncertainty calculation)
         self.ensemble_cache = {}  # {cache_key: {'forecasts': [...], 'std': float, 'timestamp': datetime}}
+
+        # NWS station cache — permanent per session (stations don't change)
+        self._nws_station_cache = {}  # {series_ticker: station_id_url}
+        # NWS observation cache — 5min TTL (NWS updates ~hourly)
+        self._nws_obs_cache = {}  # {(series_ticker, 'high'/'low'): (result, timestamp)}
+        self._nws_obs_cache_ttl = 300  # 5 minutes
 
         # Source reliability weights (based on historical accuracy)
         # Weights calibrated based on typical model performance for US temperature forecasting
@@ -198,7 +240,7 @@ class WeatherDataAggregator:
             market_type = 'low' if 'LOW' in series_ticker else 'high'
 
             # Extract city from series ticker (e.g., KXHIGHNY -> NY)
-            city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+            city = extract_city_code(series_ticker)
 
             # Calculate hours until settlement (roughly 11 PM local for daily markets)
             # Use a simple estimate - actual settlement time varies by city
@@ -702,15 +744,28 @@ class WeatherDataAggregator:
 
         all_ensemble_temps = []
 
-        # Fetch GEFS ensemble (31 members)
-        gefs_results = self.get_forecast_gefs_ensemble(lat, lon, date, series_ticker)
+        # Fetch GEFS and ECMWF ensembles in parallel (each has 15s timeout)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            gefs_future = executor.submit(self.get_forecast_gefs_ensemble, lat, lon, date, series_ticker)
+            ecmwf_future = executor.submit(self.get_forecast_ecmwf_ensemble, lat, lon, date, series_ticker)
+
+            try:
+                gefs_results = gefs_future.result(timeout=20)
+            except Exception as e:
+                logger.debug(f"GEFS ensemble fetch failed: {e}")
+                gefs_results = []
+
+            try:
+                ecmwf_results = ecmwf_future.result(timeout=20)
+            except Exception as e:
+                logger.debug(f"ECMWF ensemble fetch failed: {e}")
+                ecmwf_results = []
+
         gefs_temps = [temp for temp, source, _ in gefs_results if 'member' in source]
         if gefs_temps:
             all_ensemble_temps.extend(gefs_temps)
             logger.debug(f"GEFS ensemble: {len(gefs_temps)} members, mean={np.mean(gefs_temps):.1f}°F, std={np.std(gefs_temps):.1f}°F")
 
-        # Fetch ECMWF ensemble (51 members)
-        ecmwf_results = self.get_forecast_ecmwf_ensemble(lat, lon, date, series_ticker)
         ecmwf_temps = [temp for temp, source, _ in ecmwf_results if 'member' in source]
         if ecmwf_temps:
             all_ensemble_temps.extend(ecmwf_temps)
@@ -750,7 +805,7 @@ class WeatherDataAggregator:
             Bias-corrected temperature
         """
         # Get city base (e.g., 'NY' from 'KXHIGHNY' or 'KXLOWNY')
-        city_base = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+        city_base = extract_city_code(series_ticker)
 
         bias = self.model_bias[source][city_base][month]
         if bias != 0:
@@ -772,7 +827,7 @@ class WeatherDataAggregator:
             predicted_temp: What the model predicted
             actual_temp: What actually happened
         """
-        city_base = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+        city_base = extract_city_code(series_ticker)
         month = target_date.month
         error = predicted_temp - actual_temp  # Positive = model ran hot
 
@@ -819,118 +874,109 @@ class WeatherDataAggregator:
         """Return list of enabled weather source names."""
         return self._enabled_sources
 
+    def _get_nws_station_id(self, series_ticker: str) -> Optional[str]:
+        """Resolve NWS observation station ID for a series ticker. Cached permanently per session."""
+        if series_ticker in self._nws_station_cache:
+            return self._nws_station_cache[series_ticker]
+
+        if series_ticker not in self.CITY_COORDS:
+            return None
+
+        city = self.CITY_COORDS[series_ticker]
+        lat, lon = city['lat'], city['lon']
+
+        try:
+            points_url = f"https://api.weather.gov/points/{lat},{lon}"
+            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if resp.status_code != 200:
+                logger.debug(f"NWS points API failed for {series_ticker}: {resp.status_code}")
+                return None
+
+            obs_stations_url = resp.json()['properties'].get('observationStations')
+            if not obs_stations_url:
+                return None
+
+            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
+            if stations_resp.status_code != 200:
+                return None
+
+            features = stations_resp.json().get('features', [])
+            if not features:
+                return None
+
+            station_id = features[0]['id']
+            self._nws_station_cache[series_ticker] = station_id
+            return station_id
+        except Exception as e:
+            logger.debug(f"Error resolving NWS station for {series_ticker}: {e}")
+            return None
+
     def get_todays_observed_high(self, series_ticker: str) -> Optional[Tuple[float, datetime]]:
         """
         Get today's observed high temperature from NWS station observations.
         Returns (high_temp_f, timestamp) or None if unavailable.
-        
+
         This is critical for avoiding trades on already-determined outcomes.
-        For example, if the market is "Denver high >50°F" and we've already 
-        observed 55°F today, the outcome is certain (YES will win).
-        
-        Uses local timezone to determine "today" and checks ALL observations
-        to ensure we capture the complete daily maximum.
+        Cached for 5 minutes (NWS updates ~hourly). Station ID cached permanently.
         """
-        if series_ticker not in self.CITY_COORDS:
-            logger.debug(f"Unknown series ticker: {series_ticker}")
+        # Check observation cache first (5min TTL)
+        cache_key = (series_ticker, 'high')
+        if cache_key in self._nws_obs_cache:
+            cached_result, cached_time = self._nws_obs_cache[cache_key]
+            if (time.time() - cached_time) < self._nws_obs_cache_ttl:
+                return cached_result
+
+        if series_ticker not in self.CITY_COORDS or series_ticker not in self.CITY_TIMEZONES:
             return None
-        
-        if series_ticker not in self.CITY_TIMEZONES:
-            logger.debug(f"No timezone defined for {series_ticker}")
-            return None
-        
-        city = self.CITY_COORDS[series_ticker]
-        lat, lon = city['lat'], city['lon']
+
         tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
-        
+
         try:
-            # Get NWS observation station for this location
-            points_url = f"https://api.weather.gov/points/{lat},{lon}"
-            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            
-            if resp.status_code != 200:
-                logger.debug(f"NWS points API failed for {series_ticker}: {resp.status_code}")
+            station_id = self._get_nws_station_id(series_ticker)
+            if not station_id:
                 return None
-            
-            points_data = resp.json()
-            obs_stations_url = points_data['properties'].get('observationStations')
-            
-            if not obs_stations_url:
-                logger.debug(f"No observation stations URL for {series_ticker}")
-                return None
-            
-            # Get the nearest observation station
-            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            
-            if stations_resp.status_code != 200:
-                logger.debug(f"NWS stations API failed: {stations_resp.status_code}")
-                return None
-            
-            stations_data = stations_resp.json()
-            features = stations_data.get('features', [])
-            
-            if not features:
-                logger.debug(f"No observation stations found for {series_ticker}")
-                return None
-            
-            station_id = features[0]['id']
-            
-            # Get ALL observations from this station (NWS API returns up to 500)
+
             obs_url = f"{station_id}/observations"
             obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            
+
             if obs_resp.status_code != 200:
                 logger.debug(f"NWS observations API failed: {obs_resp.status_code}")
                 return None
-            
-            obs_data = obs_resp.json()
-            observations = obs_data.get('features', [])
-            
+
+            observations = obs_resp.json().get('features', [])
             if not observations:
                 logger.debug(f"No observations available for {series_ticker}")
                 return None
-            
-            # Use LOCAL timezone to determine "today" (critical for accuracy)
+
             today_local = datetime.now(tz).date()
             today_temps = []
-            
-            # Check ALL observations (not just first 100) to ensure we get complete daily data
+
             for obs in observations:
                 props = obs['properties']
                 timestamp_str = props.get('timestamp')
-                
                 if not timestamp_str:
                     continue
-                
-                # Parse timestamp (NWS returns UTC)
                 timestamp_utc = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                # Convert to local timezone
                 timestamp_local = timestamp_utc.astimezone(tz)
-                
-                # Only include today's observations (in local time)
                 if timestamp_local.date() != today_local:
                     continue
-                
-                # Get temperature
                 temp_c = props.get('temperature', {}).get('value')
-                
                 if temp_c is None:
                     continue
-                
-                # Convert to Fahrenheit
                 temp_f = (temp_c * 9/5) + 32
                 today_temps.append((temp_f, timestamp_local))
-            
+
             if not today_temps:
                 logger.debug(f"No observations for today ({today_local}) found for {series_ticker}")
+                self._nws_obs_cache[cache_key] = (None, time.time())
                 return None
-            
-            # Find the maximum temperature observed today
+
             max_temp, max_time = max(today_temps, key=lambda x: x[0])
-            
+            result = (max_temp, max_time)
+            self._nws_obs_cache[cache_key] = (result, time.time())
             logger.debug(f"Today's observed high for {series_ticker}: {max_temp:.1f}°F (at {max_time.strftime('%H:%M %Z')})")
-            return (max_temp, max_time)
-        
+            return result
+
         except Exception as e:
             logger.debug(f"Error getting today's observed high for {series_ticker}: {e}")
             return None
@@ -1047,111 +1093,67 @@ class WeatherDataAggregator:
         """
         Get today's observed low temperature from NWS station observations.
         Returns (low_temp_f, timestamp) or None if unavailable.
-        
-        Similar to get_todays_observed_high but finds the minimum temperature.
-        Uses local timezone to determine "today" and checks ALL observations
-        to ensure we capture the complete daily minimum.
+
+        Cached for 5 minutes (NWS updates ~hourly). Station ID cached permanently.
         """
-        if series_ticker not in self.CITY_COORDS:
-            logger.debug(f"Unknown series ticker: {series_ticker}")
+        # Check observation cache first (5min TTL)
+        cache_key = (series_ticker, 'low')
+        if cache_key in self._nws_obs_cache:
+            cached_result, cached_time = self._nws_obs_cache[cache_key]
+            if (time.time() - cached_time) < self._nws_obs_cache_ttl:
+                return cached_result
+
+        if series_ticker not in self.CITY_COORDS or series_ticker not in self.CITY_TIMEZONES:
             return None
-        
-        if series_ticker not in self.CITY_TIMEZONES:
-            logger.debug(f"No timezone defined for {series_ticker}")
-            return None
-        
-        city = self.CITY_COORDS[series_ticker]
-        lat, lon = city['lat'], city['lon']
+
         tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
-        
+
         try:
-            # Get NWS observation station for this location
-            points_url = f"https://api.weather.gov/points/{lat},{lon}"
-            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            
-            if resp.status_code != 200:
-                logger.debug(f"NWS points API failed for {series_ticker}: {resp.status_code}")
+            station_id = self._get_nws_station_id(series_ticker)
+            if not station_id:
                 return None
-            
-            points_data = resp.json()
-            obs_stations_url = points_data['properties'].get('observationStations')
-            
-            if not obs_stations_url:
-                logger.debug(f"No observation stations URL for {series_ticker}")
-                return None
-            
-            # Get the nearest observation station
-            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            
-            if stations_resp.status_code != 200:
-                logger.debug(f"NWS stations API failed: {stations_resp.status_code}")
-                return None
-            
-            stations_data = stations_resp.json()
-            features = stations_data.get('features', [])
-            
-            if not features:
-                logger.debug(f"No observation stations found for {series_ticker}")
-                return None
-            
-            station_id = features[0]['id']
-            
-            # Get ALL observations from this station (NWS API returns up to 500)
+
             obs_url = f"{station_id}/observations"
             obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            
+
             if obs_resp.status_code != 200:
                 logger.debug(f"NWS observations API failed: {obs_resp.status_code}")
                 return None
-            
-            obs_data = obs_resp.json()
-            observations = obs_data.get('features', [])
-            
+
+            observations = obs_resp.json().get('features', [])
             if not observations:
                 logger.debug(f"No observations available for {series_ticker}")
                 return None
-            
-            # Use LOCAL timezone to determine "today" (critical for accuracy)
+
             today_local = datetime.now(tz).date()
             today_temps = []
-            
-            # Check ALL observations (not just first 100) to ensure we get complete daily data
+
             for obs in observations:
                 props = obs['properties']
                 timestamp_str = props.get('timestamp')
-                
                 if not timestamp_str:
                     continue
-                
-                # Parse timestamp (NWS returns UTC)
                 timestamp_utc = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                # Convert to local timezone
                 timestamp_local = timestamp_utc.astimezone(tz)
-                
-                # Only include today's observations (in local time)
                 if timestamp_local.date() != today_local:
                     continue
-                
-                # Get temperature
                 temp_c = props.get('temperature', {}).get('value')
-                
                 if temp_c is None:
                     continue
-                
-                # Convert to Fahrenheit
                 temp_f = (temp_c * 9/5) + 32
                 today_temps.append((temp_f, timestamp_local))
-            
+
             if not today_temps:
                 logger.debug(f"No observations for today ({today_local}) found for {series_ticker}")
+                self._nws_obs_cache[cache_key] = (None, time.time())
                 return None
-            
-            # Find the minimum temperature observed today
+
             min_temp, min_time = min(today_temps, key=lambda x: x[0])
-            
+            result = (min_temp, min_time)
+            self._nws_obs_cache[cache_key] = (result, time.time())
             logger.debug(f"Today's observed low for {series_ticker}: {min_temp:.1f}°F (at {min_time.strftime('%H:%M %Z')})")
-            return (min_temp, min_time)
-        
+            return result
+
         except Exception as e:
             logger.debug(f"Error getting today's observed low for {series_ticker}: {e}")
             return None
@@ -1323,7 +1325,7 @@ class WeatherDataAggregator:
                         try:
                             from .forecast_weighting import get_forecast_tracker
                             tracker = get_forecast_tracker()
-                            city_code = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                            city_code = extract_city_code(series_ticker)
                             tracker.store_forecast(city_code, target_date.strftime('%Y-%m-%d'), source, temp)
                         except Exception:
                             pass
@@ -1350,7 +1352,7 @@ class WeatherDataAggregator:
                     try:
                         from .forecast_weighting import get_forecast_tracker
                         tracker = get_forecast_tracker()
-                        city_code = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                        city_code = extract_city_code(series_ticker)
                         tracker.store_forecast(city_code, target_date.strftime('%Y-%m-%d'), source, temp)
                     except Exception:
                         pass
@@ -1439,7 +1441,7 @@ class WeatherDataAggregator:
             try:
                 from .forecast_weighting import get_forecast_tracker
                 tracker = get_forecast_tracker()
-                city_code = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                city_code = extract_city_code(series_ticker)
                 source_dict = {source: temp for temp, _, source in weighted_forecasts}
                 tracker_mean, tracker_weights = tracker.get_weighted_forecast(source_dict, city=city_code)
                 if tracker_mean is not None and tracker_weights:

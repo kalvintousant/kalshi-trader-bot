@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
-from .config import Config
+from .config import Config, extract_city_code
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +294,7 @@ class OutcomeTracker:
                 try:
                     from .forecast_weighting import get_forecast_tracker
                     tracker = get_forecast_tracker()
-                    city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                    city = extract_city_code(series_ticker)
                     is_high = series_ticker.startswith('KXHIGH')
                     tracker.store_actual(
                         city, target_date.strftime('%Y-%m-%d'),
@@ -350,7 +350,7 @@ class OutcomeTracker:
 
             # Update adaptive city manager with outcome
             if self.adaptive_manager and series_ticker:
-                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                city = extract_city_code(series_ticker)
                 self.adaptive_manager.record_outcome(city, won, total_profit_loss)
                 logger.debug(f"Updated adaptive manager for city {city}")
 
@@ -360,7 +360,7 @@ class OutcomeTracker:
 
             # Update settlement divergence tracker
             if self.settlement_tracker and series_ticker:
-                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                city = extract_city_code(series_ticker)
                 # Look up our original probability from trades.csv
                 our_prob = self._lookup_trade_probability(market_ticker, side)
                 self.settlement_tracker.record_settlement(
@@ -521,7 +521,7 @@ class OutcomeTracker:
                 profit_loss = (revenue - total_cost) / 100.0
 
                 # Extract city from series ticker
-                city = series_ticker.replace('KXHIGH', '').replace('KXLOW', '')
+                city = extract_city_code(series_ticker)
 
                 with open(self.outcomes_file, 'a', newline='') as f:
                     writer = csv.writer(f)

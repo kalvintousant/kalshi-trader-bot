@@ -3,11 +3,13 @@ Dashboard console output for Weather Trader Bot.
 Renders a clean summary to the terminal while bot.log retains full detail.
 Style matched to Crypto Trader Bot production dashboard.
 """
+import os
+import re
 import sys
 import time
 from collections import deque
 from datetime import datetime
-from .config import Config
+from .config import Config, extract_city_code
 
 
 # ANSI color codes (matches Crypto Trader Bot palette)
@@ -82,6 +84,9 @@ class DashboardState:
         # Per-city stats {city: {wins, losses, pnl}}
         self.city_stats = {}
 
+        # Active positions per city: {city: {'high': set(tickers), 'low': set(tickers)}}
+        self.city_positions = {}
+
         # Per-type stats {type: {wins, losses, pnl}} — 'threshold' vs 'range'
         self.type_stats = {'threshold': {'wins': 0, 'losses': 0, 'pnl': 0.0},
                            'range': {'wins': 0, 'losses': 0, 'pnl': 0.0}}
@@ -105,6 +110,16 @@ class DashboardState:
     def record_trade(self, action: str, side: str, count: int, price: int,
                      ticker: str, strategy_mode: str = '', edge: float = 0.0):
         self.session_placed += 1
+        # Track active position by city and high/low
+        series_part = ticker.split('-')[0] if '-' in ticker else ticker
+        city = extract_city_code(series_part)
+        if city:
+            if city not in self.city_positions:
+                self.city_positions[city] = {'high': set(), 'low': set()}
+            if 'HIGH' in series_part.upper():
+                self.city_positions[city]['high'].add(ticker)
+            elif 'LOW' in series_part.upper():
+                self.city_positions[city]['low'].add(ticker)
         ts = datetime.now().strftime('%H:%M:%S')
         side_color = C['green'] if side.upper() == 'YES' else C['red']
         mode_label, mode_color_key = MODE_DISPLAY.get(strategy_mode, ('', 'dim'))
@@ -143,13 +158,18 @@ class DashboardState:
         else:
             self.session_losses += 1
 
+        # Remove settled position from city tracker
+        series_part = ticker.split('-')[0] if '-' in ticker else ticker
+        city = extract_city_code(series_part)
+        if city and city in self.city_positions:
+            self.city_positions[city]['high'].discard(ticker)
+            self.city_positions[city]['low'].discard(ticker)
+
         # Update per-city stats
         city = ''
-        for prefix in ('KXHIGH', 'KXLOW'):
-            if ticker.startswith(prefix):
-                rest = ticker[len(prefix):]
-                city = rest.split('-')[0] if '-' in rest else rest
-                break
+        # Extract series ticker from full ticker (e.g., KXHIGHNY-26FEB04-B75.5 -> KXHIGHNY)
+        series_part = ticker.split('-')[0] if '-' in ticker else ticker
+        city = extract_city_code(series_part)
         if city:
             if city not in self.city_stats:
                 self.city_stats[city] = {'wins': 0, 'losses': 0, 'pnl': 0.0}
@@ -252,26 +272,22 @@ class Dashboard:
         )
         lines.append(SEP)
 
-        # ── Account (one compact block) ──
-        lines.append(
-            f" {c['white']}${s.cash:.2f}{c['reset']} cash"
-            f"  {c['white']}${s.portfolio_value:.2f}{c['reset']} portfolio"
-            f"  {c['bright']}${total:.2f}{c['reset']} total"
-            f"     {c['dim']}exp{c['reset']} ${s.weather_exposure:.2f}"
-        )
-        # Win rate inline with limits
+        # ── Account (merged into two lines) ──
         settled = s.session_wins + s.session_losses
         if settled > 0:
             wr = s.session_wins / settled * 100
             wr_c = c['green'] if wr >= 50 else c['red']
-            wr_str = f"{wr_c}{wr:.0f}%{c['reset']} ({s.session_wins}W/{s.session_losses}L)"
+            wr_str = f"  {c['dim']}|{c['reset']}  {c['dim']}win{c['reset']} {wr_c}{wr:.0f}%{c['reset']} ({s.session_wins}W/{s.session_losses}L)"
         else:
-            wr_str = f"{c['dim']}0W/0L{c['reset']}"
+            wr_str = ""
+        lines.append(
+            f" {c['white']}${s.cash:.2f}{c['reset']} cash"
+            f"  {c['white']}${s.portfolio_value:.2f}{c['reset']} portfolio"
+            f"  {c['bright']}${total:.2f}{c['reset']} total"
+            f"{wr_str}"
+        )
         lines.append(
             f" {c['dim']}limit{c['reset']} -${s.daily_loss_limit:.2f}"
-            f"  {c['dim']}resting{c['reset']} {s.resting_orders}"
-            f"  {c['dim']}filled{c['reset']} {s.session_filled}"
-            f"  {c['dim']}|{c['reset']}  {c['dim']}win{c['reset']} {wr_str}"
         )
 
         # ── Per-city lines (like Crypto Bot per-asset) ──
@@ -281,25 +297,34 @@ class Dashboard:
             # Fallback: derive from WEATHER_SERIES
             seen = set()
             for series in Config.WEATHER_SERIES:
-                city = series.replace('KXHIGH', '').replace('KXLOW', '')
+                city = extract_city_code(series)
                 if city not in seen:
                     seen.add(city)
                     all_cities.append(city)
 
-        for city in all_cities:
+        # Build per-city cell strings for two-column grid
+        def _city_cell(city):
             is_hard_disabled = city.upper() in Config.DISABLED_CITIES
             is_adaptive_disabled = city in s.cities_disabled and not is_hard_disabled
-            is_enabled = city in s.cities_enabled
 
-            # City name + status tag
             if is_hard_disabled:
                 status_tag = f"{c['red']}OFF{c['reset']}"
             elif is_adaptive_disabled:
-                status_tag = f"{c['yellow']}ADAPT{c['reset']}"
+                status_tag = f"{c['yellow']}ADP{c['reset']}"
             else:
-                status_tag = f"{c['green']}ON{c['reset']}"
+                status_tag = f"{c['green']}ON{c['reset']} "
 
-            # Per-city win/loss/P&L
+            # Active positions indicator (e.g., "H2 L1" or "H1")
+            cp = s.city_positions.get(city, {})
+            h_count = len(cp.get('high', set()))
+            l_count = len(cp.get('low', set()))
+            pos_parts = []
+            if h_count:
+                pos_parts.append(f"{c['cyan']}H{h_count}{c['reset']}")
+            if l_count:
+                pos_parts.append(f"{c['magenta']}L{l_count}{c['reset']}")
+            pos_str = ' '.join(pos_parts) if pos_parts else ''
+
             cs = s.city_stats.get(city, {})
             wins = cs.get('wins', 0)
             losses = cs.get('losses', 0)
@@ -312,13 +337,29 @@ class Dashboard:
                 pnl_c2 = c['green'] if city_pnl >= 0 else c['red']
                 stats_str = (
                     f"{city_wr_c}{city_wr:.0f}%{c['reset']}"
-                    f" {c['dim']}({wins}W/{losses}L){c['reset']}"
-                    f"  {pnl_c2}${city_pnl:+.2f}{c['reset']}"
+                    f" ({wins}W/{losses}L)"
+                    f" {pnl_c2}${city_pnl:+.2f}{c['reset']}"
                 )
             else:
                 stats_str = f"{c['dim']}--{c['reset']}"
 
-            lines.append(f" {c['bright']}{city.ljust(5)}{c['reset']} {status_tag}  {stats_str}")
+            if pos_str:
+                return f" {c['bright']}{city.ljust(4)}{c['reset']} {status_tag} {pos_str} {stats_str}"
+            return f" {c['bright']}{city.ljust(4)}{c['reset']} {status_tag} {stats_str}"
+
+        # Pair cities into two-column rows
+        COL_WIDTH = 35  # visible character width per column
+        for i in range(0, len(all_cities), 2):
+            left = _city_cell(all_cities[i])
+            if i + 1 < len(all_cities):
+                # Pad left column to COL_WIDTH visible chars
+                # Strip ANSI to measure visible length
+                visible = re.sub(r'\x1b\[[0-9;]*m', '', left)
+                pad = max(COL_WIDTH - len(visible), 1)
+                right = _city_cell(all_cities[i + 1])
+                lines.append(left + ' ' * pad + right)
+            else:
+                lines.append(left)
 
         # ── Threshold vs Range P&L ──
         th = s.type_stats['threshold']
@@ -350,23 +391,6 @@ class Dashboard:
         elif s.drawdown_consecutive > 0 and s.drawdown_level != 'NORMAL':
             lines.append(f" {c['yellow']}drawdown {s.drawdown_level} ({s.drawdown_multiplier:.0%} size, {s.drawdown_consecutive}L streak){c['reset']}")
 
-        # ── Scan + ops ──
-        lines.append(SEP)
-        if s.last_scan_time:
-            scan_ts = s.last_scan_time.strftime('%H:%M:%S')
-            traded_c = c['green'] if s.last_scan_traded > 0 else c['dim']
-            lines.append(
-                f" {c['dim']}scan {s.total_scans}{c['reset']}"
-                f"  {scan_ts}"
-                f"  {c['dim']}({s.last_scan_duration:.1f}s){c['reset']}"
-                f"  {s.last_scan_markets} mkts"
-                f"  {c['dim']}|{c['reset']} {s.last_scan_skipped} skip"
-                f"  {c['dim']}|{c['reset']} {traded_c}{s.last_scan_traded} traded{c['reset']}"
-                f"  {c['dim']}|{c['reset']} {c['dim']}src{c['reset']} {s.forecast_sources}"
-            )
-        else:
-            lines.append(f" {c['dim']}no scan yet{c['reset']}")
-
         # ── Event feed ──
         if s.recent_events:
             lines.append(SEP)
@@ -375,7 +399,6 @@ class Dashboard:
 
         # ── Footer ──
         lines.append(SEP)
-        import os
         err_str = ''
         if s.total_errors > 0:
             err_str = f"  {c['dim']}|{c['reset']}  {c['red']}{s.total_errors} errors{c['reset']}"

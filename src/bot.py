@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Set
 from src.kalshi_client import KalshiClient
 from src.strategies import StrategyManager
-from src.config import Config
+from src.config import Config, extract_city_code
 from src.logger import setup_logging
 from src.outcome_tracker import OutcomeTracker
 from src.dashboard import DashboardState, Dashboard
@@ -104,6 +104,7 @@ class KalshiTradingBot:
             self.daily_pnl = 0
             self._paper_session_pnl = 0.0
             self.last_reset_date = today
+            self.client.invalidate_markets_cache()
             logger.info(f"Daily stats reset for {today}")
             logger.info(f"Starting weather exposure: ${self.starting_weather_exposure:.2f}")
     
@@ -265,6 +266,8 @@ class KalshiTradingBot:
     
     def check_filled_orders(self):
         """Check for filled orders and send notifications"""
+        if Config.PAPER_TRADING:
+            return  # No real orders to check in paper mode
         try:
             try:
                 filled_orders = self.client.get_orders(status='filled')
@@ -326,6 +329,9 @@ class KalshiTradingBot:
     
     def check_and_cancel_stale_orders(self):
         """Check resting orders and cancel if edge/EV no longer meets strategy thresholds"""
+        # Skip entirely in paper mode — no real Kalshi orders to cancel
+        if Config.PAPER_TRADING:
+            return
         try:
             try:
                 # Use fresh data (no cache) for accurate stale order detection
@@ -489,6 +495,19 @@ class KalshiTradingBot:
             if hasattr(strategy, 'clear_pending_decisions'):
                 strategy.clear_pending_decisions()
 
+        # Fetch resting orders once and push snapshot to all strategies
+        # (single-threaded bot — orders can't change mid-scan except when we place/cancel)
+        # In paper mode, use empty list (no real Kalshi orders exist)
+        if Config.PAPER_TRADING:
+            resting_snapshot = []
+        else:
+            try:
+                resting_snapshot = self.client.get_orders(status='resting', use_cache=False)
+            except Exception:
+                resting_snapshot = None  # strategies will fall back to per-call API fetch
+        for strategy in self.strategy_manager.strategies:
+            strategy._resting_orders_snapshot = resting_snapshot
+
         try:
             # Filter markets by relevant series FIRST to reduce API calls
             # Increase limit to catch all markets, especially new ones
@@ -594,7 +613,7 @@ class KalshiTradingBot:
                     break
 
                 # Pace API calls: 250ms between markets that actually get evaluated
-                if markets_evaluated > 1:
+                if markets_evaluated > 1 and not Config.PAPER_TRADING:
                     time.sleep(0.25)
 
                 logger.debug(f"Evaluating market: {market.get('ticker', 'unknown')} - {market.get('title', 'unknown')[:50]}")
@@ -619,6 +638,15 @@ class KalshiTradingBot:
                         self._recently_ordered_tickers[market_ticker] = time.time()
                         self._scan_traded_count += 1
 
+                        # Refresh resting orders snapshot after placement (skip in paper mode — no real orders)
+                        if not Config.PAPER_TRADING:
+                            try:
+                                resting_snapshot = self.client.get_orders(status='resting', use_cache=False)
+                                for strategy in self.strategy_manager.strategies:
+                                    strategy._resting_orders_snapshot = resting_snapshot
+                            except Exception:
+                                pass
+
                         # Record trade on dashboard
                         self.dashboard_state.record_trade(
                             decision.get('action', 'buy'),
@@ -634,7 +662,8 @@ class KalshiTradingBot:
                         logger.info(f"Trade executed successfully - Market: {market_ticker}")
                         logger.debug(f"Active positions being tracked: {len(self.markets_being_tracked)}")
 
-                        time.sleep(0.3)  # Reduced rate limiting delay
+                        if not Config.PAPER_TRADING:
+                            time.sleep(0.3)  # Rate limiting delay (unnecessary in paper mode)
 
             # Flush cross-threshold decisions: execute best decision per base market
             for strategy in self.strategy_manager.strategies:
@@ -653,6 +682,15 @@ class KalshiTradingBot:
                         self._recently_ordered_tickers[market_ticker] = time.time()
                         self._scan_traded_count += 1
 
+                        # Refresh resting orders snapshot after placement (skip in paper mode)
+                        if not Config.PAPER_TRADING:
+                            try:
+                                resting_snapshot = self.client.get_orders(status='resting', use_cache=False)
+                                for s in self.strategy_manager.strategies:
+                                    s._resting_orders_snapshot = resting_snapshot
+                            except Exception:
+                                pass
+
                         self.dashboard_state.record_trade(
                             decision.get('action', 'buy'),
                             decision.get('side', '?'),
@@ -664,11 +702,16 @@ class KalshiTradingBot:
                         )
 
                         logger.info(f"Trade executed successfully - Market: {market_ticker}")
-                        time.sleep(0.3)
+                        if not Config.PAPER_TRADING:
+                            time.sleep(0.3)
 
         except Exception as e:
             self.dashboard_state.record_error()
             logger.error(f"Error in scan_and_trade: {e}", exc_info=True)
+        finally:
+            # Clear resting orders snapshot at end of scan
+            for strategy in self.strategy_manager.strategies:
+                strategy._resting_orders_snapshot = None
     
     async def handle_websocket_messages(self, websocket):
         """Handle incoming WebSocket messages"""
@@ -808,7 +851,7 @@ class KalshiTradingBot:
                     am = strategy.adaptive_manager
                     seen_cities = set()
                     for series in Config.WEATHER_SERIES:
-                        city = series.replace('KXHIGH', '').replace('KXLOW', '')
+                        city = extract_city_code(series)
                         if city in seen_cities:
                             continue
                         seen_cities.add(city)

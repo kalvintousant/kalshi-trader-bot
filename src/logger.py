@@ -15,7 +15,7 @@ class ConsoleDashboardFilter(logging.Filter):
     """
 
     # Modules whose INFO messages are blocked by default
-    BLOCKED_MODULES = {'src.strategies', 'src.weather_data', 'src.bot', 'src.outcome_tracker'}
+    BLOCKED_MODULES = {'src.strategies', 'src.weather_data', 'src.bot', 'src.outcome_tracker', '__main__'}
 
     # Substrings that let an INFO message through even from blocked modules
     ALLOW_PATTERNS = [
@@ -53,6 +53,8 @@ class ConsoleDashboardFilter(logging.Filter):
         'Trade executed successfully',
         # Error recovery
         'Continuing in',
+        # Scan completion
+        'Scan complete in',
     ]
 
     def filter(self, record):
