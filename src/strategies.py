@@ -1399,6 +1399,11 @@ class WeatherDailyStrategy(TradingStrategy):
                 logger.debug(f"📊 SKIP {market_ticker}: could not extract temp threshold from title")
                 return None
             
+            # Range markets disabled entirely (0% WR in real trading)
+            if isinstance(threshold, tuple) and not getattr(Config, 'RANGE_MARKETS_ENABLED', False):
+                logger.debug(f"📊 SKIP {market_ticker}: range markets disabled (RANGE_MARKETS_ENABLED=false)")
+                return None
+
             # CRITICAL: Check if outcome is already determined by today's observations
             # Only check if this is a market for TODAY (not future dates)
             observed_today = None  # Used later for "past extreme of day" longshot cutoff
@@ -1548,11 +1553,6 @@ class WeatherDailyStrategy(TradingStrategy):
                 boundary_min_dist = getattr(Config, 'RANGE_BOUNDARY_MIN_DISTANCE', 3.0)
                 if dist_to_range < boundary_min_dist:
                     logger.debug(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° only {dist_to_range:.1f}° from range ({range_low}-{range_high}°F) — near-boundary coin flip")
-                    return None
-
-                # Master disable for range markets (0% WR in real trading)
-                if not getattr(Config, 'RANGE_MARKETS_ENABLED', False):
-                    logger.debug(f"📊 SKIP {market_ticker}: range markets disabled (RANGE_MARKETS_ENABLED=false)")
                     return None
 
             # Create temperature ranges around the forecast (2-degree brackets)
