@@ -1,7 +1,9 @@
+import csv
 import time
 import uuid
 import logging
 import numpy as np
+from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from .kalshi_client import KalshiClient
@@ -28,7 +30,12 @@ class TradingStrategy:
 
         # Data store for backtesting (shared instance)
         self.data_store = get_data_store()
-    
+
+        # Paper trade tracking — initialized here so base-class methods can
+        # access without hasattr guards. Populated by subclass _load_paper_state().
+        self._paper_tickers = set()
+        self._paper_positions = {}
+
     def _get_resting_orders(self) -> List[Dict]:
         """Return resting orders from snapshot if available, else fetch from API."""
         if self._resting_orders_snapshot is not None:
@@ -52,7 +59,7 @@ class TradingStrategy:
         try:
             # In paper mode, check local paper ticker set first
             if Config.PAPER_TRADING:
-                if hasattr(self, '_paper_tickers') and ticker in self._paper_tickers:
+                if ticker in self._paper_tickers:
                     return True
                 return False
 
@@ -155,7 +162,7 @@ class TradingStrategy:
                 }
 
             # In paper mode, add paper positions to real exposure
-            if Config.PAPER_TRADING and hasattr(self, '_paper_positions'):
+            if Config.PAPER_TRADING:
                 pp = self._paper_positions.get(base_market)
                 if pp:
                     total_contracts += pp['contracts']
@@ -327,10 +334,6 @@ class TradingStrategy:
                 }
 
                 # Track paper exposure locally for limit enforcement
-                if not hasattr(self, '_paper_positions'):
-                    self._paper_positions = {}
-                if not hasattr(self, '_paper_tickers'):
-                    self._paper_tickers = set()
                 parts = market_ticker.split('-')
                 base = '-'.join(parts[:2]) if len(parts) >= 2 else market_ticker
                 pp = self._paper_positions.setdefault(base, {'contracts': 0, 'dollars': 0.0, 'sides': set()})
@@ -627,6 +630,62 @@ class WeatherDailyStrategy(TradingStrategy):
                 logger.info("📊 Drawdown protector ENABLED — will reduce size on consecutive losses")
         except ImportError as e:
             logger.warning(f"Could not load DrawdownProtector: {e}")
+
+        # Load paper trade state from trades.csv for restart recovery
+        if Config.PAPER_TRADING:
+            self._load_paper_state()
+
+    def _load_paper_state(self):
+        """Rebuild paper_tickers and paper_positions from trades.csv for restart recovery."""
+        try:
+            trades_file = Path("data/trades.csv")
+            if not trades_file.exists():
+                return
+
+            # Load settled tickers from paper_outcomes.csv
+            settled_tickers = set()
+            outcomes_file = Path("data/paper_outcomes.csv")
+            if outcomes_file.exists():
+                with open(outcomes_file, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        settled_tickers.add(row.get('market_ticker', ''))
+
+            # Rebuild from trades.csv
+            with open(trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    order_id = row.get('order_id', '')
+                    if not order_id.startswith('PAPER-'):
+                        continue
+                    ticker = row.get('market_ticker', '')
+                    if not ticker or ticker in settled_tickers:
+                        continue
+
+                    # Add to paper tickers
+                    self._paper_tickers.add(ticker)
+
+                    # Accumulate paper positions
+                    parts = ticker.split('-')
+                    base = '-'.join(parts[:2]) if len(parts) >= 2 else ticker
+                    pp = self._paper_positions.setdefault(base, {
+                        'contracts': 0, 'dollars': 0.0, 'sides': set()
+                    })
+                    try:
+                        count = int(row.get('count', 0))
+                        price = float(row.get('price', 0))
+                        side = row.get('side', '')
+                        pp['contracts'] += count
+                        pp['dollars'] += count * price / 100.0
+                        if side:
+                            pp['sides'].add(side)
+                    except (ValueError, TypeError):
+                        pass
+
+            if self._paper_tickers:
+                logger.info(f"Loaded {len(self._paper_tickers)} paper ticker(s) from trades.csv")
+        except Exception as e:
+            logger.warning(f"Could not load paper state: {e}")
 
     def _get_required_edge(self, price: int) -> float:
         """
