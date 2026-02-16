@@ -92,6 +92,7 @@ class KalshiTradingBot:
         if Config.PAPER_TRADING:
             self._paper_session_pnl = self._load_todays_paper_pnl()
             self._load_todays_paper_settlements()
+            self._load_paper_positions_to_dashboard()
     
     def reset_daily_stats(self):
         """Reset daily statistics"""
@@ -210,6 +211,55 @@ class KalshiTradingBot:
                 logger.info(f"📋 Loaded {count} paper settlement(s) into dashboard from CSV")
         except Exception as e:
             logger.warning(f"Could not load today's paper settlements: {e}")
+
+    def _load_paper_positions_to_dashboard(self):
+        """Load unsettled paper trades into dashboard city_positions for restart recovery."""
+        try:
+            trades_file = Path("data/trades.csv")
+            if not trades_file.exists():
+                return
+
+            # Gather settled tickers so we skip them
+            settled_tickers = set()
+            outcomes_file = Path("data/paper_outcomes.csv")
+            if outcomes_file.exists():
+                with open(outcomes_file, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        settled_tickers.add(row.get('market_ticker', ''))
+
+            count = 0
+            with open(trades_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    order_id = row.get('order_id', '')
+                    if not order_id.startswith('PAPER-'):
+                        continue
+                    ticker = row.get('market_ticker', '')
+                    if not ticker or ticker in settled_tickers:
+                        continue
+                    side = row.get('side', 'yes')
+                    action = row.get('action', 'buy')
+                    try:
+                        cnt = int(row.get('count', 1))
+                        price = int(float(row.get('price', 0)))
+                    except (ValueError, TypeError):
+                        cnt, price = 1, 0
+                    edge = 0.0
+                    try:
+                        edge = float(row.get('edge', 0))
+                    except (ValueError, TypeError):
+                        pass
+                    self.dashboard_state.record_trade(
+                        action, side, cnt, price, ticker,
+                        strategy_mode=row.get('strategy_mode', ''),
+                        edge=edge,
+                    )
+                    count += 1
+            if count > 0:
+                logger.info(f"📋 Loaded {count} paper position(s) into dashboard from trades.csv")
+        except Exception as e:
+            logger.warning(f"Could not load paper positions to dashboard: {e}")
 
     def check_daily_loss_limit(self):
         """Check if we've hit daily loss limit based on weather-only P&L"""
