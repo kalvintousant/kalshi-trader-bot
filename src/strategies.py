@@ -651,7 +651,8 @@ class WeatherDailyStrategy(TradingStrategy):
                     for row in reader:
                         settled_tickers.add(row.get('market_ticker', ''))
 
-            # Rebuild from trades.csv
+            # Rebuild from trades.csv (only unsettled trades for today or future)
+            today_str = datetime.now().date().isoformat()
             with open(trades_file, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -660,6 +661,9 @@ class WeatherDailyStrategy(TradingStrategy):
                         continue
                     ticker = row.get('market_ticker', '')
                     if not ticker or ticker in settled_tickers:
+                        continue
+                    target_date = row.get('target_date', '')
+                    if target_date and target_date < today_str:
                         continue
 
                     # Add to paper tickers

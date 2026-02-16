@@ -228,6 +228,7 @@ class KalshiTradingBot:
                     for row in reader:
                         settled_tickers.add(row.get('market_ticker', ''))
 
+            today_str = datetime.now().date().isoformat()
             count = 0
             with open(trades_file, 'r') as f:
                 reader = csv.DictReader(f)
@@ -237,6 +238,9 @@ class KalshiTradingBot:
                         continue
                     ticker = row.get('market_ticker', '')
                     if not ticker or ticker in settled_tickers:
+                        continue
+                    target_date = row.get('target_date', '')
+                    if target_date and target_date < today_str:
                         continue
                     side = row.get('side', 'yes')
                     action = row.get('action', 'buy')
