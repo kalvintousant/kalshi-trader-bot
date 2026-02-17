@@ -57,9 +57,22 @@ class ConsoleDashboardFilter(logging.Filter):
         'Scan complete in',
     ]
 
+    # Weather API warnings to suppress on console (still logged to file)
+    BLOCKED_WARNING_PATTERNS = [
+        'API returned',
+        'API error',
+        'rate limit',
+        'timed out',
+    ]
+
     def filter(self, record):
-        # WARNING+ always passes
+        # WARNING+ passes, except noisy weather API warnings
         if record.levelno >= logging.WARNING:
+            if record.name == 'src.weather_data':
+                msg = record.getMessage()
+                for pattern in self.BLOCKED_WARNING_PATTERNS:
+                    if pattern in msg:
+                        return False
             return True
 
         # DEBUG is already blocked by console handler level; but be safe

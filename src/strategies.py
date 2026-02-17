@@ -355,8 +355,13 @@ class TradingStrategy:
                 parts = market_ticker.split('-')
                 base = '-'.join(parts[:2]) if len(parts) >= 2 else market_ticker
                 pp = self._paper_positions.setdefault(base, {'contracts': 0, 'dollars': 0.0, 'sides': set()})
-                pp['contracts'] += decision['count']
-                pp['dollars'] += decision['count'] * price / 100.0
+                is_sell = decision.get('action') == 'sell'
+                if is_sell:
+                    pp['contracts'] = max(0, pp['contracts'] - decision['count'])
+                    pp['dollars'] = max(0.0, pp['dollars'] - decision['count'] * price / 100.0)
+                else:
+                    pp['contracts'] += decision['count']
+                    pp['dollars'] += decision['count'] * price / 100.0
                 pp['sides'].add(decision['side'])
                 self._paper_tickers.add(market_ticker)
 
@@ -699,8 +704,13 @@ class WeatherDailyStrategy(TradingStrategy):
                         count = int(row.get('count', 0))
                         price = float(row.get('price', 0))
                         side = row.get('side', '')
-                        pp['contracts'] += count
-                        pp['dollars'] += count * price / 100.0
+                        action = row.get('action', 'buy')
+                        if action == 'sell':
+                            pp['contracts'] = max(0, pp['contracts'] - count)
+                            pp['dollars'] = max(0.0, pp['dollars'] - count * price / 100.0)
+                        else:
+                            pp['contracts'] += count
+                            pp['dollars'] += count * price / 100.0
                         if side:
                             pp['sides'].add(side)
                     except (ValueError, TypeError):
