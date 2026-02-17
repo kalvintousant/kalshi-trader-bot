@@ -1843,8 +1843,10 @@ class WeatherDailyStrategy(TradingStrategy):
                     'yes', yes_edge, yes_ev, our_prob, best_yes_ask,
                     ci_lower_yes, ci_upper_yes, is_longshot=False, **common_args)
 
+            max_no_price = getattr(Config, 'MAX_NO_BUY_PRICE_CENTS', 30)
             if (forecast_supports_no
                     and no_edge >= required_no_edge and no_ev >= self.min_ev_threshold
+                    and best_no_ask <= max_no_price
                     and (not self.require_high_confidence or high_confidence_no)
                     and (not is_range_market or best_no_ask <= getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25))):
                 no_candidate = self._build_side_decision(

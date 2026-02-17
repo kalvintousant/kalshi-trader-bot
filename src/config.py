@@ -50,6 +50,7 @@ class Config:
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '1'))  # 1-day horizon: only trade today/tomorrow (forecasts most accurate)
     # Never buy at or above this price (cents). Data shows 51-75¢ entries lose money (42% win rate).
     MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '55'))  # Allow moderately priced contracts; scaled edge still guards >35c
+    MAX_NO_BUY_PRICE_CENTS = int(os.getenv('MAX_NO_BUY_PRICE_CENTS', '30'))  # NO bets at 40-50¢ are near coin-flips with bad risk/reward
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
     MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '1.0'))  # Skip trades within 1°F of threshold (relaxed from 2.0 for volume)
