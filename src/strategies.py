@@ -2128,14 +2128,21 @@ class WeatherDailyStrategy(TradingStrategy):
             #     }
             
             # Exit condition 3: Edge disappeared (re-evaluate market)
-            # Only exit if: held long enough AND currently profitable.
-            # For cheap weather contracts, bid-ask noise causes edge to fluctuate
-            # even when the underlying forecast hasn't changed. Selling at a loss
-            # on temporary edge dips destroys value — let the thesis play out.
-            min_hold_for_edge_exit = 1800  # 30 minutes (was 5 min via general hold check)
+            # Hybrid approach:
+            #   - Profitable exits: after 30 min (lock in gains when edge is gone)
+            #   - Loss-cutting exits: after 60 min if loss < 5% (cut small losers, but
+            #     give thesis time to play out before deciding)
+            min_hold_for_profit_exit = 1800   # 30 min for profitable exits
+            min_hold_for_loss_exit = 3600     # 60 min for loss-cutting exits
+            max_loss_for_exit = -5            # only cut if loss > -5%
             hold_seconds = (datetime.now() - entry_time).total_seconds() if entry_time else 0
 
-            if hold_seconds >= min_hold_for_edge_exit and profit_pct > 0:
+            should_check_edge = (
+                (hold_seconds >= min_hold_for_profit_exit and profit_pct > 0) or
+                (hold_seconds >= min_hold_for_loss_exit and profit_pct >= max_loss_for_exit)
+            )
+
+            if should_check_edge:
                 try:
                     self._checking_exit = True
                     decisions = self.get_trade_decision(market, orderbook)
@@ -2151,7 +2158,10 @@ class WeatherDailyStrategy(TradingStrategy):
                                 break
 
                     if not edge_still_exists and entry_edge > 0:
-                        logger.info(f"📉 Edge disappeared on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), profitable exit at {sell_price}¢ (+{profit_pct:.1f}%)")
+                        if profit_pct > 0:
+                            logger.info(f"📉 Edge disappeared on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), profitable exit at {sell_price}¢ (+{profit_pct:.1f}%)")
+                        else:
+                            logger.info(f"✂️ Loss-cutting on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), exit at {sell_price}¢ ({profit_pct:.1f}%)")
                         del self.active_positions[market_ticker]
                         return {
                             'action': 'sell',
@@ -2161,8 +2171,6 @@ class WeatherDailyStrategy(TradingStrategy):
                             'reason': 'edge_gone',
                             'entry_price': entry_price
                         }
-                    elif not edge_still_exists:
-                        logger.debug(f"Edge gone on {market_ticker} but holding (not profitable: {profit_pct:.1f}%)")
                 except Exception as e:
                     logger.debug(f"Could not re-evaluate edge for {market_ticker}: {e}")
                 finally:

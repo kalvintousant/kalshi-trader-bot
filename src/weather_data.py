@@ -1483,8 +1483,8 @@ class WeatherDataAggregator:
             month_errors = self.forecast_error_history[series_ticker].get(month, [])
             if month_errors:
                 return np.mean(month_errors)
-        # Default forecast error: 2.0°F (conservative estimate)
-        return 2.0
+        # Default forecast error: 3.5°F (matches real NWS MAE of ~2.5-3.5°F)
+        return 3.5
     
     def build_probability_distribution(self, forecasts: List[float],
                                      temperature_ranges: List[Tuple[float, float]],
@@ -1568,7 +1568,7 @@ class WeatherDataAggregator:
             if series_ticker and target_date:
                 historical_error = self.get_historical_forecast_error(series_ticker, target_date.month)
                 # Blend actual std with historical error (weighted average)
-                std_temp = 0.7 * std_temp + 0.3 * historical_error
+                std_temp = 0.5 * std_temp + 0.5 * historical_error
         else:
             # Only one forecast - use historical error or default
             if series_ticker and target_date:
@@ -1582,7 +1582,13 @@ class WeatherDataAggregator:
             # Range markets need wider distribution — 2°F bin with tight std gives unrealistic probs
             min_std = getattr(Config, 'RANGE_MIN_STD_FLOOR', 3.0)
         else:
-            min_std = 1.5 if ensemble_std is not None else 2.0
+            # City-specific floor from actual forecast track record
+            if series_ticker and target_date:
+                historical_min = self.get_historical_forecast_error(series_ticker, target_date.month)
+            else:
+                historical_min = 3.5
+            # Never go below 2.5°F even with ensemble (NWS MAE for next-day is ~2.5°F)
+            min_std = max(2.5, historical_min)
         std_temp = max(std_temp, min_std)
 
         # Log the uncertainty source and value
