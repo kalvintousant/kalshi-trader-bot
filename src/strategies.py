@@ -488,6 +488,11 @@ class TradingStrategy:
 
             # Append trade details with enhanced columns
             if order:
+                # For sell orders, market_price column stores entry_price (cost basis)
+                # For buy orders, it stores the buy price (same as price column)
+                is_sell = decision.get('action') == 'sell'
+                market_price_col = decision.get('entry_price', decision.get('price', 0)) if is_sell else decision.get('price', 0)
+
                 with open(csv_file, 'a', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([
@@ -502,7 +507,7 @@ class TradingStrategy:
                         decision.get('ev', 0),
                         decision.get('strategy_mode', ''),
                         decision.get('our_probability', ''),
-                        decision.get('price', 0),  # market_price at time of trade
+                        market_price_col,  # entry_price for sells, buy_price for buys
                         order.get('status', 'unknown'),
                         # Enhanced columns
                         decision.get('mean_forecast', ''),
@@ -1428,7 +1433,22 @@ class WeatherDailyStrategy(TradingStrategy):
                     observed_today = self.weather_agg.get_todays_observed_low(series_ticker)
                 
                 observed = observed_today
-                
+
+                if observed:
+                    observed_extreme, obs_time = observed
+
+                    # Safety: validate observation is actually from today (prevents cross-midnight stale data)
+                    from zoneinfo import ZoneInfo
+                    tz_name = self.weather_agg.CITY_TIMEZONES.get(series_ticker)
+                    if tz_name:
+                        local_today = datetime.now(ZoneInfo(tz_name)).date()
+                    else:
+                        local_today = datetime.now().date()
+                    if obs_time.date() != local_today:
+                        logger.warning(f"🕐 Stale observation for {series_ticker}: obs_time {obs_time.date()} != today {local_today}, ignoring")
+                        observed = None
+                        observed_today = None
+
                 if observed:
                     observed_extreme, obs_time = observed
                     is_range_market = isinstance(threshold, tuple)
@@ -2090,7 +2110,8 @@ class WeatherDailyStrategy(TradingStrategy):
                     'side': side,
                     'count': position.get('count', 1),
                     'price': int(sell_price - 1),  # Slightly below bid to exit quickly
-                    'reason': 'take_profit'
+                    'reason': 'take_profit',
+                    'entry_price': entry_price
                 }
             
             # Exit condition 2: Stop loss (price moved 30%+ against us)
@@ -2107,43 +2128,45 @@ class WeatherDailyStrategy(TradingStrategy):
             #     }
             
             # Exit condition 3: Edge disappeared (re-evaluate market)
-            # Re-run strategy evaluation to check if edge still exists
-            try:
-                self._checking_exit = True
-                decisions = self.get_trade_decision(market, orderbook)
-                # If we get a decision for the same side, edge still exists
-                # If no decision or different side, edge is gone
-                edge_still_exists = False
-                if decisions:
-                    for decision in decisions if isinstance(decisions, list) else [decisions]:
-                        if decision and decision.get('side') == side:
-                            current_edge = decision.get('edge', 0)
-                            # Edge must still meet minimum threshold
-                            if decision.get('strategy_mode') == 'longshot':
-                                edge_still_exists = current_edge >= self.longshot_min_edge
-                            else:
-                                edge_still_exists = current_edge >= self.min_edge_threshold
-                            break
-                
-                if not edge_still_exists and entry_edge > 0:
-                    # Only exit on edge disappearing if we're not losing too much
-                    # This prevents panic selling at a loss when edge fluctuates
-                    if profit_pct >= -10:  # Only exit if not losing more than 10%
-                        logger.info(f"📉 Edge disappeared on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), exiting at {sell_price}¢")
+            # Only exit if: held long enough AND currently profitable.
+            # For cheap weather contracts, bid-ask noise causes edge to fluctuate
+            # even when the underlying forecast hasn't changed. Selling at a loss
+            # on temporary edge dips destroys value — let the thesis play out.
+            min_hold_for_edge_exit = 1800  # 30 minutes (was 5 min via general hold check)
+            hold_seconds = (datetime.now() - entry_time).total_seconds() if entry_time else 0
+
+            if hold_seconds >= min_hold_for_edge_exit and profit_pct > 0:
+                try:
+                    self._checking_exit = True
+                    decisions = self.get_trade_decision(market, orderbook)
+                    edge_still_exists = False
+                    if decisions:
+                        for decision in decisions if isinstance(decisions, list) else [decisions]:
+                            if decision and decision.get('side') == side:
+                                current_edge = decision.get('edge', 0)
+                                if decision.get('strategy_mode') == 'longshot':
+                                    edge_still_exists = current_edge >= self.longshot_min_edge
+                                else:
+                                    edge_still_exists = current_edge >= self.min_edge_threshold
+                                break
+
+                    if not edge_still_exists and entry_edge > 0:
+                        logger.info(f"📉 Edge disappeared on {market_ticker}: {side.upper()} (was {entry_edge:.1f}%), profitable exit at {sell_price}¢ (+{profit_pct:.1f}%)")
                         del self.active_positions[market_ticker]
                         return {
                             'action': 'sell',
                             'side': side,
                             'count': position.get('count', 1),
                             'price': int(sell_price - 1),
-                            'reason': 'edge_gone'
+                            'reason': 'edge_gone',
+                            'entry_price': entry_price
                         }
-                    else:
-                        logger.debug(f"Edge gone on {market_ticker} but holding (loss: {profit_pct:.1f}%)")
-            except Exception as e:
-                logger.debug(f"Could not re-evaluate edge for {market_ticker}: {e}")
-            finally:
-                self._checking_exit = False
+                    elif not edge_still_exists:
+                        logger.debug(f"Edge gone on {market_ticker} but holding (not profitable: {profit_pct:.1f}%)")
+                except Exception as e:
+                    logger.debug(f"Could not re-evaluate edge for {market_ticker}: {e}")
+                finally:
+                    self._checking_exit = False
 
             return None
             

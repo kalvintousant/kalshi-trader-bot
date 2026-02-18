@@ -919,17 +919,18 @@ class WeatherDataAggregator:
         This is critical for avoiding trades on already-determined outcomes.
         Cached for 5 minutes (NWS updates ~hourly). Station ID cached permanently.
         """
-        # Check observation cache first (5min TTL)
-        cache_key = (series_ticker, 'high')
-        if cache_key in self._nws_obs_cache:
-            cached_result, cached_time = self._nws_obs_cache[cache_key]
-            if (time.time() - cached_time) < self._nws_obs_cache_ttl:
-                return cached_result
-
         if series_ticker not in self.CITY_COORDS or series_ticker not in self.CITY_TIMEZONES:
             return None
 
         tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
+        today_local = datetime.now(tz).date()
+
+        # Check observation cache (5min TTL, keyed by date to prevent cross-midnight contamination)
+        cache_key = (series_ticker, 'high', str(today_local))
+        if cache_key in self._nws_obs_cache:
+            cached_result, cached_time = self._nws_obs_cache[cache_key]
+            if (time.time() - cached_time) < self._nws_obs_cache_ttl:
+                return cached_result
 
         try:
             station_id = self._get_nws_station_id(series_ticker)
@@ -948,7 +949,6 @@ class WeatherDataAggregator:
                 logger.debug(f"No observations available for {series_ticker}")
                 return None
 
-            today_local = datetime.now(tz).date()
             today_temps = []
 
             for obs in observations:
@@ -1096,17 +1096,18 @@ class WeatherDataAggregator:
 
         Cached for 5 minutes (NWS updates ~hourly). Station ID cached permanently.
         """
-        # Check observation cache first (5min TTL)
-        cache_key = (series_ticker, 'low')
-        if cache_key in self._nws_obs_cache:
-            cached_result, cached_time = self._nws_obs_cache[cache_key]
-            if (time.time() - cached_time) < self._nws_obs_cache_ttl:
-                return cached_result
-
         if series_ticker not in self.CITY_COORDS or series_ticker not in self.CITY_TIMEZONES:
             return None
 
         tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
+        today_local = datetime.now(tz).date()
+
+        # Check observation cache (5min TTL, keyed by date to prevent cross-midnight contamination)
+        cache_key = (series_ticker, 'low', str(today_local))
+        if cache_key in self._nws_obs_cache:
+            cached_result, cached_time = self._nws_obs_cache[cache_key]
+            if (time.time() - cached_time) < self._nws_obs_cache_ttl:
+                return cached_result
 
         try:
             station_id = self._get_nws_station_id(series_ticker)
@@ -1125,7 +1126,6 @@ class WeatherDataAggregator:
                 logger.debug(f"No observations available for {series_ticker}")
                 return None
 
-            today_local = datetime.now(tz).date()
             today_temps = []
 
             for obs in observations:
