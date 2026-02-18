@@ -1175,10 +1175,14 @@ class WeatherDataAggregator:
         For LOW markets: Low typically occurs early morning (4-7 AM). After ~8 AM local or
         when observed low ≈ forecasted low, skip longshots.
         """
-        if target_date.date() != datetime.now().date():
-            return False  # Future date: extreme hasn't happened yet
         if series_ticker not in self.CITY_TIMEZONES:
             return False
+        # Use city's local date, not system time — at midnight ET, western cities
+        # are still on the previous day
+        tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
+        local_today = datetime.now(tz).date()
+        if target_date.date() != local_today:
+            return False  # Not today in the city's timezone: extreme hasn't happened yet
         
         # Determine if this is a HIGH or LOW market
         is_high_market = series_ticker.startswith('KXHIGH')

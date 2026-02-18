@@ -5,7 +5,7 @@ import os
 import time
 import requests
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Set
 from src.kalshi_client import KalshiClient
@@ -228,7 +228,9 @@ class KalshiTradingBot:
                     for row in reader:
                         settled_tickers.add(row.get('market_ticker', ''))
 
-            today_str = datetime.now().date().isoformat()
+            # Use 1-day buffer: at midnight ET, western cities are still on the previous day
+            # so their "yesterday" trades are still active and must be tracked
+            cutoff_str = (datetime.now().date() - timedelta(days=1)).isoformat()
             count = 0
             with open(trades_file, 'r') as f:
                 reader = csv.DictReader(f)
@@ -242,7 +244,7 @@ class KalshiTradingBot:
                     target_date = row.get('target_date', '').strip()
                     if not target_date:
                         target_date = self._parse_date_from_ticker(ticker)
-                    if target_date and target_date < today_str:
+                    if target_date and target_date < cutoff_str:
                         continue
                     side = row.get('side', 'yes')
                     action = row.get('action', 'buy')

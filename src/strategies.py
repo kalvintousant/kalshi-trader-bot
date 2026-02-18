@@ -680,7 +680,9 @@ class WeatherDailyStrategy(TradingStrategy):
                         settled_tickers.add(row.get('market_ticker', ''))
 
             # Rebuild from trades.csv (only unsettled trades for today or future)
-            today_str = datetime.now().date().isoformat()
+            # Use 1-day buffer: at midnight ET, western cities are still on the previous day
+            # so their "yesterday" trades are still active and must be tracked
+            today_str = (datetime.now().date() - timedelta(days=1)).isoformat()
             with open(trades_file, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -1421,29 +1423,32 @@ class WeatherDailyStrategy(TradingStrategy):
 
             # CRITICAL: Check if outcome is already determined by today's observations
             # Only check if this is a market for TODAY (not future dates)
+            # Must use city's local date, not system time — at midnight ET, western cities
+            # are still on the previous day so we'd misapply yesterday's obs to today's market
             observed_today = None  # Used later for "past extreme of day" longshot cutoff
             is_high_market = series_ticker.startswith('KXHIGH')
             is_low_market = series_ticker.startswith('KXLOW')
-            
-            if target_date.date() == datetime.now().date():
-                # This market is for today - check if outcome already determined
+
+            from zoneinfo import ZoneInfo
+            tz_name = self.weather_agg.CITY_TIMEZONES.get(series_ticker)
+            if tz_name:
+                local_today = datetime.now(ZoneInfo(tz_name)).date()
+            else:
+                local_today = datetime.now().date()
+
+            if target_date.date() == local_today:
+                # This market is for today (in the city's timezone) - check if outcome already determined
                 if is_high_market:
                     observed_today = self.weather_agg.get_todays_observed_high(series_ticker)
                 elif is_low_market:
                     observed_today = self.weather_agg.get_todays_observed_low(series_ticker)
-                
+
                 observed = observed_today
 
                 if observed:
                     observed_extreme, obs_time = observed
 
                     # Safety: validate observation is actually from today (prevents cross-midnight stale data)
-                    from zoneinfo import ZoneInfo
-                    tz_name = self.weather_agg.CITY_TIMEZONES.get(series_ticker)
-                    if tz_name:
-                        local_today = datetime.now(ZoneInfo(tz_name)).date()
-                    else:
-                        local_today = datetime.now().date()
                     if obs_time.date() != local_today:
                         logger.warning(f"🕐 Stale observation for {series_ticker}: obs_time {obs_time.date()} != today {local_today}, ignoring")
                         observed = None
@@ -1764,7 +1769,7 @@ class WeatherDailyStrategy(TradingStrategy):
             # Skip ALL new trades on today's markets once the extreme (high/low) of day has likely occurred.
             # Official report is typically in by afternoon; buying after that is bad (outcome known or soon known).
             skip_todays_market_past_report = (
-                target_date.date() == datetime.now().date()
+                target_date.date() == local_today
                 and self.weather_agg.is_likely_past_extreme_of_day(
                     series_ticker,
                     target_date,
