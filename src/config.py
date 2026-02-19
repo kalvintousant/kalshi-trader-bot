@@ -99,6 +99,7 @@ class Config:
     EXIT_LOGIC_ENABLED = os.getenv('EXIT_LOGIC_ENABLED', 'true').lower() == 'true'  # Enabled - sell when profitable
     EXIT_TAKE_PROFIT_PERCENT = float(os.getenv('EXIT_TAKE_PROFIT_PERCENT', '30.0'))  # Sell when position is +30% profitable
     EXIT_MIN_PROFIT_CENTS = int(os.getenv('EXIT_MIN_PROFIT_CENTS', '5'))  # Minimum 5¢ profit to trigger exit
+    EXIT_MIN_ENTRY_PRICE = int(os.getenv('EXIT_MIN_ENTRY_PRICE', '15'))  # Never sell positions entered at or below this price
 
     # Stale Order Management
     STALE_ORDER_MIN_AGE_MINUTES = int(os.getenv('STALE_ORDER_MIN_AGE_MINUTES', '5'))  # Don't cancel orders younger than 5 min
@@ -164,6 +165,11 @@ class Config:
 
     # Paper Trading Mode (simulate trades without placing real orders)
     PAPER_TRADING = os.getenv('PAPER_TRADING', 'false').lower() == 'true'
+
+    # Web Dashboard (aiohttp, served from bot process)
+    WEB_DASHBOARD_ENABLED = os.getenv('WEB_DASHBOARD_ENABLED', 'false').lower() == 'true'
+    WEB_DASHBOARD_HOST = os.getenv('WEB_DASHBOARD_HOST', '0.0.0.0')
+    WEB_DASHBOARD_PORT = int(os.getenv('WEB_DASHBOARD_PORT', '8050'))
 
     # Hard-disabled cities (bypasses all other filters — will never trade)
     DISABLED_CITIES = {c.strip() for c in os.getenv('DISABLED_CITIES', '').split(',') if c.strip()}

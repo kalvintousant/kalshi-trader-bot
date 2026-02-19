@@ -135,7 +135,8 @@ class OutcomeTracker:
                         market_response = self.client.get_market(ticker)
                         market = market_response.get('market', market_response)
                         status = market.get('status', '').lower()
-                        if status in ['closed', 'finalized', 'settled']:
+                        result = market.get('result', '').lower()
+                        if status in ['closed', 'finalized', 'settled'] and result in ['yes', 'no']:
                             # Synthesize fill records from paper trades
                             fills = []
                             for t in trades:
@@ -170,7 +171,8 @@ class OutcomeTracker:
                     market_response = self.client.get_market(market_ticker)
                     market = market_response.get('market', market_response)  # Unwrap nested response
                     status = market.get('status', '').lower()
-                    if status in ['closed', 'finalized', 'settled']:
+                    result = market.get('result', '').lower()
+                    if status in ['closed', 'finalized', 'settled'] and result in ['yes', 'no']:
                         settled_positions.append({
                             'fills': ticker_fills,
                             'market': market

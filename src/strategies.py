@@ -2069,7 +2069,12 @@ class WeatherDailyStrategy(TradingStrategy):
             entry_price = position.get('entry_price', 0)
             entry_time = position.get('entry_time')
             entry_edge = position.get('edge', 0)
-            
+
+            # Never exit cheap contracts — risk is capped and upside is massive
+            # e.g. 7c entry: max loss 7c, max gain 93c (13:1). Hold to settlement.
+            if entry_price <= Config.EXIT_MIN_ENTRY_PRICE:
+                return None
+
             # Don't exit too quickly (at least 5 minutes for daily markets)
             if entry_time and (datetime.now() - entry_time).total_seconds() < 300:
                 return None
