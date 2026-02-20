@@ -88,6 +88,12 @@ class KalshiTradingBot:
         self.dashboard_state = DashboardState()
         self.dashboard = Dashboard(self.dashboard_state)
 
+        # Web dashboard (aiohttp on daemon thread)
+        self.web_dashboard = None
+        if Config.WEB_DASHBOARD_ENABLED:
+            from src.web_dashboard import WebDashboard
+            self.web_dashboard = WebDashboard(self.dashboard_state, self)
+
         # In paper mode, load today's P&L and settlements from CSV on startup
         if Config.PAPER_TRADING:
             self._paper_session_pnl = self._load_todays_paper_pnl()
@@ -968,6 +974,11 @@ class KalshiTradingBot:
         except Exception as e:
             logger.error(f"Could not fetch portfolio: {e}", exc_info=True)
         
+        # Start web dashboard if enabled
+        if self.web_dashboard:
+            self.web_dashboard.start_background()
+            logger.info(f"Web dashboard at http://localhost:{Config.WEB_DASHBOARD_PORT}")
+
         if use_websocket:
             # Run with WebSocket for real-time updates
             logger.info("Starting WebSocket connection...")

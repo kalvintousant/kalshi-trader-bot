@@ -93,7 +93,9 @@ class Config:
 
     # Bias correction settings
     ENABLE_BIAS_CORRECTION = os.getenv('ENABLE_BIAS_CORRECTION', 'true').lower() == 'true'
-    MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '5'))  # Min samples before applying bias correction
+    MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '10'))  # Min samples before applying bias correction
+    MAX_BIAS_CORRECTION_F = float(os.getenv('MAX_BIAS_CORRECTION_F', '3.0'))  # Cap bias correction magnitude (°F)
+    NWS_SOURCE_WEIGHT = float(os.getenv('NWS_SOURCE_WEIGHT', '1.5'))  # Extra weight for NWS (Kalshi settles on NWS CLI)
 
     # Exit/Sell Logic
     EXIT_LOGIC_ENABLED = os.getenv('EXIT_LOGIC_ENABLED', 'true').lower() == 'true'  # Enabled - sell when profitable

@@ -25,6 +25,22 @@ tail -f bot.log | grep -E "Trade executed|OBSERVATION|Cross-threshold|CONTRADICT
 tail -f bot_output.log
 ```
 
+## Web Dashboard
+
+Open `http://localhost:8050` after starting the bot (enabled by default via `WEB_DASHBOARD_ENABLED=true` in `.env`).
+
+Charts: cumulative P&L, daily P&L, city performance. Live event feed via SSE. Account stats, positions, recent trades.
+
+```bash
+# Remote access via ngrok
+ngrok http 8050
+```
+
+Config env vars:
+- `WEB_DASHBOARD_ENABLED` — `true`/`false` (default: `false`)
+- `WEB_DASHBOARD_HOST` — bind address (default: `0.0.0.0`)
+- `WEB_DASHBOARD_PORT` — port (default: `8050`)
+
 ## Stop
 
 ```bash

@@ -89,6 +89,28 @@ class WeatherDataAggregator:
         'KXHIGHTSFO': {'lat': 37.6213, 'lon': -122.3790, 'name': 'SFO Airport'},
     }
     
+    # Official NWS station IDs matching Kalshi CLI settlement sources
+    # These are the exact ICAO codes whose Daily Climate Report (CLI) Kalshi uses
+    CITY_STATIONS = {
+        'NY': 'KNYC',    # Central Park
+        'CHI': 'KMDW',   # Chicago Midway (NOT O'Hare)
+        'MIA': 'KMIA',   # Miami International
+        'AUS': 'KAUS',   # Austin Bergstrom
+        'LAX': 'KLAX',   # LAX Airport
+        'DEN': 'KDEN',   # Denver International
+        'PHIL': 'KPHL',  # Philadelphia International
+        'DAL': 'KDFW',   # DFW Airport
+        'BOS': 'KBOS',   # Boston Logan
+        'ATL': 'KATL',   # Hartsfield-Jackson
+        'HOU': 'KHOU',   # Houston Hobby
+        'SEA': 'KSEA',   # Seattle-Tacoma
+        'PHX': 'KPHX',   # Phoenix Sky Harbor
+        'MIN': 'KMSP',   # Minneapolis-St. Paul
+        'DC': 'KDCA',    # Reagan National
+        'OKC': 'KOKC',   # Will Rogers
+        'SFO': 'KSFO',   # SFO Airport
+    }
+
     # IANA timezones for each city (used to determine "local time" for high-of-day cutoff)
     CITY_TIMEZONES = {
         'KXHIGHNY': 'America/New_York', 'KXLOWNY': 'America/New_York',
@@ -173,10 +195,11 @@ class WeatherDataAggregator:
         self._nws_obs_cache_ttl = 300  # 5 minutes
 
         # Source reliability weights (based on historical accuracy)
-        # Weights calibrated based on typical model performance for US temperature forecasting
+        # NWS gets extra weight because Kalshi settles on the NWS CLI report
+        nws_w = Config.NWS_SOURCE_WEIGHT
         self.source_weights = {
-            'nws': 1.0,              # Most reliable (government source, uses multiple models)
-            'nws_mos': 1.0,          # MOS is bias-corrected, very reliable
+            'nws': nws_w,            # Kalshi settles on NWS CLI — highest weight
+            'nws_mos': nws_w,        # MOS is bias-corrected NWS, equally authoritative
             'tomorrowio': 0.9,       # Very reliable commercial source
             'open_meteo_best': 0.95, # Open-Meteo best match (auto-selects best model)
             'open_meteo_gfs': 0.85,  # GFS model via Open-Meteo
@@ -804,13 +827,22 @@ class WeatherDataAggregator:
         Returns:
             Bias-corrected temperature
         """
-        # Get city base (e.g., 'NY' from 'KXHIGHNY' or 'KXLOWNY')
         city_base = extract_city_code(series_ticker)
+
+        # Enforce minimum sample count before applying bias
+        history = self.model_error_history[source][city_base][month]
+        if len(history) < Config.MIN_SAMPLES_FOR_BIAS:
+            return temp
 
         bias = self.model_bias[source][city_base][month]
         if bias != 0:
-            corrected = temp - bias  # Subtract bias (positive bias = model runs hot)
-            logger.debug(f"Bias correction for {source}/{city_base}/month{month}: {temp:.1f}°F -> {corrected:.1f}°F (bias={bias:.1f}°F)")
+            # Cap bias to prevent catastrophic overcorrection
+            max_bias = Config.MAX_BIAS_CORRECTION_F
+            capped_bias = max(-max_bias, min(max_bias, bias))
+            corrected = temp - capped_bias
+            if abs(bias) > max_bias:
+                logger.debug(f"Bias capped for {source}/{city_base}/month{month}: raw bias={bias:.1f}°F -> capped={capped_bias:.1f}°F")
+            logger.debug(f"Bias correction for {source}/{city_base}/month{month}: {temp:.1f}°F -> {corrected:.1f}°F (bias={capped_bias:.1f}°F)")
             return corrected
         return temp
 
@@ -875,13 +907,25 @@ class WeatherDataAggregator:
         return self._enabled_sources
 
     def _get_nws_station_id(self, series_ticker: str) -> Optional[str]:
-        """Resolve NWS observation station ID for a series ticker. Cached permanently per session."""
+        """Resolve NWS observation station ID for a series ticker.
+        Uses hardcoded CITY_STATIONS mapping (matches Kalshi CLI settlement) with
+        dynamic API fallback. Cached permanently per session."""
         if series_ticker in self._nws_station_cache:
             return self._nws_station_cache[series_ticker]
 
         if series_ticker not in self.CITY_COORDS:
             return None
 
+        # Use hardcoded station ID if available (matches Kalshi settlement)
+        city_code = extract_city_code(series_ticker)
+        if city_code in self.CITY_STATIONS:
+            icao = self.CITY_STATIONS[city_code]
+            station_url = f"https://api.weather.gov/stations/{icao}"
+            self._nws_station_cache[series_ticker] = station_url
+            logger.debug(f"Using hardcoded station {icao} for {series_ticker}")
+            return station_url
+
+        # Fallback: dynamic lookup for unknown cities
         city = self.CITY_COORDS[series_ticker]
         lat, lon = city['lat'], city['lon']
 
@@ -990,23 +1034,10 @@ class WeatherDataAggregator:
             return None
         tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
         target_local = target_date.date() if hasattr(target_date, 'date') else target_date
-        city = self.CITY_COORDS[series_ticker]
-        lat, lon = city['lat'], city['lon']
         try:
-            points_url = f"https://api.weather.gov/points/{lat},{lon}"
-            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            if resp.status_code != 200:
+            station_id = self._get_nws_station_id(series_ticker)
+            if not station_id:
                 return None
-            obs_stations_url = resp.json()['properties'].get('observationStations')
-            if not obs_stations_url:
-                return None
-            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            if stations_resp.status_code != 200:
-                return None
-            features = stations_resp.json().get('features', [])
-            if not features:
-                return None
-            station_id = features[0]['id']
             obs_url = f"{station_id}/observations"
             obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
             if obs_resp.status_code != 200:
@@ -1034,7 +1065,7 @@ class WeatherDataAggregator:
         except Exception as e:
             logger.debug(f"Error getting observed high for {series_ticker} on {target_local}: {e}")
             return None
-    
+
     def get_observed_low_for_date(self, series_ticker: str, target_date) -> Optional[Tuple[float, datetime]]:
         """
         Get observed low temperature from NWS for a specific date (local time for that city).
@@ -1044,23 +1075,10 @@ class WeatherDataAggregator:
             return None
         tz = ZoneInfo(self.CITY_TIMEZONES[series_ticker])
         target_local = target_date.date() if hasattr(target_date, 'date') else target_date
-        city = self.CITY_COORDS[series_ticker]
-        lat, lon = city['lat'], city['lon']
         try:
-            points_url = f"https://api.weather.gov/points/{lat},{lon}"
-            resp = requests.get(points_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            if resp.status_code != 200:
+            station_id = self._get_nws_station_id(series_ticker)
+            if not station_id:
                 return None
-            obs_stations_url = resp.json()['properties'].get('observationStations')
-            if not obs_stations_url:
-                return None
-            stations_resp = requests.get(obs_stations_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
-            if stations_resp.status_code != 200:
-                return None
-            features = stations_resp.json().get('features', [])
-            if not features:
-                return None
-            station_id = features[0]['id']
             obs_url = f"{station_id}/observations"
             obs_resp = requests.get(obs_url, headers={'User-Agent': 'KalshiTradingBot/1.0'}, timeout=10)
             if obs_resp.status_code != 200:
@@ -1333,12 +1351,11 @@ class WeatherDataAggregator:
                             tracker.store_forecast(city_code, target_date.strftime('%Y-%m-%d'), source, temp)
                         except Exception:
                             pass
-                        # Apply bias correction
+                        # Apply bias correction (store raw temp for bias learning)
                         corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
-                        forecast_data.append((corrected_temp, source, timestamp))
-                        # Log each source at INFO level for analysis
+                        forecast_data.append((corrected_temp, source, timestamp, temp))
                         weight = self.source_weights.get(source, 0.8)
-                        logger.debug(f"  {source}: {corrected_temp:.1f}°F (weight={weight:.2f})")
+                        logger.debug(f"  {source}: {corrected_temp:.1f}°F (raw={temp:.1f}°F, weight={weight:.2f})")
                 except Exception as e:
                     source = tier1_futures[future]
                     logger.debug(f"Error fetching from {source}: {e}")
@@ -1350,9 +1367,7 @@ class WeatherDataAggregator:
                 weatherbit_result = self.get_forecast_weatherbit(lat, lon, target_date, series_ticker)
                 if weatherbit_result is not None:
                     temp, source, timestamp = weatherbit_result
-                    # Log the raw forecast
                     self._log_source_forecast(series_ticker, target_date, source, temp)
-                    # Store in ForecastTracker for accuracy-weighted means
                     try:
                         from .forecast_weighting import get_forecast_tracker
                         tracker = get_forecast_tracker()
@@ -1361,7 +1376,7 @@ class WeatherDataAggregator:
                     except Exception:
                         pass
                     corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
-                    forecast_data.append((corrected_temp, source, timestamp))
+                    forecast_data.append((corrected_temp, source, timestamp, temp))
                     logger.debug(f"Using Weatherbit fallback for {series_ticker}")
             except Exception as e:
                 logger.debug(f"Error fetching from weatherbit (fallback): {e}")
@@ -1375,7 +1390,7 @@ class WeatherDataAggregator:
         logger.debug(f"Collected {len(forecast_data)} forecasts from: {', '.join(sources)}")
 
         # Extract temperatures for outlier detection
-        raw_forecasts = [temp for temp, _, _ in forecast_data]
+        raw_forecasts = [temp for temp, _, _, *_ in forecast_data]
 
         # Detect and filter outliers
         valid_indices = []
@@ -1391,7 +1406,7 @@ class WeatherDataAggregator:
         total_weight = 0.0
 
         for idx in valid_indices:
-            temp, source, forecast_time = forecast_data[idx]
+            temp, source, forecast_time = forecast_data[idx][0], forecast_data[idx][1], forecast_data[idx][2]
 
             # Source reliability weight
             source_weight = self.source_weights.get(source, 0.8)
@@ -1652,9 +1667,11 @@ class WeatherDataAggregator:
         forecast_data = self.forecast_metadata[cache_key]
         updated_sources = []
 
-        for temp, source, timestamp in forecast_data:
-            # Update model-specific bias
-            self.update_model_bias(source, series_ticker, target_date, temp, actual_temp)
+        for entry in forecast_data:
+            # Use raw (uncorrected) temp for bias learning to avoid feedback loop
+            raw_temp = entry[3] if len(entry) > 3 else entry[0]
+            source = entry[1]
+            self.update_model_bias(source, series_ticker, target_date, raw_temp, actual_temp)
             updated_sources.append(source)
 
         logger.debug(f"📊 Updated bias for {len(updated_sources)} models: {', '.join(updated_sources)}")
