@@ -430,7 +430,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .pos-table th { text-align: left; color: var(--text-dim); padding: 5px 8px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: 0.3px; }
   .pos-table td { padding: 5px 8px; }
   .pos-table tr:hover { background: #ffffff08; }
-  .pos-table .ticker { color: var(--blue); font-weight: 600; }
+  .pos-table .ticker { font-weight: 600; }
+  .pos-table .ticker a { color: var(--blue); text-decoration: none; }
+  .pos-table .ticker a:hover { text-decoration: underline; color: #5fa8ff; }
   .pos-table .side-yes { color: var(--green); font-weight: 600; }
   .pos-table .side-no { color: var(--red); font-weight: 600; }
   .pos-empty { color: var(--text-dim); text-align: center; padding: 20px; font-style: italic; }
@@ -697,6 +699,25 @@ async function fetchPositions() {
       return;
     }
     countEl.textContent = '(' + d.positions.length + ')';
+    const KALSHI_SLUGS = {
+      'KXHIGHNY':'highest-temperature-in-nyc','KXLOWNY':'lowest-temperature-in-nyc',
+      'KXHIGHCHI':'highest-temperature-in-chicago','KXLOWCHI':'lowest-temperature-in-chicago',
+      'KXHIGHMIA':'highest-temperature-in-miami','KXLOWMIA':'lowest-temperature-in-miami',
+      'KXHIGHAUS':'highest-temperature-in-austin','KXLOWAUS':'lowest-temperature-in-austin',
+      'KXHIGHLAX':'highest-temperature-in-los-angeles','KXLOWLAX':'lowest-temperature-in-los-angeles',
+      'KXHIGHDEN':'highest-temperature-in-denver','KXLOWDEN':'lowest-temperature-in-denver',
+      'KXHIGHTDAL':'dallas-maximum-temperature','KXHIGHTDC':'washington-dc-daily-max-temp',
+      'KXHIGHTPHX':'phoenix-high-temperature-daily','KXLOWTPHIL':'lowest-temperature-in-philadelphia',
+      'KXHIGHOU':'highest-temperature-in-houston',
+    };
+    function kalshiUrl(ticker) {
+      const parts = ticker.split('-');
+      const series = parts[0];
+      const event = parts.slice(0,2).join('-').toLowerCase();
+      const slug = KALSHI_SLUGS[series];
+      if (slug) return 'https://kalshi.com/markets/' + series.toLowerCase() + '/' + slug + '/' + event;
+      return 'https://kalshi.com/markets/' + series.toLowerCase();
+    }
     for (const p of d.positions) {
       const tr = document.createElement('tr');
       const sideClass = p.side === 'yes' ? 'side-yes' : 'side-no';
@@ -707,7 +728,7 @@ async function fetchPositions() {
       const date = p.target_date ? p.target_date.slice(5) : '--';
       tr.innerHTML = '<td style="color:var(--text-dim)">' + date + '</td>'
         + '<td style="font-weight:600">' + (p.city || '--') + '</td>'
-        + '<td class="ticker">' + p.ticker + '</td>'
+        + '<td class="ticker"><a href="' + kalshiUrl(p.ticker) + '" target="_blank" rel="noopener">' + p.ticker + '</a></td>'
         + '<td class="' + sideClass + '">' + p.side.toUpperCase() + '</td>'
         + '<td>' + p.qty + '</td>'
         + '<td>' + p.avg_entry + 'c</td>'
