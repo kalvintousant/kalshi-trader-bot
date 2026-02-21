@@ -55,6 +55,10 @@ class KalshiTradingBot:
         if 'weather_daily' in Config.ENABLED_STRATEGIES:
             self.relevant_series.update(Config.WEATHER_SERIES)
         
+        # Wire bot reference for determined_outcome tracking
+        for strategy in self.strategy_manager.strategies:
+            strategy._bot_ref = self
+
         # Adaptive city manager (shared with strategies)
         self.adaptive_manager = None
         if self.strategy_manager.strategies:

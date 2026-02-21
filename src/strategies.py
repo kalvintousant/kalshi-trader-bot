@@ -1455,6 +1455,10 @@ class WeatherDailyStrategy(TradingStrategy):
                         observed_today = None
 
                 if observed:
+                    if self._has_resting_order_on_ticker(market_ticker):
+                        logger.debug(f"📊 SKIP {market_ticker}: already have position/order on this ticker")
+                        return None
+
                     observed_extreme, obs_time = observed
                     is_range_market = isinstance(threshold, tuple)
                     
@@ -1478,29 +1482,39 @@ class WeatherDailyStrategy(TradingStrategy):
                         # Single threshold market
                         market_title = market.get('title', '').lower()
                         is_above_market = 'above' in market_title or '>' in market_title
-                        
+                        obs_buffer = Config.OBSERVATION_MIN_BUFFER  # Must be ≥2°F past threshold to be "certain"
+
                         if is_high_market:
                             if is_above_market:
                                 # Market is "Will high be >X°?"
-                                if observed_extreme > threshold:
+                                if observed_extreme > threshold + obs_buffer:
                                     outcome_determined = True
-                                    reason = f"Observed high {observed_extreme:.1f}°F already exceeds threshold {threshold}°F (YES certain)"
+                                    reason = f"Observed high {observed_extreme:.1f}°F exceeds threshold {threshold}°F by {observed_extreme - threshold:.1f}°F (YES certain)"
+                                elif observed_extreme > threshold:
+                                    logger.debug(f"📊 Observation {observed_extreme:.1f}°F barely above threshold {threshold}°F (margin {observed_extreme - threshold:.1f}°F < {obs_buffer}°F buffer), NOT treating as certain")
                             else:
                                 # Market is "Will high be <X°?"
-                                if observed_extreme >= threshold:
+                                if observed_extreme >= threshold + obs_buffer:
                                     outcome_determined = True
-                                    reason = f"Observed high {observed_extreme:.1f}°F already reached threshold {threshold}°F (NO certain)"
+                                    reason = f"Observed high {observed_extreme:.1f}°F exceeds threshold {threshold}°F by {observed_extreme - threshold:.1f}°F (NO certain)"
+                                elif observed_extreme >= threshold:
+                                    logger.debug(f"📊 Observation {observed_extreme:.1f}°F barely at/above threshold {threshold}°F (margin {observed_extreme - threshold:.1f}°F < {obs_buffer}°F buffer), NOT treating as certain")
                         elif is_low_market:
                             if is_above_market:
                                 # Market is "Will low be >X°?"
-                                if observed_extreme > threshold:
+                                # LOW min can only DECREASE — can confirm NO, never YES
+                                if observed_extreme < threshold - obs_buffer:
                                     outcome_determined = True
-                                    reason = f"Observed low {observed_extreme:.1f}°F already exceeds threshold {threshold}°F (YES certain)"
+                                    reason = f"Observed low {observed_extreme:.1f}°F below threshold {threshold}°F by {threshold - observed_extreme:.1f}°F (NO certain)"
+                                elif observed_extreme < threshold:
+                                    logger.debug(f"📊 Observation {observed_extreme:.1f}°F barely below threshold {threshold}°F (margin {threshold - observed_extreme:.1f}°F < {obs_buffer}°F buffer), NOT treating as certain")
                             else:
                                 # Market is "Will low be <X°?"
-                                if observed_extreme <= threshold:
+                                if observed_extreme <= threshold - obs_buffer:
                                     outcome_determined = True
-                                    reason = f"Observed low {observed_extreme:.1f}°F already below threshold {threshold}°F (NO certain)"
+                                    reason = f"Observed low {observed_extreme:.1f}°F below threshold {threshold}°F by {threshold - observed_extreme:.1f}°F (YES certain)"
+                                elif observed_extreme <= threshold:
+                                    logger.debug(f"📊 Observation {observed_extreme:.1f}°F barely at/below threshold {threshold}°F (margin {threshold - observed_extreme:.1f}°F < {obs_buffer}°F buffer), NOT treating as certain")
                     
                     if outcome_determined:
                         # OBSERVATION-BASED TRADING: Instead of just skipping,
@@ -1513,6 +1527,8 @@ class WeatherDailyStrategy(TradingStrategy):
                             observed_extreme, reason
                         )
                         if obs_decision:
+                            if hasattr(self, '_bot_ref') and self._bot_ref:
+                                self._bot_ref.determined_outcome_markets.add(market_ticker)
                             return obs_decision
 
                         # No observation trade available — skip and exclude
@@ -1565,6 +1581,20 @@ class WeatherDailyStrategy(TradingStrategy):
             if forecast_spread < min_spread:
                 logger.debug(f"📊 SKIP {market_ticker}: forecast spread {forecast_spread:.2f}°F < {min_spread}°F (sources agree too perfectly, likely same upstream)")
                 return None
+
+            # --- FORECAST DISAGREEMENT GATE ---
+            # Detect bimodal forecasts where sources split into cold/warm clusters.
+            # A simple mean masks the disagreement and produces unreliable probabilities.
+            max_cluster_gap = getattr(Config, 'MAX_FORECAST_CLUSTER_GAP', 8.0)
+            if max_cluster_gap > 0 and len(forecasts) >= 4:
+                sorted_f = sorted(forecasts)
+                mid = len(sorted_f) // 2
+                lower_mean = float(np.mean(sorted_f[:mid]))
+                upper_mean = float(np.mean(sorted_f[mid:]))
+                cluster_gap = upper_mean - lower_mean
+                if cluster_gap > max_cluster_gap:
+                    logger.info(f"📊 SKIP {market_ticker}: forecast cluster gap {cluster_gap:.1f}°F > {max_cluster_gap}°F (lower half mean={lower_mean:.1f}, upper half mean={upper_mean:.1f}) — bimodal disagreement")
+                    return None
 
             # Build temperature ranges (2-degree brackets as mentioned in guide)
             # Kalshi weather markets typically have 6 brackets
@@ -1708,7 +1738,16 @@ class WeatherDailyStrategy(TradingStrategy):
             prob_ci_no = 1.0 - prob_ci_yes
             ci_lower_no = 1.0 - ci_upper_yes
             ci_upper_no = 1.0 - ci_lower_yes
-            
+
+            # --- CONFIDENCE INTERVAL WIDTH GATE ---
+            # When CI spans >50pp the probability estimate is nearly meaningless.
+            max_ci_width = getattr(Config, 'MAX_CI_WIDTH', 0.50)
+            if max_ci_width > 0:
+                ci_width_yes = ci_upper_yes - ci_lower_yes
+                if ci_width_yes > max_ci_width:
+                    logger.info(f"📊 SKIP {market_ticker}: CI width {ci_width_yes:.1%} > {max_ci_width:.0%} — probability estimate too uncertain (CI [{ci_lower_yes:.1%}, {ci_upper_yes:.1%}])")
+                    return None
+
             # Estimate fill prices based on orderbook depth (for position sizing)
             estimated_yes_price = self.weather_agg.estimate_fill_price(orderbook, 'yes', 
                                                                        self.max_position_size * 5)
@@ -2031,6 +2070,10 @@ class WeatherDailyStrategy(TradingStrategy):
                 '_is_longshot': False,
                 '_series_ticker': series_ticker,
             }
+
+            # Pre-register paper ticker to prevent duplicates before execute_trade runs
+            if Config.PAPER_TRADING:
+                self._paper_tickers.add(market_ticker)
 
             self._finalize_decision(decision, market_ticker)
             return decision
