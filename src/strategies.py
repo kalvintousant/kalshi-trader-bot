@@ -338,6 +338,11 @@ class TradingStrategy:
                 no_price = price
 
             if Config.PAPER_TRADING:
+                # Final safety net: block duplicate paper trades on the same ticker
+                if market_ticker in self._paper_tickers:
+                    logger.warning(f"PAPER DEDUP: Blocked duplicate trade on {market_ticker}")
+                    return None
+
                 # Paper mode: create mock order without hitting Kalshi API
                 order = {
                     'order_id': f"PAPER-{uuid.uuid4()}",

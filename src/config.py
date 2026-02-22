@@ -53,7 +53,8 @@ class Config:
     MAX_NO_BUY_PRICE_CENTS = int(os.getenv('MAX_NO_BUY_PRICE_CENTS', '30'))  # NO bets at 40-50¢ are near coin-flips with bad risk/reward
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
-    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '1.0'))  # Skip trades within 1°F of threshold (relaxed from 2.0 for volume)
+    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '2.0'))  # Skip trades within 2°F of threshold (raised from 1.0 after CHI loss)
+    OBSERVATION_MIN_BUFFER = float(os.getenv('OBSERVATION_MIN_BUFFER', '2.0'))  # Observed temp must be ≥2°F past threshold to count as "determined"
 
     # Forecast quality gates
     MIN_FORECAST_SOURCES = int(os.getenv('MIN_FORECAST_SOURCES', '2'))  # Need >=2 independent forecasts (rate-limited sources often 429)
@@ -63,6 +64,10 @@ class Config:
     # For "below" markets (YES = temp < T): require forecast mean < threshold
     # For "above" markets (YES = temp > T): require forecast mean > threshold
     REQUIRE_FORECAST_DIRECTION = os.getenv('REQUIRE_FORECAST_DIRECTION', 'true').lower() == 'true'
+
+    # Forecast disagreement gates
+    MAX_FORECAST_CLUSTER_GAP = float(os.getenv('MAX_FORECAST_CLUSTER_GAP', '8.0'))  # Skip if lower/upper forecast halves differ by >8°F
+    MAX_CI_WIDTH = float(os.getenv('MAX_CI_WIDTH', '0.50'))  # Skip if confidence interval spans >50 percentage points
 
     # Range market boundary guard
     RANGE_BOUNDARY_MIN_DISTANCE = float(os.getenv('RANGE_BOUNDARY_MIN_DISTANCE', '3.0'))  # Skip range markets when forecast is within 3°F of boundary
@@ -101,7 +106,7 @@ class Config:
     EXIT_LOGIC_ENABLED = os.getenv('EXIT_LOGIC_ENABLED', 'true').lower() == 'true'  # Enabled - sell when profitable
     EXIT_TAKE_PROFIT_PERCENT = float(os.getenv('EXIT_TAKE_PROFIT_PERCENT', '30.0'))  # Sell when position is +30% profitable
     EXIT_MIN_PROFIT_CENTS = int(os.getenv('EXIT_MIN_PROFIT_CENTS', '5'))  # Minimum 5¢ profit to trigger exit
-    EXIT_MIN_ENTRY_PRICE = int(os.getenv('EXIT_MIN_ENTRY_PRICE', '15'))  # Never sell positions entered at or below this price
+    EXIT_MIN_ENTRY_PRICE = int(os.getenv('EXIT_MIN_ENTRY_PRICE', '30'))  # Never sell positions entered at or below this price (hold cheap contracts to settlement)
 
     # Stale Order Management
     STALE_ORDER_MIN_AGE_MINUTES = int(os.getenv('STALE_ORDER_MIN_AGE_MINUTES', '5'))  # Don't cancel orders younger than 5 min
