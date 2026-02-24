@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from scipy import stats
 from dotenv import load_dotenv
-from .config import extract_city_code
+from .config import extract_city_code, Config
 
 load_dotenv()
 
@@ -173,7 +173,6 @@ class WeatherDataAggregator:
         # Cache TTL balances freshness with API rate limits
         self.forecast_cache = {}
         self.cache_timestamp = {}
-        from .config import Config
         self.cache_ttl = Config.FORECAST_CACHE_TTL
         # Use configurable cutoff for today's low markets (default 8 AM local)
         self.LONGSHOT_LOW_CUTOFF_HOUR = getattr(Config, 'LONGSHOT_LOW_CUTOFF_HOUR', self.LONGSHOT_LOW_CUTOFF_HOUR)
@@ -193,6 +192,11 @@ class WeatherDataAggregator:
         # NWS observation cache — 5min TTL (NWS updates ~hourly)
         self._nws_obs_cache = {}  # {(series_ticker, 'high'/'low'): (result, timestamp)}
         self._nws_obs_cache_ttl = 300  # 5 minutes
+
+        # Per-source 429 backoff: skip sources that are rate-limited
+        # {source_name: datetime when we can retry}
+        self._source_backoff = {}
+        self._source_backoff_duration = 3600  # 1 hour backoff on 429
 
         # Source reliability weights (based on historical accuracy)
         # NWS gets extra weight because Kalshi settles on the NWS CLI report
@@ -252,6 +256,23 @@ class WeatherDataAggregator:
                     'forecast_temp', 'market_type', 'hours_until_settlement', 'city'
                 ])
 
+    def _is_source_backed_off(self, source: str) -> bool:
+        """Check if a source is in 429 backoff period."""
+        retry_after = self._source_backoff.get(source)
+        if retry_after and datetime.now() < retry_after:
+            return True
+        # Clear expired backoff
+        if retry_after:
+            del self._source_backoff[source]
+        return False
+
+    def _set_source_backoff(self, source: str) -> None:
+        """Put a source into backoff after a 429 response."""
+        retry_at = datetime.now() + timedelta(seconds=self._source_backoff_duration)
+        if source not in self._source_backoff:
+            logger.warning(f"{source} rate limited (429), backing off for {self._source_backoff_duration // 60} min")
+        self._source_backoff[source] = retry_at
+
     def _log_source_forecast(self, series_ticker: str, target_date: datetime,
                             source: str, forecast_temp: float):
         """Log individual source forecast to CSV for later accuracy analysis"""
@@ -289,12 +310,14 @@ class WeatherDataAggregator:
         """Get forecast from Tomorrow.io API - returns (temp, source, timestamp) for HIGH/LOW markets"""
         if not self.tomorrowio_api_key:
             return None
-        
+        if self._is_source_backed_off('tomorrowio'):
+            return None
+
         try:
             # Request both temperatureMax and temperatureMin
             is_low_market = 'LOW' in series_ticker
             temp_field = 'temperatureMin' if is_low_market else 'temperatureMax'
-            
+
             url = f"https://api.tomorrow.io/v4/timelines"
             params = {
                 'location': f"{lat},{lon}",
@@ -303,6 +326,9 @@ class WeatherDataAggregator:
                 'apikey': self.tomorrowio_api_key
             }
             response = self.session.get(url, params=params, timeout=5)
+            if response.status_code == 429:
+                self._set_source_backoff('tomorrowio')
+                return None
             if response.status_code != 200:
                 logger.warning(f"Tomorrow.io API returned {response.status_code} for {series_ticker}")
                 return None
@@ -494,6 +520,8 @@ class WeatherDataAggregator:
         """
         if not self.pirate_weather_api_key:
             return None
+        if self._is_source_backed_off('pirate_weather'):
+            return None
 
         try:
             is_low_market = 'LOW' in series_ticker
@@ -506,6 +534,9 @@ class WeatherDataAggregator:
             }
 
             response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 429:
+                self._set_source_backoff('pirate_weather')
+                return None
             if response.status_code != 200:
                 logger.warning(f"Pirate Weather API returned {response.status_code} for {series_ticker}")
                 return None
@@ -539,6 +570,8 @@ class WeatherDataAggregator:
         """
         if not self.visual_crossing_api_key:
             return None
+        if self._is_source_backed_off('visual_crossing'):
+            return None
 
         try:
             is_low_market = 'LOW' in series_ticker
@@ -553,6 +586,9 @@ class WeatherDataAggregator:
             }
 
             response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 429:
+                self._set_source_backoff('visual_crossing')
+                return None
             if response.status_code != 200:
                 logger.warning(f"Visual Crossing API returned {response.status_code} for {series_ticker}")
                 return None
@@ -1386,7 +1422,7 @@ class WeatherDataAggregator:
             return []
 
         # Log all sources that responded
-        sources = [source for _, source, _ in forecast_data]
+        sources = [source for _, source, _, *_ in forecast_data]
         logger.debug(f"Collected {len(forecast_data)} forecasts from: {', '.join(sources)}")
 
         # Extract temperatures for outlier detection
@@ -1685,7 +1721,6 @@ class WeatherDataAggregator:
         Called automatically after update_all_model_biases().
         """
         try:
-            from .config import Config
             if not getattr(Config, 'PERSIST_LEARNING', True):
                 return
 
@@ -1731,7 +1766,6 @@ class WeatherDataAggregator:
         Restores model biases and forecast error history from previous sessions.
         """
         try:
-            from .config import Config
             if not getattr(Config, 'PERSIST_LEARNING', True):
                 logger.info("Learning persistence disabled, starting fresh")
                 return
@@ -1790,7 +1824,6 @@ class WeatherDataAggregator:
             True if source is reliable (or insufficient data), False if unreliable
         """
         try:
-            from .config import Config
             max_rmse = getattr(Config, 'MAX_SOURCE_RMSE', 4.0)
 
             # Check all months for this source/city
