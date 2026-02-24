@@ -82,7 +82,7 @@ docs/                 # Strategy, setup, and optimization documentation
 
 ## Workflow
 
-1. **Plan first.** Before writing code, outline the approach. If the task touches 3+ files, create a brief plan and get confirmation before proceeding.
+1. **ALWAYS plan before writing code.** Use `EnterPlanMode` before making ANY code changes. This is not optional. The only exceptions are single-line typo fixes or changes the user has given exact instructions for (e.g. "change X to Y on line Z"). Investigation and diagnosis do NOT require plan mode — only the transition to writing/editing code does. When in doubt, plan.
 2. **Read before editing.** Always read the full relevant section of a file before modifying it. `strategies.py` and `weather_data.py` are large — understand the surrounding context.
 3. **Trace data flow end-to-end.** When fixing a function, follow its outputs through every downstream consumer. Don't stop at the function you edited — trace through strategies → risk checks → order placement → outcome tracking.
 4. **Make minimal changes.** Change only what's necessary. Don't refactor unrelated code.
