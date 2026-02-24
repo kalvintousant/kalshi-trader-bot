@@ -1070,35 +1070,34 @@ class KalshiTradingBot:
                     
                     # Heartbeat logging to confirm bot is alive + render dashboard
                     if time.time() - last_heartbeat >= heartbeat_interval:
-                        portfolio = self.client.get_portfolio()
-                        if portfolio is None:
-                            logger.warning("Heartbeat: get_portfolio() returned None, skipping")
-                            last_heartbeat = time.time()
-                            continue
-                        balance = portfolio.get('balance', 0) / 100  # Convert cents to dollars
-                        portfolio_value = portfolio.get('portfolio_value', 0) / 100  # Convert cents to dollars
-                        total_value = balance + portfolio_value
+                        try:
+                            portfolio = self.client.get_portfolio()
+                            balance = portfolio.get('balance', 0) / 100  # Convert cents to dollars
+                            portfolio_value = portfolio.get('portfolio_value', 0) / 100  # Convert cents to dollars
+                            total_value = balance + portfolio_value
 
-                        # Update weather-only daily P&L for heartbeat
-                        if Config.PAPER_TRADING:
-                            self.daily_pnl = self._paper_session_pnl
-                        else:
-                            current_weather_exposure = self._get_weather_exposure()
-                            if self.starting_weather_exposure is not None:
-                                todays_fills_cost = self._get_todays_weather_fills_cost()
-                                todays_settlements = self._get_todays_weather_settlements()
-                                total_invested = self.starting_weather_exposure + todays_fills_cost
-                                total_return = current_weather_exposure + todays_settlements
-                                self.daily_pnl = total_return - total_invested
+                            # Update weather-only daily P&L for heartbeat
+                            if Config.PAPER_TRADING:
+                                self.daily_pnl = self._paper_session_pnl
+                            else:
+                                current_weather_exposure = self._get_weather_exposure()
+                                if self.starting_weather_exposure is not None:
+                                    todays_fills_cost = self._get_todays_weather_fills_cost()
+                                    todays_settlements = self._get_todays_weather_settlements()
+                                    total_invested = self.starting_weather_exposure + todays_fills_cost
+                                    total_return = current_weather_exposure + todays_settlements
+                                    self.daily_pnl = total_return - total_invested
 
-                        logger.info(f"❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h")
-                        logger.info(f"   Account - Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
-                        logger.info(f"   Weather P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+                            logger.info(f"❤️  Heartbeat: Running for {(time.time() - last_heartbeat)/3600:.1f}h")
+                            logger.info(f"   Account - Cash: ${balance:.2f}, Portfolio: ${portfolio_value:.2f}, Total: ${total_value:.2f}")
+                            logger.info(f"   Weather P&L: ${self.daily_pnl:.2f} (limit: -${Config.MAX_DAILY_LOSS:.2f})")
+
+                            # Update dashboard with fresh account data and render
+                            self._update_dashboard_account()
+                            self._maybe_render_dashboard(force=True)
+                        except Exception as e:
+                            logger.warning(f"Heartbeat: failed to fetch portfolio: {e}")
                         last_heartbeat = time.time()
-
-                        # Update dashboard with fresh account data and render
-                        self._update_dashboard_account()
-                        self._maybe_render_dashboard(force=True)
                     
                     # Adaptive scan intervals based on market type
                     # Weather daily: 30s (frequent Kalshi odds check, weather forecasts cached)

@@ -149,7 +149,11 @@ class KalshiClient:
                 headers = self._create_headers('GET', path)
                 response = self.session.get(url, headers=headers, params=params, timeout=10)
                 response.raise_for_status()
-                result = response.json()
+                try:
+                    result = response.json()
+                except (ValueError, json.JSONDecodeError):
+                    logger.warning(f"Non-JSON response from GET {path}: {response.text[:200]}")
+                    return {}
 
                 # Cache orderbook results
                 if use_cache and path.startswith('/markets/') and path.endswith('/orderbook'):
@@ -186,7 +190,11 @@ class KalshiClient:
                 headers = self._create_headers('POST', path)
                 response = self.session.post(url, headers=headers, json=data, timeout=10)
                 response.raise_for_status()
-                return response.json()
+                try:
+                    return response.json()
+                except (ValueError, json.JSONDecodeError):
+                    logger.warning(f"Non-JSON response from POST {path}: {response.text[:200]}")
+                    return {}
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
                     if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
@@ -210,7 +218,11 @@ class KalshiClient:
                 headers = self._create_headers('PUT', path)
                 response = self.session.put(url, headers=headers, json=data, timeout=10)
                 response.raise_for_status()
-                return response.json()
+                try:
+                    return response.json()
+                except (ValueError, json.JSONDecodeError):
+                    logger.warning(f"Non-JSON response from PUT {path}: {response.text[:200]}")
+                    return {}
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
                     if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:
@@ -234,7 +246,11 @@ class KalshiClient:
                 headers = self._create_headers('DELETE', path)
                 response = self.session.delete(url, headers=headers, timeout=10)
                 response.raise_for_status()
-                return response.json()
+                try:
+                    return response.json()
+                except (ValueError, json.JSONDecodeError):
+                    logger.warning(f"Non-JSON response from DELETE {path}: {response.text[:200]}")
+                    return {}
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
                     if hasattr(e, 'response') and hasattr(e.response, 'status_code') and e.response.status_code == 429:

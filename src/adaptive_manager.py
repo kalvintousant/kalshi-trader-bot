@@ -380,7 +380,7 @@ class AdaptiveCityManager:
             if total_trades == 0:
                 continue
 
-            win_rate = stats.get('wins', 0) / total_trades
+            win_rate = stats.get('wins', 0) / total_trades if total_trades > 0 else 0
             pnl = stats.get('pnl', 0)
 
             status = "✅ ENABLED"
