@@ -36,15 +36,20 @@ class WebDashboard:
         t.start()
 
     def _run_server(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        app = self._create_app()
-        runner = web.AppRunner(app)
-        loop.run_until_complete(runner.setup())
-        site = web.TCPSite(runner, self.host, self.port)
-        loop.run_until_complete(site.start())
-        logger.info(f"Web dashboard listening on http://{self.host}:{self.port}")
-        loop.run_forever()
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            app = self._create_app()
+            runner = web.AppRunner(app)
+            loop.run_until_complete(runner.setup())
+            site = web.TCPSite(runner, self.host, self.port)
+            loop.run_until_complete(site.start())
+            logger.info(f"Web dashboard listening on http://{self.host}:{self.port}")
+            loop.run_forever()
+        except OSError as e:
+            logger.error(f"Web dashboard failed to start: {e} — kill the process on port {self.port} or change WEB_DASHBOARD_PORT")
+        except Exception as e:
+            logger.error(f"Web dashboard crashed: {e}", exc_info=True)
 
     def _create_app(self):
         app = web.Application()

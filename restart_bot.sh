@@ -8,6 +8,8 @@ cd "$(dirname "$0")"
 echo "🛑 Stopping all bot processes..."
 pkill -9 -f "python.*bot" 2>/dev/null || true
 pkill -9 -f "python.*src" 2>/dev/null || true
+# Kill any process holding the web dashboard port
+lsof -ti :8050 | xargs kill -9 2>/dev/null || true
 sleep 2
 
 echo "🧹 Clearing Python bytecode cache..."
