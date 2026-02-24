@@ -178,7 +178,7 @@ class WeatherDataAggregator:
         self.LONGSHOT_LOW_CUTOFF_HOUR = getattr(Config, 'LONGSHOT_LOW_CUTOFF_HOUR', self.LONGSHOT_LOW_CUTOFF_HOUR)
 
         # Forecast metadata cache (stores source and timestamp for each forecast)
-        self.forecast_metadata = {}  # {cache_key: [(temp, source, timestamp), ...]}
+        self.forecast_metadata = {}  # {cache_key: [(corrected_temp, source, timestamp, raw_temp), ...]}
         
         # File to log individual source forecasts for later analysis
         self.forecasts_log_file = Path("data/source_forecasts.csv")

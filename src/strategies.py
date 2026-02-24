@@ -1141,7 +1141,7 @@ class WeatherDailyStrategy(TradingStrategy):
             'ci_lower': ci_lower,
             'ci_upper': ci_upper,
             'time_decay_factor': time_factor,
-            'num_sources': len(set(s for _, s, _ in self.weather_agg.forecast_metadata.get(
+            'num_sources': len(set(entry[1] for entry in self.weather_agg.forecast_metadata.get(
                 f"{series_ticker}_{target_date.strftime('%Y-%m-%d') if target_date else ''}", []))) or len(forecasts),
             'threshold': str(threshold),
             'target_date': target_date.strftime('%Y-%m-%d') if target_date else '',
@@ -1203,8 +1203,8 @@ class WeatherDailyStrategy(TradingStrategy):
         decision_label = f"{strategy_mode}_{side}"
         self._log_trade_decision(market_ticker, {
             'decision': decision_label,
-            'forecasts': [(f, s, t.isoformat() if hasattr(t, 'isoformat') else str(t))
-                         for f, s, t in self.weather_agg.forecast_metadata.get(
+            'forecasts': [(entry[0], entry[1], entry[2].isoformat() if hasattr(entry[2], 'isoformat') else str(entry[2]))
+                         for entry in self.weather_agg.forecast_metadata.get(
                              f"{series_ticker}_{target_date_str}", [])],
             'ci_lower': ci_lower,
             'ci_upper': ci_upper,
