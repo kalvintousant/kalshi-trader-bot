@@ -293,6 +293,25 @@ class KalshiClient:
     def get_market_orderbook(self, market_ticker: str, use_cache: bool = True) -> Dict:
         """Get orderbook for a specific market with caching"""
         return self._get(f"/markets/{market_ticker}/orderbook", use_cache=use_cache)
+
+    def get_orderbook_with_ws_cache(self, market_ticker: str, ws_cache=None, use_cache: bool = True) -> Dict:
+        """Get orderbook, checking WebSocket cache first for faster reads.
+
+        If ws_cache has a fresh price for this ticker, synthesizes an orderbook
+        response from it. Otherwise falls back to REST API.
+        """
+        if ws_cache is not None:
+            cached = ws_cache.get_price(market_ticker)
+            if cached is not None:
+                # Synthesize orderbook-like response from WS cache
+                return {
+                    'orderbook': {
+                        'yes': [[cached['yes_bid'], 1], [cached['yes_ask'], 1]] if cached['yes_bid'] else [],
+                        'no': [[cached['no_bid'], 1], [cached['no_ask'], 1]] if cached['no_bid'] else [],
+                    },
+                    '_source': 'ws_cache',
+                }
+        return self.get_market_orderbook(market_ticker, use_cache=use_cache)
     
     def get_portfolio(self, use_cache: bool = True) -> Dict:
         """Get portfolio information with caching"""

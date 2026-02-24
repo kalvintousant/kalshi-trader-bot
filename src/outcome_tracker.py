@@ -28,11 +28,12 @@ logger = logging.getLogger(__name__)
 class OutcomeTracker:
     """Track market outcomes and forecast accuracy"""
 
-    def __init__(self, client, weather_aggregator, adaptive_manager=None, drawdown_protector=None):
+    def __init__(self, client, weather_aggregator, adaptive_manager=None, drawdown_protector=None, cooldown_timer=None):
         self.client = client
         self.weather_agg = weather_aggregator
         self.adaptive_manager = adaptive_manager
         self.drawdown_protector = drawdown_protector
+        self.cooldown_timer = cooldown_timer
 
         # Settlement divergence tracker
         self.settlement_tracker = None
@@ -102,20 +103,51 @@ class OutcomeTracker:
 
     def _lookup_trade_probability(self, market_ticker: str, side: str) -> float:
         """Look up our original probability for a trade from trades.csv."""
+        details = self._lookup_trade_details(market_ticker, side)
+        prob = details.get('our_probability')
+        return float(prob) if prob else 0.5
+
+    def _lookup_trade_details(self, market_ticker: str, side: str) -> dict:
+        """Look up original trade decision data from trades.csv.
+
+        Returns dict with keys: our_probability, market_price, edge, ev, strategy_mode.
+        Values are strings (empty string if not found).
+        """
+        result = {'our_probability': '', 'market_price': '', 'edge': '', 'ev': '', 'strategy_mode': ''}
         trades_file = Path("data/trades.csv")
         if not trades_file.exists():
-            return 0.5
+            return result
         try:
             with open(trades_file, 'r') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     if row.get('market_ticker') == market_ticker and row.get('side', '').lower() == side:
-                        prob = row.get('our_probability', '')
-                        if prob:
-                            return float(prob)
+                        result['our_probability'] = row.get('our_probability', '')
+                        result['market_price'] = row.get('market_price', '')
+                        result['edge'] = row.get('edge', '')
+                        result['ev'] = row.get('ev', '')
+                        result['strategy_mode'] = row.get('strategy_mode', '')
+                        break
         except Exception as e:
-            logger.debug(f"Could not look up probability for {market_ticker}: {e}")
-        return 0.5  # Default fallback
+            logger.debug(f"Could not look up trade details for {market_ticker}: {e}")
+        return result
+
+    @staticmethod
+    def parse_target_date_from_ticker(market_ticker: str) -> Optional[datetime]:
+        """Parse target date from market ticker.
+
+        e.g., KXHIGHNY-26FEB07-T24 → Feb 7, 2026
+        """
+        if not market_ticker:
+            return None
+        parts = market_ticker.split('-')
+        if len(parts) < 2:
+            return None
+        date_part = parts[1]  # e.g., '26FEB07'
+        try:
+            return datetime.strptime(date_part, '%y%b%d')
+        except ValueError:
+            return None
 
     def check_settled_positions(self) -> List[Dict]:
         """
@@ -185,49 +217,57 @@ class OutcomeTracker:
             logger.error(f"Error checking settled positions: {e}", exc_info=True)
             return []
     
-    def extract_actual_temperature(self, market: Dict) -> Optional[float]:
+    def extract_actual_temperature(self, market: Dict, series_ticker: str = '', target_date: Optional[datetime] = None) -> Optional[float]:
         """
-        Extract actual temperature from settled market
-        
-        Kalshi markets settle based on the actual outcome. For temperature markets:
-        - Range markets: "Will temp be 71-72°" -> YES if actual was in that range
-        - Threshold markets: "Will temp be >75°" -> YES if actual was above 75
-        
-        We can infer the actual temp from which bracket won.
+        Extract actual temperature from settled market.
+
+        Strategy:
+        1. Try NWS observed data (most accurate — same source Kalshi settles on)
+        2. Fall back to range midpoint for range markets
+        3. Return None if we can't determine the actual temp
         """
         try:
-            title = market.get('title', '')
             result = market.get('result', '').lower()
-            
             if result not in ['yes', 'no']:
-                logger.debug(f"Market result unclear: {result}")
                 return None
-            
-            # Parse market to get threshold/range
+
+            # Try NWS observed data first (closes feedback loop for all market types)
+            if series_ticker and self.weather_agg:
+                is_high = series_ticker.startswith('KXHIGH')
+                try:
+                    if target_date and target_date.date() != datetime.now().date():
+                        # Historical date — use date-specific method
+                        if is_high:
+                            obs = self.weather_agg.get_observed_high_for_date(series_ticker, target_date)
+                        else:
+                            obs = self.weather_agg.get_observed_low_for_date(series_ticker, target_date)
+                    else:
+                        # Today — use cached today method
+                        if is_high:
+                            obs = self.weather_agg.get_todays_observed_high(series_ticker)
+                        else:
+                            obs = self.weather_agg.get_todays_observed_low(series_ticker)
+                    if obs is not None:
+                        actual_temp, _ = obs
+                        logger.debug(f"NWS observed {'high' if is_high else 'low'} for {series_ticker}: {actual_temp:.1f}°F")
+                        return actual_temp
+                except Exception as e:
+                    logger.debug(f"Could not get NWS observation for {series_ticker}: {e}")
+
+            # Fall back to range market midpoint
             from src.weather_data import extract_threshold_from_market
             threshold = extract_threshold_from_market(market)
-            
             if threshold is None:
                 return None
-            
-            # For range markets (tuple), we know actual temp was in that range
+
             if isinstance(threshold, tuple):
                 low, high = threshold
                 if result == 'yes':
-                    # Actual temp was in [low, high]
-                    # Use midpoint as estimate
                     return (low + high) / 2.0
-                else:
-                    # Temp was NOT in range - can't determine exact value
-                    # Would need to check other markets for same city/date
-                    return None
-            
-            # For threshold markets (float), we have less info
-            # "Will temp be >75?" YES means actual >= 75, NO means actual < 75
-            # We'd need to cross-reference other markets to get exact value
-            # For now, return None (need more sophisticated approach)
+                return None
+
             return None
-        
+
         except Exception as e:
             logger.warning(f"Error extracting actual temp: {e}")
             return None
@@ -278,8 +318,8 @@ class OutcomeTracker:
                 parts = market_ticker.split('-')
                 series_ticker = parts[0] if parts else ''
 
-            target_date = datetime.now()  # Placeholder
-            actual_temp = self.extract_actual_temperature(market)
+            target_date = self.parse_target_date_from_ticker(market_ticker) or datetime.now()
+            actual_temp = self.extract_actual_temperature(market, series_ticker, target_date)
             predicted_temp = None
             if actual_temp and series_ticker:
                 predicted_temp = self.get_predicted_temperature(market_ticker, target_date, series_ticker)
@@ -327,6 +367,9 @@ class OutcomeTracker:
             trade_price = first_fill.get('yes_price', 0) if side == 'yes' else first_fill.get('no_price', 0)
             won = (side == result)
 
+            # Look up original trade decision data
+            trade_details = self._lookup_trade_details(market_ticker, side)
+
             with open(self.outcomes_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -336,7 +379,11 @@ class OutcomeTracker:
                     target_date.date().isoformat() if target_date else '',
                     str(threshold),
                     'range' if isinstance(threshold, tuple) else 'threshold',
-                    '', '', '', '', '',
+                    trade_details['our_probability'],
+                    trade_details['market_price'],
+                    trade_details['edge'],
+                    trade_details['ev'],
+                    trade_details['strategy_mode'],
                     side,
                     total_count,
                     trade_price,
@@ -372,6 +419,58 @@ class OutcomeTracker:
                 self.settlement_tracker.record_settlement(
                     city=city, our_probability=our_prob, won=won, ticker=market_ticker
                 )
+
+            # Update cooldown timer with outcome
+            if self.cooldown_timer:
+                self.cooldown_timer.record_outcome(won)
+
+            # Feed forecast error to city/season error tracker
+            if forecast_error is not None and series_ticker:
+                try:
+                    from .city_error_tracker import get_city_error_tracker
+                    city = extract_city_code(series_ticker)
+                    month = target_date.month if target_date else datetime.now().month
+                    tracker = get_city_error_tracker()
+                    tracker.record_error(city, month, forecast_error)
+                except Exception:
+                    pass
+
+            # Generate post-mortem
+            if Config.POSTMORTEM_ENABLED:
+                try:
+                    from .postmortem import PostMortemGenerator
+                    pm_gen = PostMortemGenerator()
+                    source_forecasts = pm_gen._lookup_source_forecasts(market_ticker)
+                    pm = pm_gen.generate(
+                        market_ticker=market_ticker,
+                        trade_details=trade_details,
+                        outcome_data={
+                            'won': won,
+                            'pnl': total_profit_loss,
+                            'side': side,
+                            'contracts': total_count,
+                            'entry_price': trade_price,
+                            'actual_temp': actual_temp,
+                            'predicted_temp': predicted_temp,
+                            'forecast_error': forecast_error,
+                            'result': result,
+                            'threshold': str(threshold),
+                        },
+                        source_forecasts=source_forecasts,
+                    )
+                    pm_gen.store(pm)
+                except Exception as e:
+                    logger.debug(f"Could not generate post-mortem: {e}")
+
+            # Trigger ML retrain check
+            if Config.ML_ENABLED:
+                try:
+                    from .ml_predictor import get_ml_predictor
+                    ml = get_ml_predictor()
+                    if ml.needs_retrain():
+                        ml.train()
+                except Exception:
+                    pass
 
             return {'ticker': market_ticker, 'won': won, 'pnl': abs(total_profit_loss), 'signed_pnl': total_profit_loss}
 

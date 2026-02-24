@@ -666,6 +666,20 @@ class WeatherDailyStrategy(TradingStrategy):
         except ImportError as e:
             logger.warning(f"Could not load DrawdownProtector: {e}")
 
+        # Cooldown timer — time-based pause after losses
+        self.cooldown_timer = None
+        if Config.COOLDOWN_ENABLED:
+            try:
+                from .cooldown_timer import CooldownTimer
+                self.cooldown_timer = CooldownTimer()
+                status = self.cooldown_timer.get_status()
+                if status['on_cooldown']:
+                    logger.info(f"⏱ Cooldown timer: ON COOLDOWN ({status['remaining_minutes']:.0f}m remaining)")
+                else:
+                    logger.info("⏱ Cooldown timer ENABLED")
+            except ImportError as e:
+                logger.warning(f"Could not load CooldownTimer: {e}")
+
         # Load paper trade state from trades.csv for restart recovery
         if Config.PAPER_TRADING:
             self._load_paper_state()
@@ -1071,6 +1085,15 @@ class WeatherDailyStrategy(TradingStrategy):
             if dd_mult < 1.0:
                 base_position = max(1, int(base_position * dd_mult))
                 logger.debug(f"Drawdown multiplier: {dd_mult:.2f}x, adjusted position={base_position}")
+
+        # Apply cooldown timer
+        if self.cooldown_timer and self.cooldown_timer.is_on_cooldown():
+            remaining = self.cooldown_timer.get_remaining_minutes()
+            if self.cooldown_timer.session_paused:
+                logger.warning(f"⏱ COOLDOWN: skipping {market_ticker} — session paused (rest of day)")
+            else:
+                logger.warning(f"⏱ COOLDOWN: skipping {market_ticker} — {remaining:.0f}m remaining")
+            return None
 
         # Calculate liquidity cap
         if Config.LIQUIDITY_CAP_ENABLED:

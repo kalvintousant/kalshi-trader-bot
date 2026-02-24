@@ -178,6 +178,29 @@ class Config:
     WEB_DASHBOARD_HOST = os.getenv('WEB_DASHBOARD_HOST', '0.0.0.0')
     WEB_DASHBOARD_PORT = int(os.getenv('WEB_DASHBOARD_PORT', '8050'))
 
+    # Post-Mortems (structured analysis of each settled trade)
+    POSTMORTEM_ENABLED = os.getenv('POSTMORTEM_ENABLED', 'true').lower() == 'true'
+
+    # Cooldown Timer (pause trading after losses)
+    COOLDOWN_ENABLED = os.getenv('COOLDOWN_ENABLED', 'false').lower() == 'true'
+    COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '30'))  # Pause duration after a single loss
+    COOLDOWN_SESSION_PAUSE_LOSSES = int(os.getenv('COOLDOWN_SESSION_PAUSE_LOSSES', '3'))  # Consecutive losses to pause rest of day
+
+    # City/Season Error Std (per-city, per-season forecast uncertainty floor)
+    CITY_SEASON_STD_ENABLED = os.getenv('CITY_SEASON_STD_ENABLED', 'true').lower() == 'true'
+    CITY_SEASON_MIN_SAMPLES = int(os.getenv('CITY_SEASON_MIN_SAMPLES', '10'))  # Min observations before using historical std
+
+    # WebSocket Price Cache (feed live prices into memory for faster orderbook reads)
+    WEBSOCKET_CACHE_ENABLED = os.getenv('WEBSOCKET_CACHE_ENABLED', 'false').lower() == 'true'
+    WEBSOCKET_CACHE_MAX_AGE = int(os.getenv('WEBSOCKET_CACHE_MAX_AGE', '10'))  # Max age in seconds before fallback to REST
+
+    # ML Prediction Layer (Ridge + RandomForest blend)
+    ML_ENABLED = os.getenv('ML_ENABLED', 'false').lower() == 'true'
+    ML_BLEND_WEIGHT = float(os.getenv('ML_BLEND_WEIGHT', '0.3'))  # Weight for ML prediction in mean blend (0.0-1.0)
+    ML_MIN_TRAINING_SAMPLES = int(os.getenv('ML_MIN_TRAINING_SAMPLES', '60'))  # Min samples to train ML model
+    ML_RETRAIN_INTERVAL_DAYS = int(os.getenv('ML_RETRAIN_INTERVAL_DAYS', '7'))  # Retrain weekly
+    ML_MAX_RMSE = float(os.getenv('ML_MAX_RMSE', '5.0'))  # Reject model if RMSE exceeds this (°F)
+
     # Hard-disabled cities (bypasses all other filters — will never trade)
     DISABLED_CITIES = {c.strip() for c in os.getenv('DISABLED_CITIES', '').split(',') if c.strip()}
 

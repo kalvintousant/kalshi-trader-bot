@@ -1580,6 +1580,24 @@ class WeatherDataAggregator:
         else:
             mean_temp = np.mean(forecasts)
 
+        # Blend ML prediction into mean if enabled and trained
+        if Config.ML_ENABLED and series_ticker and target_date:
+            try:
+                from .ml_predictor import get_ml_predictor
+                ml = get_ml_predictor()
+                city_code = extract_city_code(series_ticker)
+                is_high = series_ticker.startswith('KXHIGH')
+                hours_until = max(0, (target_date - datetime.now()).total_seconds() / 3600.0)
+                source_temps = {'aggregate_mean': float(mean_temp)}
+                ml_pred = ml.predict(source_temps, city_code, target_date.month, is_high, hours_until)
+                if ml_pred is not None:
+                    stat_mean = mean_temp
+                    blend_w = Config.ML_BLEND_WEIGHT
+                    mean_temp = (1 - blend_w) * stat_mean + blend_w * ml_pred
+                    logger.debug(f"ML blend: stat={stat_mean:.1f}, ml={ml_pred:.1f}, blended={mean_temp:.1f}")
+            except Exception:
+                pass
+
         # Try to get ensemble-based uncertainty (GEFS + ECMWF)
         ensemble_std = None
         if series_ticker and target_date and series_ticker in self.CITY_COORDS:
@@ -1642,6 +1660,14 @@ class WeatherDataAggregator:
         if is_range_market:
             # Range markets need wider distribution — 2°F bin with tight std gives unrealistic probs
             min_std = getattr(Config, 'RANGE_MIN_STD_FLOOR', 3.0)
+        elif Config.CITY_SEASON_STD_ENABLED and series_ticker and target_date:
+            # Per-city, per-season floor from historical error tracking
+            try:
+                from .city_error_tracker import get_city_error_tracker
+                city_code = extract_city_code(series_ticker)
+                min_std = get_city_error_tracker().get_min_std(city_code, target_date.month)
+            except Exception:
+                min_std = max(2.5, self.get_historical_forecast_error(series_ticker, target_date.month))
         else:
             # City-specific floor from actual forecast track record
             if series_ticker and target_date:

@@ -2,6 +2,7 @@ import asyncio
 import csv
 import json
 import os
+import threading
 import time
 import requests
 import logging
@@ -74,9 +75,16 @@ class KalshiTradingBot:
             if hasattr(first_strategy, 'drawdown_protector'):
                 self.drawdown_protector = first_strategy.drawdown_protector
 
+        # Get cooldown timer from first strategy (if available)
+        self.cooldown_timer = None
+        if self.strategy_manager.strategies:
+            first_strategy = self.strategy_manager.strategies[0]
+            if hasattr(first_strategy, 'cooldown_timer'):
+                self.cooldown_timer = first_strategy.cooldown_timer
+
         # Outcome tracker for learning from results
         weather_agg = self.strategy_manager.strategies[0].weather_agg if self.strategy_manager.strategies else None
-        self.outcome_tracker = OutcomeTracker(self.client, weather_agg, self.adaptive_manager, self.drawdown_protector) if weather_agg else None
+        self.outcome_tracker = OutcomeTracker(self.client, weather_agg, self.adaptive_manager, self.drawdown_protector, self.cooldown_timer) if weather_agg else None
         self.last_outcome_check = 0  # Timestamp of last outcome check
         self._paper_session_pnl = 0.0  # Accumulated paper P&L for today
 
@@ -91,6 +99,18 @@ class KalshiTradingBot:
         self.dashboard_enabled = os.getenv('DASHBOARD_ENABLED', 'true').lower() != 'false'
         self.dashboard_state = DashboardState()
         self.dashboard = Dashboard(self.dashboard_state)
+
+        # WebSocket price cache (daemon thread feeding live prices into memory)
+        self.ws_price_cache = None
+        if Config.WEBSOCKET_CACHE_ENABLED:
+            try:
+                from src.ws_price_cache import WsPriceCache, run_ws_cache
+                self.ws_price_cache = WsPriceCache()
+                ws_thread = threading.Thread(target=run_ws_cache, args=(self.ws_price_cache, self.client), daemon=True)
+                ws_thread.start()
+                logger.info("WebSocket price cache thread started")
+            except Exception as e:
+                logger.warning(f"Could not start WebSocket price cache: {e}")
 
         # Web dashboard (aiohttp on daemon thread)
         self.web_dashboard = None
