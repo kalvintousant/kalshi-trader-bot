@@ -132,6 +132,8 @@ class KalshiTradingBot:
     def _get_weather_exposure(self) -> float:
         """Get total market exposure for weather positions only"""
         positions = self.client.get_positions()
+        if not positions:
+            return 0.0
         weather_exposure = 0.0
         for pos in positions:
             ticker = pos.get('ticker', '')
@@ -482,7 +484,10 @@ class KalshiTradingBot:
                     
                     # Get current orderbook
                     orderbook = self.client.get_market_orderbook(ticker)
-                    
+                    if orderbook is None:
+                        logger.debug(f"Orderbook unavailable for {ticker}, skipping stale check")
+                        continue
+
                     # Re-evaluate market with strategy (pass orderbook to avoid re-fetching)
                     decisions = self.strategy_manager.evaluate_market(market, orderbook)
                     
@@ -899,7 +904,7 @@ class KalshiTradingBot:
             exposure = self._get_weather_exposure()
 
             # Count active positions and resting orders
-            positions = self.client.get_positions()
+            positions = self.client.get_positions() or []
             active_count = sum(1 for p in positions if p.get('position', 0) != 0)
             try:
                 resting = self.client.get_orders(status='resting')
@@ -1054,9 +1059,9 @@ class KalshiTradingBot:
                             settlement_results = self.outcome_tracker.run_outcome_check() or []
                             self.last_outcome_check = time.time()
                             for result in settlement_results:
-                                self.dashboard_state.record_settlement(result['ticker'], result['won'], result['pnl'])
+                                self.dashboard_state.record_settlement(result.get('ticker', '?'), result.get('won', False), result.get('pnl', 0))
                                 if Config.PAPER_TRADING:
-                                    self._paper_session_pnl += result['signed_pnl']
+                                    self._paper_session_pnl += result.get('signed_pnl', result.get('pnl', 0))
                             if settlement_results:
                                 self._update_dashboard_account()
                                 self._maybe_render_dashboard(force=True)
@@ -1066,6 +1071,10 @@ class KalshiTradingBot:
                     # Heartbeat logging to confirm bot is alive + render dashboard
                     if time.time() - last_heartbeat >= heartbeat_interval:
                         portfolio = self.client.get_portfolio()
+                        if portfolio is None:
+                            logger.warning("Heartbeat: get_portfolio() returned None, skipping")
+                            last_heartbeat = time.time()
+                            continue
                         balance = portfolio.get('balance', 0) / 100  # Convert cents to dollars
                         portfolio_value = portfolio.get('portfolio_value', 0) / 100  # Convert cents to dollars
                         total_value = balance + portfolio_value

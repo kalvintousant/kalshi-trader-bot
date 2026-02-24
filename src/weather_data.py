@@ -358,7 +358,9 @@ class WeatherDataAggregator:
             response = self.session.get(grid_url, timeout=5, headers={'User-Agent': 'KalshiBot/1.0'})
             if response.status_code == 200:
                 grid_data = response.json()
-                forecast_url = grid_data['properties']['forecast']
+                forecast_url = grid_data.get('properties', {}).get('forecast')
+                if not forecast_url:
+                    return None
                 forecast_response = self.session.get(forecast_url, timeout=5, headers={'User-Agent': 'KalshiBot/1.0'})
                 if forecast_response.status_code == 200:
                     forecast_data = forecast_response.json()
@@ -1033,7 +1035,9 @@ class WeatherDataAggregator:
             today_temps = []
 
             for obs in observations:
-                props = obs['properties']
+                props = obs.get('properties')
+                if not props:
+                    continue
                 timestamp_str = props.get('timestamp')
                 if not timestamp_str:
                     continue
@@ -1184,7 +1188,9 @@ class WeatherDataAggregator:
             today_temps = []
 
             for obs in observations:
-                props = obs['properties']
+                props = obs.get('properties')
+                if not props:
+                    continue
                 timestamp_str = props.get('timestamp')
                 if not timestamp_str:
                     continue

@@ -364,10 +364,12 @@ class TradingStrategy:
                 if is_sell:
                     pp['contracts'] = max(0, pp['contracts'] - decision['count'])
                     pp['dollars'] = max(0.0, pp['dollars'] - decision['count'] * price / 100.0)
+                    if pp['contracts'] <= 0:
+                        pp['sides'].discard(decision['side'])
                 else:
                     pp['contracts'] += decision['count']
                     pp['dollars'] += decision['count'] * price / 100.0
-                pp['sides'].add(decision['side'])
+                    pp['sides'].add(decision['side'])
                 self._paper_tickers.add(market_ticker)
 
                 logger.info(f"📝 PAPER TRADE: {decision['action'].upper()} {decision['count']} {decision['side'].upper()} @ {price}¢ | {market_ticker}")
@@ -994,6 +996,9 @@ class WeatherDailyStrategy(TradingStrategy):
             use_kelly = len(forecasts) >= 2 and prob > 0.7 and (ci_lower > ask_price / 100.0)
 
         # Position sizing: EV-proportional (new) or Kelly/Confidence (legacy)
+        if ask_price <= 0:
+            logger.debug(f"Skipping position sizing: ask_price={ask_price}¢ is non-positive")
+            return None
         if Config.EV_PROPORTIONAL_ENABLED:
             base_position = self._calculate_ev_proportional_size(ev, is_longshot=is_longshot)
             logger.debug(f"EV-proportional sizing: EV=${ev:.4f}, position={base_position}")
@@ -1866,23 +1871,27 @@ class WeatherDailyStrategy(TradingStrategy):
 
             # CONSERVATIVE MODE: Standard edge/EV trading (high win rate)
             # Optionally require confidence interval to not overlap market price (REQUIRE_HIGH_CONFIDENCE)
-            high_confidence_yes = (ci_lower_yes > best_yes_ask / 100.0 or ci_upper_yes < best_yes_ask / 100.0)
-            high_confidence_no = (ci_lower_no > best_no_ask / 100.0 or ci_upper_no < best_no_ask / 100.0)
+            high_confidence_yes = ci_lower_yes > best_yes_ask / 100.0
+            high_confidence_no = ci_lower_no > best_no_ask / 100.0
 
             # Get required edge based on price (scaled edge for expensive contracts)
             required_yes_edge = self._get_required_edge(best_yes_ask)
             required_no_edge = self._get_required_edge(best_no_ask)
 
             # Range markets: require higher edge and enforce lower price cap
+            range_yes_blocked = False
+            range_no_blocked = False
             if is_range_market:
                 range_edge_mult = getattr(Config, 'RANGE_MIN_EDGE_MULTIPLIER', 2.0)
                 required_yes_edge *= range_edge_mult
                 required_no_edge *= range_edge_mult
                 range_max_price = getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25)
                 if best_yes_ask > range_max_price:
-                    logger.debug(f"📊 SKIP {market_ticker} YES: ask {best_yes_ask}¢ > range cap {range_max_price}¢")
+                    logger.debug(f"📊 Range cap: {market_ticker} YES ask {best_yes_ask}¢ > {range_max_price}¢ — blocked")
+                    range_yes_blocked = True
                 if best_no_ask > range_max_price:
-                    logger.debug(f"📊 SKIP {market_ticker} NO: ask {best_no_ask}¢ > range cap {range_max_price}¢")
+                    logger.debug(f"📊 Range cap: {market_ticker} NO ask {best_no_ask}¢ > {range_max_price}¢ — blocked")
+                    range_no_blocked = True
 
             yes_candidate = None
             no_candidate = None
@@ -1904,7 +1913,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     forecast_supports_yes = mean_forecast < threshold
                     forecast_supports_no = mean_forecast >= threshold
 
-            if (forecast_supports_yes
+            if (forecast_supports_yes and not range_yes_blocked
                     and yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
                     and (not self.require_high_confidence or high_confidence_yes)
                     and (not is_range_market or best_yes_ask <= getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25))):
@@ -1913,7 +1922,7 @@ class WeatherDailyStrategy(TradingStrategy):
                     ci_lower_yes, ci_upper_yes, is_longshot=False, **common_args)
 
             max_no_price = getattr(Config, 'MAX_NO_BUY_PRICE_CENTS', 30)
-            if (forecast_supports_no
+            if (forecast_supports_no and not range_no_blocked
                     and no_edge >= required_no_edge and no_ev >= self.min_ev_threshold
                     and best_no_ask <= max_no_price
                     and (not self.require_high_confidence or high_confidence_no)
