@@ -712,11 +712,20 @@ class KalshiTradingBot:
                     continue
                 
                 for decision in decisions:
-                    strategy_name = decision.pop('strategy')
-                    market_ticker = decision.pop('market_ticker')
-                    
+                    if self.check_daily_loss_limit():
+                        break
+
+                    strategy_name = decision.pop('strategy', None)
+                    market_ticker = decision.pop('market_ticker', None)
+                    if not strategy_name or not market_ticker:
+                        logger.warning(f"Malformed decision missing keys: {list(decision.keys())}")
+                        continue
+
                     # Execute trade
-                    strategy = next(s for s in self.strategy_manager.strategies if s.name == strategy_name)
+                    strategy = next((s for s in self.strategy_manager.strategies if s.name == strategy_name), None)
+                    if not strategy:
+                        logger.warning(f"Strategy '{strategy_name}' not found, skipping trade for {market_ticker}")
+                        continue
                     order = strategy.execute_trade(decision, market_ticker)
                     
                     if order:
@@ -728,10 +737,10 @@ class KalshiTradingBot:
                         if not Config.PAPER_TRADING:
                             try:
                                 resting_snapshot = self.client.get_orders(status='resting', use_cache=False)
-                                for strategy in self.strategy_manager.strategies:
-                                    strategy._resting_orders_snapshot = resting_snapshot
-                            except Exception:
-                                pass
+                                for s in self.strategy_manager.strategies:
+                                    s._resting_orders_snapshot = resting_snapshot
+                            except Exception as e:
+                                logger.debug(f"Failed to refresh resting orders: {e}")
 
                         # Record trade on dashboard
                         self.dashboard_state.record_trade(
@@ -752,14 +761,21 @@ class KalshiTradingBot:
                             time.sleep(0.3)  # Rate limiting delay (unnecessary in paper mode)
 
             # Flush cross-threshold decisions: execute best decision per base market
+            loss_limit_hit = False
             for strategy in self.strategy_manager.strategies:
+                if loss_limit_hit:
+                    break
                 if not hasattr(strategy, 'get_pending_decisions'):
                     continue
                 for decision in strategy.get_pending_decisions():
-                    strategy_name = decision.pop('strategy')
-                    market_ticker = decision.pop('market_ticker')
+                    strategy_name = decision.pop('strategy', None)
+                    market_ticker = decision.pop('market_ticker', None)
+                    if not strategy_name or not market_ticker:
+                        logger.warning(f"Malformed pending decision missing keys: {list(decision.keys())}")
+                        continue
 
                     if self.check_daily_loss_limit():
+                        loss_limit_hit = True
                         break
 
                     order = strategy.execute_trade(decision, market_ticker)
@@ -774,8 +790,8 @@ class KalshiTradingBot:
                                 resting_snapshot = self.client.get_orders(status='resting', use_cache=False)
                                 for s in self.strategy_manager.strategies:
                                     s._resting_orders_snapshot = resting_snapshot
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"Failed to refresh resting orders: {e}")
 
                         self.dashboard_state.record_trade(
                             decision.get('action', 'buy'),

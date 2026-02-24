@@ -627,9 +627,10 @@ class WeatherDataAggregator:
                 return None
 
             points_data = response.json()
-            grid_id = points_data['properties'].get('gridId')
-            grid_x = points_data['properties'].get('gridX')
-            grid_y = points_data['properties'].get('gridY')
+            props = points_data.get('properties', {})
+            grid_id = props.get('gridId')
+            grid_x = props.get('gridX')
+            grid_y = props.get('gridY')
 
             if not all([grid_id, grid_x, grid_y]):
                 return None
@@ -972,7 +973,7 @@ class WeatherDataAggregator:
                 logger.debug(f"NWS points API failed for {series_ticker}: {resp.status_code}")
                 return None
 
-            obs_stations_url = resp.json()['properties'].get('observationStations')
+            obs_stations_url = resp.json().get('properties', {}).get('observationStations')
             if not obs_stations_url:
                 return None
 
@@ -1613,10 +1614,9 @@ class WeatherDataAggregator:
 
             # Add base uncertainty based on forecast horizon
             if target_date:
-                days_until = (target_date - datetime.now()).days
-                hours_until = (target_date - datetime.now()).total_seconds() / 3600.0
-                # Base uncertainty increases with time: +0.5°F per day, +0.1°F per hour
-                base_uncertainty = 1.0 + (days_until * 0.5) + max(0, (hours_until - days_until * 24) * 0.1)
+                total_hours = max(0, (target_date - datetime.now()).total_seconds() / 3600.0)
+                # Base uncertainty increases with time: +0.5°F per 24h (linear)
+                base_uncertainty = 1.0 + (total_hours * 0.5 / 24.0)
                 std_temp = max(std_temp, base_uncertainty)
 
             # Incorporate historical forecast error if available
@@ -1887,16 +1887,24 @@ class WeatherDataAggregator:
                     total_prob += prob
                 elif temp_max > threshold:
                     # Partial overlap - add proportional probability
-                    overlap = (temp_max - threshold) / (temp_max - temp_min)
-                    total_prob += prob * overlap
+                    if temp_max > temp_min:
+                        overlap = (temp_max - threshold) / (temp_max - temp_min)
+                        total_prob += prob * overlap
+                    else:
+                        # Zero-width bin at threshold boundary — assign half probability
+                        total_prob += prob * 0.5
             else:
                 # For "below threshold", count ranges where max <= threshold
                 if temp_max <= threshold:
                     total_prob += prob
                 elif temp_min < threshold:
                     # Partial overlap
-                    overlap = (threshold - temp_min) / (temp_max - temp_min)
-                    total_prob += prob * overlap
+                    if temp_max > temp_min:
+                        overlap = (threshold - temp_min) / (temp_max - temp_min)
+                        total_prob += prob * overlap
+                    else:
+                        # Zero-width bin at threshold boundary — assign half probability
+                        total_prob += prob * 0.5
         
         return total_prob
     
