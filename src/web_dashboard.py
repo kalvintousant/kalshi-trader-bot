@@ -800,6 +800,46 @@ function formatUptime(s) {
 function pnlClass(v) { return v >= 0 ? 'pnl-pos' : 'pnl-neg'; }
 function pnlStr(v) { return (v >= 0 ? '+' : '') + '$' + v.toFixed(2); }
 
+function formatTicker(ticker, side) {
+  // KXHIGHLAX-26FEB25-T73, yes → High - LA - 25Feb - <73°
+  if (!ticker) return ticker;
+  const parts = ticker.split('-');
+  if (parts.length < 3) return ticker;
+  const series = parts[0];
+  const datePart = parts[1];
+  const threshPart = parts[2];
+  // HIGH or LOW
+  const isHigh = series.includes('HIGH');
+  const type = isHigh ? 'High' : 'Low';
+  // City code (match Python extract_city_code: try KXHIGHT, KXLOWT, KXHIGH, KXLOW)
+  let city = series;
+  for (const pfx of ['KXHIGHT','KXLOWT','KXHIGH','KXLOW']) {
+    if (series.startsWith(pfx)) { city = series.slice(pfx.length); break; }
+  }
+  const cityMap = {NY:'NYC',CHI:'CHI',MIA:'MIA',AUS:'AUS',LAX:'LA',DEN:'DEN',
+    PHIL:'PHIL',DAL:'DAL',BOS:'BOS',ATL:'ATL',HOU:'HOU',SEA:'SEA',PHX:'PHX',
+    MIN:'MIN',DC:'DC',OKC:'OKC',SFO:'SF'};
+  city = cityMap[city] || city;
+  // Date: 26FEB25 → 25Feb
+  const day = datePart.slice(5);
+  const mon = datePart.slice(2, 5);
+  const dateStr = day + mon.charAt(0) + mon.slice(1).toLowerCase();
+  // Threshold value
+  const threshold = threshPart.slice(1);
+  // Direction: what we're betting on
+  // HIGH YES = betting high stays below threshold (<)
+  // HIGH NO  = betting high reaches threshold (>=)
+  // LOW YES  = betting low stays above threshold (>=)
+  // LOW NO   = betting low drops below threshold (<)
+  let dir = '';
+  if (side) {
+    const s = side.toLowerCase();
+    if (isHigh) { dir = s === 'yes' ? '<' : '>='; }
+    else { dir = s === 'yes' ? '>=' : '<'; }
+  }
+  return type + ' - ' + city + ' - ' + dateStr + ' - ' + dir + threshold + '\\u00b0';
+}
+
 // ── Data fetching ──
 
 async function fetchStatus() {
@@ -909,7 +949,7 @@ async function fetchTrades() {
       const ts = t.timestamp ? t.timestamp.slice(11, 19) : '';
       const edge = t.edge ? parseFloat(t.edge).toFixed(1) + '%' : '';
       tr.innerHTML = '<td style="color:var(--text-dim)">' + ts + '</td>'
-        + '<td>' + (t.ticker || '') + '</td>'
+        + '<td title="' + (t.ticker || '') + '">' + formatTicker(t.ticker, t.side) + '</td>'
         + '<td style="color:' + sideColor + ';font-weight:600">' + (t.side||'').toUpperCase() + '</td>'
         + '<td>' + (t.count || '') + '</td>'
         + '<td>' + (t.price || '') + 'c</td>'
@@ -962,7 +1002,7 @@ async function fetchPositions() {
       const date = p.target_date ? p.target_date.slice(5) : '--';
       tr.innerHTML = '<td style="color:var(--text-dim)">' + date + '</td>'
         + '<td style="font-weight:600">' + (p.city || '--') + '</td>'
-        + '<td class="ticker"><a href="' + kalshiUrl(p.ticker) + '" target="_blank" rel="noopener">' + p.ticker + '</a></td>'
+        + '<td class="ticker"><a href="' + kalshiUrl(p.ticker) + '" target="_blank" rel="noopener" title="' + p.ticker + '">' + formatTicker(p.ticker, p.side) + '</a></td>'
         + '<td class="' + sideClass + '">' + p.side.toUpperCase() + '</td>'
         + '<td>' + p.qty + '</td>'
         + '<td>' + p.avg_entry + 'c</td>'
@@ -1089,8 +1129,9 @@ async function fetchPostmortems() {
       // Header
       const header = document.createElement('div');
       header.className = 'pm-header';
+      const pmSide = pm.trade ? pm.trade.side : '';
       header.innerHTML = '<span class="pm-badge ' + (won ? 'win' : 'loss') + '">' + (won ? 'WIN' : 'LOSS') + '</span>'
-        + '<span class="pm-ticker">' + ticker + '</span>'
+        + '<span class="pm-ticker" title="' + ticker + '">' + formatTicker(ticker, pmSide) + '</span>'
         + '<span class="pm-meta">' + (edge !== null ? 'Edge: ' + edge.toFixed(1) + '%' : '') + '</span>'
         + '<span class="pm-meta ' + pnlClass(pnl) + '">' + pnlStr(pnl) + '</span>'
         + '<span class="pm-arrow" id="pmArrow' + i + '">&#9654;</span>';
