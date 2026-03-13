@@ -653,18 +653,8 @@ class WeatherDailyStrategy(TradingStrategy):
         except ImportError as e:
             logger.warning(f"Could not load SettlementTracker: {e}")
 
-        # Drawdown protector — progressive loss protection
+        # Drawdown protector — DISABLED (was blocking trades during calibration phase)
         self.drawdown_protector = None
-        try:
-            from .drawdown_protector import DrawdownProtector
-            self.drawdown_protector = DrawdownProtector()
-            status = self.drawdown_protector.get_status()
-            if status['consecutive_losses'] > 0:
-                logger.info(f"📉 Drawdown protector: {status['level']} ({status['consecutive_losses']} consecutive losses)")
-            else:
-                logger.info("📊 Drawdown protector ENABLED — will reduce size on consecutive losses")
-        except ImportError as e:
-            logger.warning(f"Could not load DrawdownProtector: {e}")
 
         # Cooldown timer — time-based pause after losses
         self.cooldown_timer = None
@@ -1142,6 +1132,11 @@ class WeatherDailyStrategy(TradingStrategy):
                 order_type = routes[0]['type']
                 if order_type == 'maker':
                     logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {ask_price}¢, saving {ask_price - execution_price}¢)")
+                    # Recalculate EV with maker fees (4x lower) and better price
+                    maker_stake = execution_price / 100.0
+                    ev = self.weather_agg.calculate_ev(
+                        prob, 1.0, 1.0 - prob, maker_stake,
+                        include_fees=True, is_maker=True)
 
         # Build enhanced decision with analysis data
         # NOTE: active_positions write and INFO logging happen in caller
@@ -1638,7 +1633,18 @@ class WeatherDailyStrategy(TradingStrategy):
             min_deg = getattr(Config, 'MIN_DEGREES_FROM_THRESHOLD', 0)
             if min_deg > 0 and not isinstance(threshold, tuple):
                 if abs(mean_forecast - threshold) < min_deg:
-                    logger.debug(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° within {min_deg}° of threshold {threshold}° (reduce coin-flip losses)")
+                    logger.info(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° within {min_deg}° of threshold {threshold}° (reduce coin-flip losses)")
+                    return None
+
+            # --- TAIL DISTANCE GUARD (single-threshold markets) ---
+            # Skip contracts where the threshold is far from our forecast mean.
+            # These are cheap "lottery tickets" (e.g., model says 70°F but trading 80°F+)
+            # that look good on EV but never hit. Boz limits to within 2 buckets (~4°F).
+            max_thresh_dist = getattr(Config, 'MAX_THRESHOLD_DISTANCE', 0)
+            if max_thresh_dist > 0 and not isinstance(threshold, tuple):
+                dist = abs(mean_forecast - threshold)
+                if dist > max_thresh_dist:
+                    logger.info(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° is {dist:.1f}°F from threshold {threshold}° (max {max_thresh_dist}°F — tail trade)")
                     return None
 
             # --- NEAR-BOUNDARY GUARD (range markets) ---
@@ -1722,6 +1728,12 @@ class WeatherDailyStrategy(TradingStrategy):
                 except Exception:
                     pass
 
+            # Apply calibration discount to combat systematic overconfidence
+            # Brier score 0.5461 (random=0.25) indicates severe miscalibration
+            cal_discount = getattr(Config, 'CALIBRATION_DISCOUNT', 1.0)
+            if cal_discount < 1.0:
+                our_prob *= cal_discount
+
             # Get market prices (reuse from earlier calculation if available)
             # Get orderbook data
             # Kalshi orderbook format: [[price, quantity], ...] sorted by price ASCENDING
@@ -1730,15 +1742,15 @@ class WeatherDailyStrategy(TradingStrategy):
             # For asks: YES ask = 100 - NO bid, NO ask = 100 - YES bid
             yes_orders = orderbook.get('orderbook', {}).get('yes', [])
             no_orders = orderbook.get('orderbook', {}).get('no', [])
-            
+
             if not yes_orders or not no_orders:
                 logger.debug(f"📊 SKIP {market_ticker}: empty orderbook (no yes/no orders)")
                 return None
-            
+
             # Use market prices as fallback
             yes_market_price = market.get('yes_price', 50)
             no_market_price = market.get('no_price', 50)
-            
+
             # Kalshi orderbook: each side lists BIDS (what buyers will pay) sorted ascending
             # The [-1] entry is the HIGHEST BID (best bid), not the ask
             # ASK for one side = 100 - best BID for the other side
@@ -1749,6 +1761,38 @@ class WeatherDailyStrategy(TradingStrategy):
             # Calculate actual ASK prices (what we'd pay to buy)
             best_yes_ask = 100 - best_no_bid  # YES ask = 100 - NO bid
             best_no_ask = 100 - best_yes_bid  # NO ask = 100 - YES bid
+
+            # --- GUARDRAILS: Prevent model from overriding market consensus ---
+            yes_blocked_by_floor = False
+            if getattr(Config, 'GUARDRAIL_ENABLED', True):
+                market_yes_prob = best_yes_ask / 100.0
+                raw_prob = our_prob
+
+                # Layer 1: Market probability floor — hard skip YES on very cheap contracts
+                # (cheap YES = lottery ticket; NO side still tradeable since it's expensive = high conviction)
+                market_prob_floor = getattr(Config, 'GUARDRAIL_MARKET_FLOOR', 0.15)
+                if market_yes_prob < market_prob_floor:
+                    logger.info(f"📊 SKIP YES {market_ticker}: market floor — YES ask {best_yes_ask}¢ < {int(market_prob_floor * 100)}¢ floor (lottery ticket)")
+                    # Flag so YES candidate is blocked below; NO side proceeds normally
+                    yes_blocked_by_floor = True
+                else:
+                    yes_blocked_by_floor = False
+
+                # Layer 2: Divergence cap (clamp model within ±N% of market)
+                max_divergence = getattr(Config, 'GUARDRAIL_MAX_DIVERGENCE', 0.25)
+                capped_prob = max(market_yes_prob - max_divergence,
+                                  min(market_yes_prob + max_divergence, our_prob))
+
+                # Layer 3: Blend with market (don't fully trust model)
+                model_weight = getattr(Config, 'GUARDRAIL_MODEL_WEIGHT', 0.40)
+                blended_prob = model_weight * capped_prob + (1 - model_weight) * market_yes_prob
+
+                # Log the guardrail adjustment
+                if abs(blended_prob - raw_prob) > 0.01:
+                    logger.info(f"📊 GUARDRAIL {market_ticker}: raw={raw_prob:.1%} → capped={capped_prob:.1%} → blended={blended_prob:.1%} (mkt={market_yes_prob:.1%})")
+
+                our_prob = blended_prob
+                no_prob = 1.0 - our_prob
 
             # EARLY PRICE CHECK: Skip if BOTH sides are too expensive (saves calculation time)
             if best_yes_ask > Config.MAX_BUY_PRICE_CENTS and best_no_ask > Config.MAX_BUY_PRICE_CENTS:
@@ -1792,18 +1836,18 @@ class WeatherDailyStrategy(TradingStrategy):
             yes_price_for_ev = estimated_yes_price if abs(estimated_yes_price - best_yes_ask) > 2 else best_yes_ask
             no_price_for_ev = estimated_no_price if abs(estimated_no_price - best_no_ask) > 2 else best_no_ask
             
-            # Calculate EV for both sides using estimated fill prices and INCLUDING FEES
-            # For YES: if we win, we get $1 per contract, if we lose we lose what we paid
+            # Calculate EV for both sides using estimated fill prices and Kalshi's actual fee formula
+            # Kalshi fees: ceil(coeff * P * (1-P)) per contract — taker 0.07, maker 0.0175
             yes_stake = yes_price_for_ev / 100.0  # Convert cents to dollars
             yes_payout = 1.0  # $1 per contract if YES wins
-            yes_ev = self.weather_agg.calculate_ev(our_prob, yes_payout, no_prob, yes_stake, 
-                                                   include_fees=True, fee_rate=0.05)
-            
+            yes_ev = self.weather_agg.calculate_ev(our_prob, yes_payout, no_prob, yes_stake,
+                                                   include_fees=True)
+
             # For NO: if we win, we get $1 per contract, if we lose we lose what we paid
             no_stake = no_price_for_ev / 100.0
             no_payout = 1.0
             no_ev = self.weather_agg.calculate_ev(no_prob, no_payout, our_prob, no_stake,
-                                                  include_fees=True, fee_rate=0.05)
+                                                  include_fees=True)
             
             # CRITICAL FIX: Check if we already have a resting order on THIS EXACT ticker
             # This prevents the bug where we place multiple orders on the same ticker every scan
@@ -1936,7 +1980,13 @@ class WeatherDailyStrategy(TradingStrategy):
                     forecast_supports_yes = mean_forecast < threshold
                     forecast_supports_no = mean_forecast >= threshold
 
-            if (forecast_supports_yes and not range_yes_blocked
+            # INFO-level evaluation logging for diagnostics
+            forecast_std = float(np.std(forecasts)) if len(forecasts) > 1 else 0
+            logger.info(f"📊 EVAL {market_ticker}: mean={mean_forecast:.1f}°F std={forecast_std:.1f}°F "
+                        f"prob={our_prob:.1%} yes_edge={yes_edge:.1f}% no_edge={no_edge:.1f}% "
+                        f"yes_ask={best_yes_ask}¢ no_ask={best_no_ask}¢ req_edge={required_yes_edge:.1f}%")
+
+            if (forecast_supports_yes and not range_yes_blocked and not yes_blocked_by_floor
                     and yes_edge >= required_yes_edge and yes_ev >= self.min_ev_threshold
                     and (not self.require_high_confidence or high_confidence_yes)
                     and (not is_range_market or best_yes_ask <= getattr(Config, 'RANGE_MAX_BUY_PRICE_CENTS', 25))):
@@ -1979,9 +2029,9 @@ class WeatherDailyStrategy(TradingStrategy):
                 reason = f"edge ok, best EV ${best_ev:.4f} < ${self.min_ev_threshold}"
             else:
                 reason = "no side met edge/EV/confidence"
-            logger.debug(f"📊 SKIP {market_ticker}: {reason}")
+            logger.info(f"📊 SKIP {market_ticker}: {reason}")
             return None
-            
+
         except Exception as e:
             logger.error(f"Error in get_trade_decision: {e}", exc_info=True)
             return None
@@ -2070,7 +2120,10 @@ class WeatherDailyStrategy(TradingStrategy):
             position_size = max(1, position_size)
 
             edge = 100.0 - ask_price  # Our probability is 100%, market price is ask_price%
-            ev = (100 - ask_price) / 100.0 * 0.93  # Net of ~7% fees
+            import math
+            stake = ask_price / 100.0
+            fee_cents = math.ceil(0.07 * stake * (1.0 - stake) * 100) / 100.0
+            ev = (100 - ask_price) / 100.0 - fee_cents  # Net of Kalshi taker fee
 
             logger.info(
                 f"👁️ OBSERVATION TRADE {winning_side.upper()} {market_ticker}: "

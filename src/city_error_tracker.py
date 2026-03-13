@@ -38,27 +38,27 @@ class CityErrorTracker:
     # Conservative fallback std per city per season (°F)
     # Based on typical NWS forecast MAE patterns
     FALLBACK_STD = {
-        'NY':  {'winter': 4.0, 'spring': 3.5, 'summer': 2.5, 'fall': 3.5},
-        'CHI': {'winter': 4.5, 'spring': 4.0, 'summer': 3.0, 'fall': 3.5},
-        'MIA': {'winter': 2.5, 'spring': 2.5, 'summer': 2.0, 'fall': 2.5},
-        'AUS': {'winter': 3.5, 'spring': 3.5, 'summer': 2.5, 'fall': 3.0},
-        'LAX': {'winter': 3.0, 'spring': 2.5, 'summer': 2.0, 'fall': 3.0},
-        'DEN': {'winter': 5.0, 'spring': 4.5, 'summer': 3.5, 'fall': 4.0},
-        'PHIL': {'winter': 4.0, 'spring': 3.5, 'summer': 2.5, 'fall': 3.5},
+        'NY':  {'winter': 4.0, 'spring': 3.5, 'summer': 2.0, 'fall': 3.0},
+        'CHI': {'winter': 4.5, 'spring': 3.5, 'summer': 2.5, 'fall': 3.0},
+        'MIA': {'winter': 2.0, 'spring': 2.0, 'summer': 2.0, 'fall': 2.0},
+        'AUS': {'winter': 3.0, 'spring': 3.0, 'summer': 2.0, 'fall': 2.5},
+        'LAX': {'winter': 2.5, 'spring': 2.5, 'summer': 2.0, 'fall': 2.5},
+        'DEN': {'winter': 6.5, 'spring': 6.0, 'summer': 3.5, 'fall': 4.0},
+        'PHIL': {'winter': 7.0, 'spring': 6.5, 'summer': 2.5, 'fall': 3.5},
         'DAL': {'winter': 3.5, 'spring': 3.5, 'summer': 2.5, 'fall': 3.0},
-        'BOS': {'winter': 4.0, 'spring': 3.5, 'summer': 2.5, 'fall': 3.5},
+        'BOS': {'winter': 8.0, 'spring': 7.5, 'summer': 2.5, 'fall': 3.5},
         'ATL': {'winter': 3.5, 'spring': 3.0, 'summer': 2.5, 'fall': 3.0},
         'HOU': {'winter': 3.0, 'spring': 3.0, 'summer': 2.5, 'fall': 3.0},
         'SEA': {'winter': 3.5, 'spring': 3.0, 'summer': 2.5, 'fall': 3.0},
         'PHX': {'winter': 3.0, 'spring': 3.0, 'summer': 3.0, 'fall': 3.0},
         'MIN': {'winter': 5.0, 'spring': 4.5, 'summer': 3.0, 'fall': 4.0},
         'DC':  {'winter': 3.5, 'spring': 3.5, 'summer': 2.5, 'fall': 3.0},
-        'OKC': {'winter': 4.0, 'spring': 4.0, 'summer': 3.0, 'fall': 3.5},
+        'OKC': {'winter': 6.0, 'spring': 6.5, 'summer': 3.0, 'fall': 3.5},
         'SFO': {'winter': 3.0, 'spring': 2.5, 'summer': 2.5, 'fall': 3.0},
     }
 
     # Default fallback for unknown cities
-    DEFAULT_FALLBACK = 3.5
+    DEFAULT_FALLBACK = 5.0
 
     SEASON_MAP = {
         12: 'winter', 1: 'winter', 2: 'winter',

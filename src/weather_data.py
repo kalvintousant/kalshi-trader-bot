@@ -880,8 +880,8 @@ class WeatherDataAggregator:
             capped_bias = max(-max_bias, min(max_bias, bias))
             corrected = temp - capped_bias
             if abs(bias) > max_bias:
-                logger.debug(f"Bias capped for {source}/{city_base}/month{month}: raw bias={bias:.1f}°F -> capped={capped_bias:.1f}°F")
-            logger.debug(f"Bias correction for {source}/{city_base}/month{month}: {temp:.1f}°F -> {corrected:.1f}°F (bias={capped_bias:.1f}°F)")
+                logger.info(f"📊 Bias capped: {source}/{city_base}/month{month}: raw={bias:+.1f}°F → capped={capped_bias:+.1f}°F")
+            logger.info(f"📊 Bias correction: {source}/{city_base}/month{month}: {temp:.1f}°F → {corrected:.1f}°F (bias={capped_bias:+.1f}°F)")
             return corrected
         return temp
 
@@ -1667,15 +1667,15 @@ class WeatherDataAggregator:
                 city_code = extract_city_code(series_ticker)
                 min_std = get_city_error_tracker().get_min_std(city_code, target_date.month)
             except Exception:
-                min_std = max(2.5, self.get_historical_forecast_error(series_ticker, target_date.month))
+                min_std = max(Config.GLOBAL_MIN_STD, self.get_historical_forecast_error(series_ticker, target_date.month))
         else:
             # City-specific floor from actual forecast track record
             if series_ticker and target_date:
                 historical_min = self.get_historical_forecast_error(series_ticker, target_date.month)
             else:
                 historical_min = 3.5
-            # Never go below 2.5°F even with ensemble (NWS MAE for next-day is ~2.5°F)
-            min_std = max(2.5, historical_min)
+            # Never go below global floor even with ensemble (actual forecast errors are 5-10°F)
+            min_std = max(Config.GLOBAL_MIN_STD, historical_min)
         std_temp = max(std_temp, min_std)
 
         # Log the uncertainty source and value
@@ -1955,27 +1955,36 @@ class WeatherDataAggregator:
         edge = (our_probability - market_probability) * 100
         return edge
     
-    def calculate_ev(self, win_prob: float, payout: float, loss_prob: float, stake: float, 
-                     include_fees: bool = True, fee_rate: float = 0.05) -> float:
+    def calculate_ev(self, win_prob: float, payout: float, loss_prob: float, stake: float,
+                     include_fees: bool = True, fee_rate: float = 0.15,
+                     is_maker: bool = False) -> float:
         """
-        Calculate Expected Value with optional transaction fees
-        
+        Calculate Expected Value with Kalshi's actual fee formula.
+
+        Kalshi fees use: ceil(coefficient * P * (1-P)) per contract
+        - Taker coefficient: 0.07 (max 1.75¢/contract at 50¢)
+        - Maker coefficient: 0.0175 (max ~0.44¢/contract at 50¢)
+
         Args:
             win_prob: Probability of winning (0-1)
             payout: Payout if we win (in dollars)
             loss_prob: Probability of losing (0-1)
             stake: Amount staked (in dollars)
-            include_fees: Whether to include Kalshi fees (5% on winnings)
-            fee_rate: Fee rate (default 0.05 = 5%)
-        
+            include_fees: Whether to include Kalshi fees
+            fee_rate: Legacy parameter (ignored — Kalshi formula used instead)
+            is_maker: True if placing a resting limit order (4x lower fees)
+
         Returns:
             Expected value in dollars
         """
+        import math
         if include_fees:
-            # Kalshi fees: ~5% on winning trades, ~0% on losing trades
-            # If we win: payout - stake - (payout * fee_rate)
-            # If we lose: -stake (no fee on losses)
-            ev = (win_prob * (payout - stake - payout * fee_rate)) - (loss_prob * stake)
+            # Kalshi fee formula: ceil(coefficient * P * (1-P)) cents per contract
+            # P = price as fraction (stake in dollars = P)
+            coeff = 0.0175 if is_maker else 0.07
+            fee_cents = math.ceil(coeff * stake * (1.0 - stake) * 100) / 100.0  # Convert cents to dollars
+            # Fee is charged on the trade itself (win or lose), so subtract from both outcomes
+            ev = (win_prob * (payout - stake)) - (loss_prob * stake) - fee_cents
         else:
             # Original formula without fees
             ev = (win_prob * payout) - (loss_prob * stake)

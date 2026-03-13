@@ -54,6 +54,9 @@ class AdaptiveCityManager:
         # Load existing state
         self.load_state()
 
+        # Re-evaluate all cities on startup (catches config changes like lowered min_trades)
+        self._startup_reevaluate()
+
         logger.info(f"📊 AdaptiveCityManager initialized: {len(self.city_stats)} cities tracked")
 
     def _load_config(self):
@@ -72,6 +75,13 @@ class AdaptiveCityManager:
             self.disable_win_rate = 0.40
             self.disable_hours = 24
             self.reenable_check_hours = 6
+
+    def _startup_reevaluate(self):
+        """Re-check all cities against current config on startup."""
+        for city in list(self.city_stats.keys()):
+            if not self._is_currently_disabled(city):
+                if self._check_and_disable(city):
+                    logger.info(f"🔄 Startup re-eval: disabled {city}")
 
     def load_state(self):
         """Load persisted state from JSON file"""

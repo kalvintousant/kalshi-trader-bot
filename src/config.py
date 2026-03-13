@@ -30,11 +30,11 @@ class Config:
     
     # Weather Strategy Parameters
     # Conservative strategy
-    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '8.0'))  # Minimum edge % to trade (relaxed to 8% for paper trading volume)
+    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '8.0'))  # Minimum edge % to trade (wider stds + calibration discount already reduce overconfidence)
     MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.02'))  # Minimum EV in dollars (relaxed for paper trading data collection)
     # If True, only trade when confidence interval does NOT overlap market price (stricter).
     # If False (default), trade when edge/EV meet thresholds even if CI overlaps (more trades, higher risk).
-    REQUIRE_HIGH_CONFIDENCE = os.getenv('REQUIRE_HIGH_CONFIDENCE', 'false').lower() == 'true'
+    REQUIRE_HIGH_CONFIDENCE = os.getenv('REQUIRE_HIGH_CONFIDENCE', 'true').lower() == 'true'
     
     # Longshot strategy
     LONGSHOT_ENABLED = os.getenv('LONGSHOT_ENABLED', 'false').lower() == 'true'  # Disabled until probability model validated
@@ -49,16 +49,20 @@ class Config:
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '1'))  # 1-day horizon: only trade today/tomorrow (forecasts most accurate)
     # Never buy at or above this price (cents). Data shows 51-75¢ entries lose money (42% win rate).
-    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '55'))  # Allow moderately priced contracts; scaled edge still guards >35c
-    MAX_NO_BUY_PRICE_CENTS = int(os.getenv('MAX_NO_BUY_PRICE_CENTS', '30'))  # NO bets at 40-50¢ are near coin-flips with bad risk/reward
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '92'))  # 92¢ ceiling — guardrails (market blend) prevent overconfidence; 93-99¢ not worth fees
+    MAX_NO_BUY_PRICE_CENTS = int(os.getenv('MAX_NO_BUY_PRICE_CENTS', '92'))  # Symmetric with YES — guardrails handle risk
     # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
     # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
-    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '2.0'))  # Skip trades within 2°F of threshold (raised from 1.0 after CHI loss)
+    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '3.0'))  # Skip trades within 3°F of threshold (lowered from 5.0; 5°F blocked everything)
+    # Skip contracts where threshold is MORE than this many degrees from forecast mean
+    # (prevents "tail trades" — cheap contracts far from prediction that never hit). 0 = disabled.
+    MAX_THRESHOLD_DISTANCE = float(os.getenv('MAX_THRESHOLD_DISTANCE', '4.0'))  # ~2 Kalshi buckets (2°F each); Boz uses 2 buckets
     OBSERVATION_MIN_BUFFER = float(os.getenv('OBSERVATION_MIN_BUFFER', '2.0'))  # Observed temp must be ≥2°F past threshold to count as "determined"
 
     # Forecast quality gates
     MIN_FORECAST_SOURCES = int(os.getenv('MIN_FORECAST_SOURCES', '2'))  # Need >=2 independent forecasts (rate-limited sources often 429)
     MIN_FORECAST_SPREAD = float(os.getenv('MIN_FORECAST_SPREAD', '0.5'))  # Minimum std across forecasts (°F) — blocks correlated sources
+    GLOBAL_MIN_STD = float(os.getenv('GLOBAL_MIN_STD', '2.5'))  # Global minimum std floor (°F) for probability distributions (lowered from 4.0; guardrails prevent overconfidence)
 
     # Forecast direction gate: only trade when the forecast mean supports the bet direction
     # For "below" markets (YES = temp < T): require forecast mean < threshold
@@ -98,8 +102,8 @@ class Config:
 
     # Bias correction settings
     ENABLE_BIAS_CORRECTION = os.getenv('ENABLE_BIAS_CORRECTION', 'true').lower() == 'true'
-    MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '10'))  # Min samples before applying bias correction
-    MAX_BIAS_CORRECTION_F = float(os.getenv('MAX_BIAS_CORRECTION_F', '3.0'))  # Cap bias correction magnitude (°F)
+    MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '3'))  # Min samples before applying bias correction (lowered from 10; with 12 trades we never hit 10)
+    MAX_BIAS_CORRECTION_F = float(os.getenv('MAX_BIAS_CORRECTION_F', '8.0'))  # Cap bias correction magnitude (°F) (raised from 3.0; actual biases are -13 to -18°F)
     NWS_SOURCE_WEIGHT = float(os.getenv('NWS_SOURCE_WEIGHT', '1.5'))  # Extra weight for NWS (Kalshi settles on NWS CLI)
 
     # Exit/Sell Logic
@@ -114,7 +118,7 @@ class Config:
     # Scaled Edge Requirements (require more edge for expensive contracts)
     SCALED_EDGE_ENABLED = os.getenv('SCALED_EDGE_ENABLED', 'true').lower() == 'true'
     SCALED_EDGE_PRICE_THRESHOLD = int(os.getenv('SCALED_EDGE_PRICE_THRESHOLD', '35'))  # Apply scaling above 35¢
-    SCALED_EDGE_MULTIPLIER = float(os.getenv('SCALED_EDGE_MULTIPLIER', '1.2'))  # Require 1.2x edge for expensive contracts (relaxed from 1.5)
+    SCALED_EDGE_MULTIPLIER = float(os.getenv('SCALED_EDGE_MULTIPLIER', '1.0'))  # 1.0 = disabled — guardrail market blend already prevents overconfidence on expensive contracts
 
     # Market Making Mode (post limit orders at better prices instead of paying the ask)
     MARKET_MAKING_ENABLED = os.getenv('MARKET_MAKING_ENABLED', 'true').lower() == 'true'
@@ -158,7 +162,7 @@ class Config:
     # Enable/disable adaptive city management (auto-disable poor performers)
     ADAPTIVE_ENABLED = os.getenv('ADAPTIVE_ENABLED', 'true').lower() == 'true'
     # Minimum trades before evaluating city performance (lowered from 20 for faster response)
-    ADAPTIVE_MIN_TRADES = int(os.getenv('ADAPTIVE_MIN_TRADES', '10'))
+    ADAPTIVE_MIN_TRADES = int(os.getenv('ADAPTIVE_MIN_TRADES', '4'))  # Lowered from 8 — allows faster city disabling with limited trade volume
     # Disable city if win rate falls below this threshold (raised from 40% — need >50% to be profitable)
     ADAPTIVE_DISABLE_WIN_RATE = float(os.getenv('ADAPTIVE_DISABLE_WIN_RATE', '0.50'))
     # How long to disable a city (in hours) — extended from 24h to 72h for meaningful cooldown
@@ -185,6 +189,15 @@ class Config:
     COOLDOWN_ENABLED = os.getenv('COOLDOWN_ENABLED', 'false').lower() == 'true'
     COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '30'))  # Pause duration after a single loss
     COOLDOWN_SESSION_PAUSE_LOSSES = int(os.getenv('COOLDOWN_SESSION_PAUSE_LOSSES', '3'))  # Consecutive losses to pause rest of day
+
+    # Calibration discount (shrink probabilities toward 50% to combat overconfidence)
+    CALIBRATION_DISCOUNT = float(os.getenv('CALIBRATION_DISCOUNT', '1.0'))  # Multiply our_prob_yes by this factor (1.0 = no discount; wider stds handle conservatism)
+
+    # Guardrails: Prevent model from fighting market consensus (inspired by Boz)
+    GUARDRAIL_ENABLED = os.getenv('GUARDRAIL_ENABLED', 'true').lower() == 'true'
+    GUARDRAIL_MARKET_FLOOR = float(os.getenv('GUARDRAIL_MARKET_FLOOR', '0.15'))  # Skip YES when market < 15¢
+    GUARDRAIL_MAX_DIVERGENCE = float(os.getenv('GUARDRAIL_MAX_DIVERGENCE', '0.25'))  # Max ±25% from market
+    GUARDRAIL_MODEL_WEIGHT = float(os.getenv('GUARDRAIL_MODEL_WEIGHT', '0.40'))  # 40% model, 60% market
 
     # City/Season Error Std (per-city, per-season forecast uncertainty floor)
     CITY_SEASON_STD_ENABLED = os.getenv('CITY_SEASON_STD_ENABLED', 'true').lower() == 'true'
