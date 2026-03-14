@@ -14,6 +14,109 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Fixed-point API migration helpers (March 2026)
+# Kalshi moved from integer-cents fields to dollar-denominated strings.
+# These helpers convert new fields back to legacy integer-cents at the API
+# boundary so the rest of the codebase needs ZERO changes.
+# ---------------------------------------------------------------------------
+
+def _dollars_to_cents(dollar_string) -> int:
+    """'0.9200' → 92. Returns 0 for None/empty."""
+    if not dollar_string:
+        return 0
+    try:
+        return int(round(float(dollar_string) * 100))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _fp_to_int(fp_string) -> int:
+    """'13.00' → 13. Returns 0 for None/empty."""
+    if not fp_string:
+        return 0
+    try:
+        return int(round(float(fp_string)))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _cents_to_dollars(cents: int) -> str:
+    """92 → '0.92'. For outbound order creation."""
+    return f"{cents / 100:.2f}"
+
+
+def _normalize_market(market: dict) -> dict:
+    """Inject legacy integer-cents fields from new dollar-string fields."""
+    if not market:
+        return market
+
+    # Price fields: _dollars → cents
+    if 'yes_bid' not in market and 'yes_bid_dollars' in market:
+        market['yes_bid'] = _dollars_to_cents(market.get('yes_bid_dollars'))
+    if 'yes_ask' not in market and 'yes_ask_dollars' in market:
+        market['yes_ask'] = _dollars_to_cents(market.get('yes_ask_dollars'))
+    if 'no_bid' not in market and 'no_bid_dollars' in market:
+        market['no_bid'] = _dollars_to_cents(market.get('no_bid_dollars'))
+    if 'no_ask' not in market and 'no_ask_dollars' in market:
+        market['no_ask'] = _dollars_to_cents(market.get('no_ask_dollars'))
+    if 'last_price' not in market and 'last_price_dollars' in market:
+        market['last_price'] = _dollars_to_cents(market.get('last_price_dollars'))
+
+    # yes_price = what you pay for YES = ask price (legacy convention)
+    if 'yes_price' not in market and 'yes_ask_dollars' in market:
+        market['yes_price'] = _dollars_to_cents(market.get('yes_ask_dollars'))
+    # no_price = what you pay for NO = no ask price
+    if 'no_price' not in market and 'no_ask_dollars' in market:
+        market['no_price'] = _dollars_to_cents(market.get('no_ask_dollars'))
+
+    # Count/volume fields: _fp → int
+    if 'volume' not in market and 'volume_fp' in market:
+        market['volume'] = _fp_to_int(market.get('volume_fp'))
+    if 'open_interest' not in market and 'open_interest_fp' in market:
+        market['open_interest'] = _fp_to_int(market.get('open_interest_fp'))
+
+    return market
+
+
+def _normalize_orderbook(response: dict) -> dict:
+    """Convert orderbook_fp.yes_dollars → orderbook.yes with [[cents, qty], ...]."""
+    if not response:
+        return response
+
+    fp = response.get('orderbook_fp')
+    if fp and 'orderbook' not in response:
+        ob = {}
+        for side in ('yes', 'no'):
+            dollar_key = f'{side}_dollars'
+            if dollar_key in fp:
+                ob[side] = [
+                    [_dollars_to_cents(entry[0]), _fp_to_int(entry[1])]
+                    for entry in fp[dollar_key]
+                    if len(entry) >= 2
+                ]
+            else:
+                ob[side] = []
+        response['orderbook'] = ob
+
+    return response
+
+
+def _normalize_order(order: dict) -> dict:
+    """Inject legacy price fields on orders/fills."""
+    if not order:
+        return order
+
+    if 'yes_price' not in order and 'yes_price_dollars' in order:
+        order['yes_price'] = _dollars_to_cents(order.get('yes_price_dollars'))
+    if 'no_price' not in order and 'no_price_dollars' in order:
+        order['no_price'] = _dollars_to_cents(order.get('no_price_dollars'))
+    if 'count' not in order and 'count_fp' in order:
+        order['count'] = _fp_to_int(order.get('count_fp'))
+
+    return order
+
+
 class KalshiClient:
     """Client for interacting with Kalshi API"""
     
@@ -116,7 +219,8 @@ class KalshiClient:
         # Remove query string from path for signing
         path_for_signing = path.split('?')[0]
         # Kalshi requires the full path including /trade-api/v2 for signing
-        if not path_for_signing.startswith('/trade-api/v2'):
+        # But WS paths like /trade-api/ws/v2 should be kept as-is
+        if not path_for_signing.startswith('/trade-api/'):
             path_for_signing = '/trade-api/v2' + path_for_signing
         msg_string = timestamp + method + path_for_signing
         signature = self._sign_pss_text(msg_string)
@@ -282,7 +386,7 @@ class KalshiClient:
             params['series_ticker'] = series_ticker
 
         response = self._get('/markets', params=params)
-        markets = response.get('markets', [])
+        markets = [_normalize_market(m) for m in response.get('markets', [])]
         self.markets_cache[cache_key] = (markets, time.time())
         return markets
 
@@ -292,7 +396,8 @@ class KalshiClient:
     
     def get_market_orderbook(self, market_ticker: str, use_cache: bool = True) -> Dict:
         """Get orderbook for a specific market with caching"""
-        return self._get(f"/markets/{market_ticker}/orderbook", use_cache=use_cache)
+        response = self._get(f"/markets/{market_ticker}/orderbook", use_cache=use_cache)
+        return _normalize_orderbook(response)
 
     def get_orderbook_with_ws_cache(self, market_ticker: str, ws_cache=None, use_cache: bool = True) -> Dict:
         """Get orderbook, checking WebSocket cache first for faster reads.
@@ -347,7 +452,7 @@ class KalshiClient:
         if status:
             params['status'] = status
         response = self._get('/portfolio/orders', params=params)
-        orders = response.get('orders', [])
+        orders = [_normalize_order(o) for o in response.get('orders', [])]
         self.orders_cache[cache_key] = (orders, time.time())
         return orders
 
@@ -377,7 +482,7 @@ class KalshiClient:
         if ticker:
             params['ticker'] = ticker
         response = self._get('/portfolio/fills', params=params)
-        return response.get('fills', [])
+        return [_normalize_order(f) for f in response.get('fills', [])]
 
     def get_all_fills(self, since_ts: Optional[int] = None, ticker: Optional[str] = None,
                       action_filter: Optional[str] = 'buy') -> List[Dict]:
@@ -398,6 +503,7 @@ class KalshiClient:
             resp = self._get('/portfolio/fills', params=params)
             fills = resp.get('fills', [])
             for f in fills:
+                f = _normalize_order(f)
                 if action_filter is None or (f.get('action') or 'buy').lower() == action_filter:
                     all_fills.append(f)
             cursor = resp.get('cursor')
@@ -431,7 +537,9 @@ class KalshiClient:
 
     def get_market(self, ticker: str) -> Dict:
         """Get details for a specific market"""
-        return self._get(f'/markets/{ticker}')
+        response = self._get(f'/markets/{ticker}')
+        market = response.get('market', response)
+        return _normalize_market(market)
     
     # Trading Methods
     def create_order(self, ticker: str, action: str, side: str, 
@@ -443,19 +551,19 @@ class KalshiClient:
             'ticker': ticker,
             'action': action,  # 'buy' or 'sell'
             'side': side,  # 'yes' or 'no'
-            'count': count,
+            'count_fp': f"{count:.2f}",
             'type': order_type  # 'limit' or 'market'
         }
-        
+
         if yes_price is not None:
-            order_data['yes_price'] = yes_price
+            order_data['yes_price_dollars'] = _cents_to_dollars(yes_price)
         if no_price is not None:
-            order_data['no_price'] = no_price
+            order_data['no_price_dollars'] = _cents_to_dollars(no_price)
         if client_order_id:
             order_data['client_order_id'] = client_order_id
-        
+
         response = self._post('/portfolio/orders', order_data)
-        return response.get('order', {})
+        return _normalize_order(response.get('order', {}))
     
     def cancel_order(self, order_id: str) -> Dict:
         """Cancel an order"""
@@ -466,13 +574,13 @@ class KalshiClient:
         """Amend an existing order"""
         data = {}
         if yes_price is not None:
-            data['yes_price'] = yes_price
+            data['yes_price_dollars'] = _cents_to_dollars(yes_price)
         if no_price is not None:
-            data['no_price'] = no_price
+            data['no_price_dollars'] = _cents_to_dollars(no_price)
         if count is not None:
-            data['count'] = count
-        
-        return self._put(f"/portfolio/orders/{order_id}", data)
+            data['count_fp'] = f"{count:.2f}"
+
+        return _normalize_order(self._put(f"/portfolio/orders/{order_id}", data))
     
     # WebSocket Methods
     async def connect_websocket(self, message_handler):

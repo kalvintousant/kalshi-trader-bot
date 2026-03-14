@@ -1,6 +1,9 @@
 #!/bin/bash
 # Clean Start Script - Forces fresh Python environment
 # Use this if the bot won't start due to cached bytecode
+# Usage: ./clean_start.sh [--reset-strategy]
+#   --reset-strategy: Reset strategy-dependent state (adaptive, settlement, ML)
+#                     while keeping weather model accuracy data
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "🧹 CLEAN START - Kalshi Trading Bot"
@@ -24,15 +27,28 @@ rm -rf src/__pycache__ 2>/dev/null
 rm -rf __pycache__ 2>/dev/null
 echo "   ✅ Cache cleared"
 
+# Reset strategy-dependent state if requested
+if [[ "$1" == "--reset-strategy" ]]; then
+    echo ""
+    echo "3. Resetting strategy-dependent learned state..."
+    rm -f data/adaptive_state.json data/settlement_divergence.json data/ml_model.pkl 2>/dev/null
+    echo "   Removed: adaptive_state.json, settlement_divergence.json, ml_model.pkl"
+    echo "   Kept: learned_state.json, forecasts.db, city_errors.json, outcomes.csv, trades.csv"
+    echo "   ✅ Strategy state reset (cities re-enabled, confidence=1.0x, ML will retrain)"
+fi
+
 # Remove old logs
 echo ""
-echo "3. Removing old log files..."
+STEP=3
+[ "$1" == "--reset-strategy" ] && STEP=4
+echo "${STEP}. Removing old log files..."
 rm -f bot_output.log nohup.out 2>/dev/null
 echo "   ✅ Logs cleared"
+STEP=$((STEP + 1))
 
 # Verify the fix is in place
 echo ""
-echo "4. Verifying code fix..."
+echo "${STEP}. Verifying code fix..."
 if grep -q "# Don't call super() - this is the base class" src/strategies.py; then
     echo "   ✅ Fix verified: TradingStrategy doesn't call super()"
 else
@@ -41,7 +57,8 @@ fi
 
 # Start bot with fresh Python (no bytecode)
 echo ""
-echo "5. Starting bot with clean Python environment..."
+STEP=$((STEP + 1))
+echo "${STEP}. Starting bot with clean Python environment..."
 echo "   Using PYTHONDONTWRITEBYTECODE=1 to prevent cache"
 echo ""
 
@@ -61,7 +78,8 @@ echo "   🚀 Bot started with PID: $BOT_PID"
 echo ""
 
 # Wait for startup
-echo "6. Waiting for bot to initialize (8 seconds)..."
+STEP=$((STEP + 1))
+echo "${STEP}. Waiting for bot to initialize (8 seconds)..."
 sleep 8
 
 # Check if bot is running

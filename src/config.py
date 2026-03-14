@@ -20,9 +20,10 @@ class Config:
     WS_URL = os.getenv('KALSHI_WS_URL', 'wss://api.elections.kalshi.com/trade-api/ws/v2')
     
     # Trading Settings
-    MAX_POSITION_SIZE = int(os.getenv('MAX_POSITION_SIZE', '10'))
+    MAX_POSITION_SIZE = int(os.getenv('MAX_POSITION_SIZE', '1'))
     MAX_DAILY_LOSS = int(os.getenv('MAX_DAILY_LOSS', '10'))  # $10 max daily loss limit
     MAX_CONTRACTS_PER_MARKET = int(os.getenv('MAX_CONTRACTS_PER_MARKET', '10'))  # Max contracts per base market
+    MAX_CONTRACTS_PER_BRACKET = int(os.getenv('MAX_CONTRACTS_PER_BRACKET', '1'))  # Max contracts per individual bracket/threshold
     MAX_DOLLARS_PER_MARKET = float(os.getenv('MAX_DOLLARS_PER_MARKET', '5.0'))  # Max dollars per base market
     # Skip placing an order if computed size would be below this (avoids many 1-contract orders).
     MIN_ORDER_CONTRACTS = int(os.getenv('MIN_ORDER_CONTRACTS', '1'))  # 1 = allow 1-contract orders; 2+ = require at least that many
@@ -51,12 +52,6 @@ class Config:
     # Never buy at or above this price (cents). Data shows 51-75¢ entries lose money (42% win rate).
     MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '92'))  # 92¢ ceiling — guardrails (market blend) prevent overconfidence; 93-99¢ not worth fees
     MAX_NO_BUY_PRICE_CENTS = int(os.getenv('MAX_NO_BUY_PRICE_CENTS', '92'))  # Symmetric with YES — guardrails handle risk
-    # Skip single-threshold markets when mean forecast is within this many degrees of the threshold
-    # (reduces "coin flip" losses when actual lands right on the boundary). 0 = disabled.
-    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '3.0'))  # Skip trades within 3°F of threshold (lowered from 5.0; 5°F blocked everything)
-    # Skip contracts where threshold is MORE than this many degrees from forecast mean
-    # (prevents "tail trades" — cheap contracts far from prediction that never hit). 0 = disabled.
-    MAX_THRESHOLD_DISTANCE = float(os.getenv('MAX_THRESHOLD_DISTANCE', '4.0'))  # ~2 Kalshi buckets (2°F each); Boz uses 2 buckets
     OBSERVATION_MIN_BUFFER = float(os.getenv('OBSERVATION_MIN_BUFFER', '2.0'))  # Observed temp must be ≥2°F past threshold to count as "determined"
 
     # Forecast quality gates
@@ -72,6 +67,9 @@ class Config:
     # Forecast disagreement gates
     MAX_FORECAST_CLUSTER_GAP = float(os.getenv('MAX_FORECAST_CLUSTER_GAP', '8.0'))  # Skip if lower/upper forecast halves differ by >8°F
     MAX_CI_WIDTH = float(os.getenv('MAX_CI_WIDTH', '0.50'))  # Skip if confidence interval spans >50 percentage points
+
+    # HIGH-only mode (Boz-style: only trade daily HIGH markets, skip LOW)
+    HIGH_ONLY = os.getenv('HIGH_ONLY', 'true').lower() == 'true'
 
     # Range market boundary guard
     RANGE_BOUNDARY_MIN_DISTANCE = float(os.getenv('RANGE_BOUNDARY_MIN_DISTANCE', '3.0'))  # Skip range markets when forecast is within 3°F of boundary
@@ -186,8 +184,8 @@ class Config:
     POSTMORTEM_ENABLED = os.getenv('POSTMORTEM_ENABLED', 'true').lower() == 'true'
 
     # Cooldown Timer (pause trading after losses)
-    COOLDOWN_ENABLED = os.getenv('COOLDOWN_ENABLED', 'false').lower() == 'true'
-    COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '30'))  # Pause duration after a single loss
+    COOLDOWN_ENABLED = os.getenv('COOLDOWN_ENABLED', 'true').lower() == 'true'
+    COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '60'))  # Pause duration after a single loss
     COOLDOWN_SESSION_PAUSE_LOSSES = int(os.getenv('COOLDOWN_SESSION_PAUSE_LOSSES', '3'))  # Consecutive losses to pause rest of day
 
     # Calibration discount (shrink probabilities toward 50% to combat overconfidence)
@@ -212,6 +210,8 @@ class Config:
     ML_BLEND_WEIGHT = float(os.getenv('ML_BLEND_WEIGHT', '0.3'))  # Weight for ML prediction in mean blend (0.0-1.0)
     ML_MIN_TRAINING_SAMPLES = int(os.getenv('ML_MIN_TRAINING_SAMPLES', '60'))  # Min samples to train ML model
     ML_RETRAIN_INTERVAL_DAYS = int(os.getenv('ML_RETRAIN_INTERVAL_DAYS', '7'))  # Retrain weekly
+    ML_RETRAIN_BRIER_THRESHOLD = float(os.getenv('ML_RETRAIN_BRIER_THRESHOLD', '0.25'))  # Retrain if Brier score exceeds this
+    ML_RETRAIN_MIN_NEW_SETTLEMENTS = int(os.getenv('ML_RETRAIN_MIN_NEW_SETTLEMENTS', '25'))  # Retrain after N new settlements
     ML_MAX_RMSE = float(os.getenv('ML_MAX_RMSE', '5.0'))  # Reject model if RMSE exceeds this (°F)
 
     # Hard-disabled cities (bypasses all other filters — will never trade)

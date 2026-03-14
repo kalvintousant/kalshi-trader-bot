@@ -203,7 +203,40 @@ class TradingStrategy:
                 'base_market': market_ticker,
                 'sides_held': set()
             }
-    
+
+    def _get_bracket_exposure(self, market_ticker: str) -> int:
+        """Get existing contract count on this exact ticker (bracket/threshold level).
+
+        Counts both current positions and resting orders on this specific ticker,
+        NOT the base market. Used for per-bracket position caps.
+        """
+        total = 0
+        try:
+            positions = self.client.get_positions()
+            for pos in positions:
+                if pos.get('ticker', '') == market_ticker:
+                    total += abs(pos.get('position', 0))
+        except Exception as e:
+            logger.debug(f"Could not fetch positions for bracket {market_ticker}: {e}")
+            return Config.MAX_CONTRACTS_PER_BRACKET  # Assume at limit if we can't check
+
+        try:
+            orders = self._get_resting_orders()
+            for order in orders:
+                if order.get('ticker', '') == market_ticker:
+                    total += order.get('remaining_count', 0)
+        except Exception as e:
+            logger.debug(f"Could not fetch orders for bracket {market_ticker}: {e}")
+            return Config.MAX_CONTRACTS_PER_BRACKET
+
+        # Include paper trades tracked in active_positions (keyed by market_ticker)
+        if Config.PAPER_TRADING and hasattr(self, 'active_positions'):
+            ap = self.active_positions.get(market_ticker)
+            if ap:
+                total += ap.get('count', 0)
+
+        return total
+
     def should_trade(self, market: Dict) -> bool:
         """Determine if we should trade this market"""
         raise NotImplementedError
@@ -1098,6 +1131,17 @@ class WeatherDailyStrategy(TradingStrategy):
         if liquidity_cap < base_position:
             logger.debug(f"Liquidity cap applied: {liquidity_cap} contracts (was {base_position})")
 
+        # Per-bracket (individual ticker) position cap — prevents overconcentration on a single threshold
+        bracket_cap = Config.MAX_CONTRACTS_PER_BRACKET
+        existing_on_bracket = self._get_bracket_exposure(market_ticker)
+        bracket_remaining = max(0, bracket_cap - existing_on_bracket)
+        if bracket_remaining == 0:
+            logger.debug(f"📊 SKIP {market_ticker}: at bracket cap ({existing_on_bracket}/{bracket_cap} contracts on this ticker)")
+            return None
+        if bracket_remaining < position_size:
+            logger.debug(f"Bracket cap applied: {bracket_remaining} contracts (was {position_size}, {existing_on_bracket}/{bracket_cap} on ticker)")
+            position_size = bracket_remaining
+
         # Skip if no room or below minimum order size
         if position_size <= 0:
             logger.debug(f"📊 SKIP {market_ticker}: {strategy_mode} {side.upper()} ok but no capacity (position_size=0)")
@@ -1457,6 +1501,10 @@ class WeatherDailyStrategy(TradingStrategy):
             is_high_market = series_ticker.startswith('KXHIGH')
             is_low_market = series_ticker.startswith('KXLOW')
 
+            if is_low_market and getattr(Config, 'HIGH_ONLY', False):
+                logger.debug(f"📊 SKIP {market_ticker}: LOW market disabled (HIGH_ONLY mode)")
+                return None
+
             from zoneinfo import ZoneInfo
             tz_name = self.weather_agg.CITY_TIMEZONES.get(series_ticker)
             if tz_name:
@@ -1629,24 +1677,6 @@ class WeatherDailyStrategy(TradingStrategy):
             # We'll create a fine-grained distribution first, then map to brackets
             mean_forecast = sum(forecasts) / len(forecasts)
 
-            # Skip single-threshold markets when forecast is too close to threshold (high uncertainty)
-            min_deg = getattr(Config, 'MIN_DEGREES_FROM_THRESHOLD', 0)
-            if min_deg > 0 and not isinstance(threshold, tuple):
-                if abs(mean_forecast - threshold) < min_deg:
-                    logger.info(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° within {min_deg}° of threshold {threshold}° (reduce coin-flip losses)")
-                    return None
-
-            # --- TAIL DISTANCE GUARD (single-threshold markets) ---
-            # Skip contracts where the threshold is far from our forecast mean.
-            # These are cheap "lottery tickets" (e.g., model says 70°F but trading 80°F+)
-            # that look good on EV but never hit. Boz limits to within 2 buckets (~4°F).
-            max_thresh_dist = getattr(Config, 'MAX_THRESHOLD_DISTANCE', 0)
-            if max_thresh_dist > 0 and not isinstance(threshold, tuple):
-                dist = abs(mean_forecast - threshold)
-                if dist > max_thresh_dist:
-                    logger.info(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° is {dist:.1f}°F from threshold {threshold}° (max {max_thresh_dist}°F — tail trade)")
-                    return None
-
             # --- NEAR-BOUNDARY GUARD (range markets) ---
             # Skip range markets where the mean forecast is close to the range boundary.
             # A small forecast error (1-2°F) can flip the outcome entirely when the mean
@@ -1765,14 +1795,16 @@ class WeatherDailyStrategy(TradingStrategy):
             # --- GUARDRAILS: Prevent model from overriding market consensus ---
             yes_blocked_by_floor = False
             if getattr(Config, 'GUARDRAIL_ENABLED', True):
-                market_yes_prob = best_yes_ask / 100.0
+                # Use mid-price as market's implied probability (consensus),
+                # not the ask (which biases high and shrinks YES edge)
+                market_yes_prob = (best_yes_bid + best_yes_ask) / 2.0 / 100.0
                 raw_prob = our_prob
 
                 # Layer 1: Market probability floor — hard skip YES on very cheap contracts
                 # (cheap YES = lottery ticket; NO side still tradeable since it's expensive = high conviction)
                 market_prob_floor = getattr(Config, 'GUARDRAIL_MARKET_FLOOR', 0.15)
                 if market_yes_prob < market_prob_floor:
-                    logger.info(f"📊 SKIP YES {market_ticker}: market floor — YES ask {best_yes_ask}¢ < {int(market_prob_floor * 100)}¢ floor (lottery ticket)")
+                    logger.info(f"📊 SKIP YES {market_ticker}: market floor — YES mid {market_yes_prob:.0%} < {market_prob_floor:.0%} floor (lottery ticket)")
                     # Flag so YES candidate is blocked below; NO side proceeds normally
                     yes_blocked_by_floor = True
                 else:

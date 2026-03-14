@@ -107,12 +107,10 @@ def run_ws_cache(ws_cache: WsPriceCache, client):
 
                 # Get auth headers from client
                 headers = {}
-                if hasattr(client, '_get_auth_headers'):
-                    headers = client._get_auth_headers()
-                elif hasattr(client, 'get_auth_headers'):
-                    headers = client.get_auth_headers()
+                if hasattr(client, '_create_headers'):
+                    headers = client._create_headers('GET', '/trade-api/ws/v2')
 
-                async with websockets.connect(ws_url, extra_headers=headers) as ws:
+                async with websockets.connect(ws_url, additional_headers=headers) as ws:
                     ws_cache.set_connected(True)
                     logger.info("WebSocket connected for price cache")
 
@@ -134,8 +132,22 @@ def run_ws_cache(ws_cache: WsPriceCache, client):
                             if msg_type == 'ticker':
                                 ticker_data = data.get('msg', data.get('data', {}))
                                 ticker = ticker_data.get('market_ticker', '')
-                                yes_bid = ticker_data.get('yes_bid', 0)
-                                yes_ask = ticker_data.get('yes_ask', 0)
+                                # Handle both legacy int fields and new dollar-string fields
+                                yes_bid_raw = ticker_data.get('yes_bid')
+                                yes_ask_raw = ticker_data.get('yes_ask')
+                                if yes_bid_raw is None and 'yes_bid_dollars' in ticker_data:
+                                    yes_bid_raw = ticker_data['yes_bid_dollars']
+                                if yes_ask_raw is None and 'yes_ask_dollars' in ticker_data:
+                                    yes_ask_raw = ticker_data['yes_ask_dollars']
+                                # Convert strings to cents if needed
+                                if isinstance(yes_bid_raw, str):
+                                    yes_bid = int(round(float(yes_bid_raw) * 100)) if yes_bid_raw else 0
+                                else:
+                                    yes_bid = yes_bid_raw or 0
+                                if isinstance(yes_ask_raw, str):
+                                    yes_ask = int(round(float(yes_ask_raw) * 100)) if yes_ask_raw else 0
+                                else:
+                                    yes_ask = yes_ask_raw or 0
                                 if ticker:
                                     ws_cache.update_ticker(ticker, yes_bid, yes_ask)
 

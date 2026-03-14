@@ -74,6 +74,7 @@ class MLPredictor:
         self.trained = False
         self.last_train_time = None
         self.training_samples = 0
+        self.settlements_at_last_train = 0
 
         self._load_model()
 
@@ -94,6 +95,7 @@ class MLPredictor:
             self.trained = state.get('trained', False)
             self.last_train_time = state.get('last_train_time')
             self.training_samples = state.get('training_samples', 0)
+            self.settlements_at_last_train = state.get('settlements_at_last_train', 0)
             if self.trained:
                 logger.info(f"📊 ML model loaded: {self.training_samples} samples, "
                           f"Ridge RMSE={self.ridge_rmse:.2f}°F, RF RMSE={self.rf_rmse:.2f}°F")
@@ -114,6 +116,7 @@ class MLPredictor:
                 'trained': self.trained,
                 'last_train_time': self.last_train_time,
                 'training_samples': self.training_samples,
+                'settlements_at_last_train': self.settlements_at_last_train,
             }
             with open(self.model_path, 'wb') as f:
                 pickle.dump(state, f)
@@ -336,6 +339,7 @@ class MLPredictor:
         self.trained = True
         self.last_train_time = datetime.now().isoformat()
         self.training_samples = len(X)
+        self.settlements_at_last_train = self._count_settlements()
         self._save_model()
 
         logger.info(f"ML model trained: {self.training_samples} samples, "
@@ -388,10 +392,56 @@ class MLPredictor:
             logger.debug(f"ML prediction error: {e}")
             return None
 
+    def _count_settlements(self) -> int:
+        """Count total settled outcomes for settlement-based retrain trigger."""
+        outcomes_file = Path("data/paper_outcomes.csv") if Config.PAPER_TRADING else Path("data/outcomes.csv")
+        if not outcomes_file.exists():
+            return 0
+        try:
+            count = 0
+            with open(outcomes_file, 'r') as f:
+                for row in csv.DictReader(f):
+                    if row.get('result') in ('yes', 'no'):
+                        count += 1
+            return count
+        except Exception:
+            return 0
+
     def needs_retrain(self) -> bool:
-        """Check if model needs retraining (weekly schedule)."""
+        """Check if model needs retraining.
+
+        Triggers on any of:
+        1. Brier score exceeds ML_RETRAIN_BRIER_THRESHOLD (calibration degraded)
+        2. New settlements since last train >= ML_RETRAIN_MIN_NEW_SETTLEMENTS
+        3. Time-based: days since last train >= ML_RETRAIN_INTERVAL_DAYS (fallback)
+        """
         if not self.last_train_time:
             return True
+
+        # Check Brier score trigger
+        try:
+            from .calibration import CalibrationTracker
+            cal = CalibrationTracker()
+            result = cal.compute()
+            if result and result.get('brier_score') is not None:
+                brier = result['brier_score']
+                if brier > Config.ML_RETRAIN_BRIER_THRESHOLD:
+                    logger.info(f"ML retrain triggered: Brier score {brier:.3f} > {Config.ML_RETRAIN_BRIER_THRESHOLD}")
+                    return True
+        except Exception as e:
+            logger.debug(f"Could not check Brier score for retrain trigger: {e}")
+
+        # Check settlement count trigger
+        try:
+            current_settlements = self._count_settlements()
+            new_since_train = current_settlements - self.settlements_at_last_train
+            if new_since_train >= Config.ML_RETRAIN_MIN_NEW_SETTLEMENTS:
+                logger.info(f"ML retrain triggered: {new_since_train} new settlements since last train (threshold: {Config.ML_RETRAIN_MIN_NEW_SETTLEMENTS})")
+                return True
+        except Exception as e:
+            logger.debug(f"Could not check settlement count for retrain trigger: {e}")
+
+        # Time-based fallback
         try:
             last = datetime.fromisoformat(self.last_train_time)
             days_since = (datetime.now() - last).days
