@@ -71,6 +71,11 @@ class Config:
     # HIGH-only mode (Boz-style: only trade daily HIGH markets, skip LOW)
     HIGH_ONLY = os.getenv('HIGH_ONLY', 'true').lower() == 'true'
 
+    # Day-over-day volatility std boost (widen uncertainty during weather regime changes)
+    VOLATILITY_STD_ENABLED = os.getenv('VOLATILITY_STD_ENABLED', 'true').lower() == 'true'
+    VOLATILITY_THRESHOLD = float(os.getenv('VOLATILITY_THRESHOLD', '8.0'))  # °F day-over-day change before boost
+    VOLATILITY_STD_FRACTION = float(os.getenv('VOLATILITY_STD_FRACTION', '0.4'))  # Fraction of delta used as std floor
+
     # Range market boundary guard
     RANGE_BOUNDARY_MIN_DISTANCE = float(os.getenv('RANGE_BOUNDARY_MIN_DISTANCE', '3.0'))  # Skip range markets when forecast is within 3°F of boundary
 

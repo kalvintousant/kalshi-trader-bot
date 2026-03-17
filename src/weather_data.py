@@ -1678,6 +1678,32 @@ class WeatherDataAggregator:
             min_std = max(Config.GLOBAL_MIN_STD, historical_min)
         std_temp = max(std_temp, min_std)
 
+        # Day-over-day volatility boost: if yesterday's observed temp is far from
+        # today's forecast mean, the atmosphere is in transition and our std should
+        # reflect that uncertainty even if all sources tightly agree.
+        if Config.VOLATILITY_STD_ENABLED and series_ticker and target_date:
+            try:
+                from datetime import timedelta
+                yesterday = (target_date - timedelta(days=1))
+                if hasattr(yesterday, 'date'):
+                    yesterday = yesterday.date()
+                is_high = series_ticker.startswith('KXHIGH') or series_ticker.startswith('KXHIGHT')
+                if is_high:
+                    obs = self.get_observed_high_for_date(series_ticker, yesterday)
+                else:
+                    obs = self.get_observed_low_for_date(series_ticker, yesterday)
+                if obs is not None:
+                    yesterday_temp = obs[0]
+                    delta = abs(yesterday_temp - mean_temp)
+                    if delta > Config.VOLATILITY_THRESHOLD:
+                        volatility_std = delta * Config.VOLATILITY_STD_FRACTION
+                        if volatility_std > std_temp:
+                            logger.info(f"Volatility boost {series_ticker}: yesterday={yesterday_temp:.1f}F, "
+                                       f"forecast={mean_temp:.1f}F, delta={delta:.1f}F -> std {std_temp:.1f} -> {volatility_std:.1f}F")
+                            std_temp = volatility_std
+            except Exception as e:
+                logger.debug(f"Volatility std check failed for {series_ticker}: {e}")
+
         # Log the uncertainty source and value
         uncertainty_source = 'ensemble' if ensemble_std is not None else 'synthetic'
         logger.debug(f"Probability distribution for {series_ticker}: mean={mean_temp:.1f}°F, "
