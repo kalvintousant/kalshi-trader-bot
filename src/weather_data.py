@@ -853,9 +853,13 @@ class WeatherDataAggregator:
 
         return result
 
-    def apply_bias_correction(self, temp: float, source: str, series_ticker: str, month: int) -> float:
+    def apply_bias_correction(self, temp: float, source: str, series_ticker: str, month: int) -> Optional[float]:
         """
-        Apply model-specific bias correction based on historical errors
+        Apply model-specific bias correction based on historical errors.
+
+        Returns None when the source's learned bias for this city/month exceeds
+        UNRELIABLE_BIAS_THRESHOLD_F — a source that's >12°F off systematically
+        is too broken to trust even after correction; callers should drop it.
 
         Args:
             temp: Raw forecast temperature
@@ -864,7 +868,7 @@ class WeatherDataAggregator:
             month: Target month (1-12)
 
         Returns:
-            Bias-corrected temperature
+            Bias-corrected temperature, or None if the source should be dropped
         """
         city_base = extract_city_code(series_ticker)
 
@@ -874,6 +878,15 @@ class WeatherDataAggregator:
             return temp
 
         bias = self.model_bias[source][city_base][month]
+
+        # Drop the source entirely when bias is unreliably large
+        if abs(bias) > Config.UNRELIABLE_BIAS_THRESHOLD_F:
+            logger.warning(
+                f"🚫 DROP {source}/{city_base}/month{month}: bias={bias:+.1f}°F exceeds "
+                f"reliability threshold {Config.UNRELIABLE_BIAS_THRESHOLD_F}°F"
+            )
+            return None
+
         if bias != 0:
             # Cap bias to prevent catastrophic overcorrection
             max_bias = Config.MAX_BIAS_CORRECTION_F
@@ -1396,6 +1409,9 @@ class WeatherDataAggregator:
                             pass
                         # Apply bias correction (store raw temp for bias learning)
                         corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
+                        if corrected_temp is None:
+                            # Source dropped — bias too large to trust
+                            continue
                         forecast_data.append((corrected_temp, source, timestamp, temp))
                         weight = self.source_weights.get(source, 0.8)
                         logger.debug(f"  {source}: {corrected_temp:.1f}°F (raw={temp:.1f}°F, weight={weight:.2f})")
@@ -1419,8 +1435,11 @@ class WeatherDataAggregator:
                     except Exception:
                         pass
                     corrected_temp = self.apply_bias_correction(temp, source, series_ticker, target_date.month)
-                    forecast_data.append((corrected_temp, source, timestamp, temp))
-                    logger.debug(f"Using Weatherbit fallback for {series_ticker}")
+                    if corrected_temp is None:
+                        logger.debug(f"Weatherbit fallback dropped for {series_ticker} (bias too large)")
+                    else:
+                        forecast_data.append((corrected_temp, source, timestamp, temp))
+                        logger.debug(f"Using Weatherbit fallback for {series_ticker}")
             except Exception as e:
                 logger.debug(f"Error fetching from weatherbit (fallback): {e}")
 
@@ -1615,67 +1634,47 @@ class WeatherDataAggregator:
                 logger.debug(f"  Ensemble: std={ensemble_std:.1f}°F ({ensemble_data['n_members']} members from {ensemble_data['source']})")
 
         # Dynamic standard deviation calculation
-        if ensemble_std is not None:
-            # Ensemble-based uncertainty (preferred)
-            std_temp = ensemble_std
+        #
+        # Total uncertainty is the quadrature sum of three independent terms:
+        #   sigma_total^2 = sigma_ensemble^2 + sigma_source^2 + sigma_model^2
+        #
+        # where sigma_model is the historical RMSE of our aggregate forecast vs
+        # actual observed temp. Calibration backtest on 56 paper outcomes showed
+        # the Normal-CDF model without this term had Brier 0.3136 (vs market 0.2131);
+        # adding it (FAT_TAIL) improved Brier to 0.2792 and produced +$0.48 simulated
+        # P&L instead of -$0.54.
+        source_std = float(np.std(forecasts)) if len(forecasts) > 1 else 0.0
+        model_rmse = 0.0
+        if series_ticker and target_date:
+            model_rmse = self.get_historical_forecast_error(series_ticker, target_date.month)
 
-            # Blend with multi-source spread if available
-            if len(forecasts) > 1:
-                source_std = np.std(forecasts)
-                # Weight ensemble std higher (70%) but incorporate source spread (30%)
-                std_temp = 0.7 * ensemble_std + 0.3 * source_std
+        ensemble_component = ensemble_std if ensemble_std is not None else 0.0
+        variance_parts = [ensemble_component**2, source_std**2, model_rmse**2]
+        std_temp = float(np.sqrt(sum(variance_parts))) if any(v > 0 for v in variance_parts) else 3.5
 
-            # Add small time-based uncertainty for longer horizons
-            if target_date:
-                days_until = max(0, (target_date - datetime.now()).days)
-                # Smaller time penalty when we have ensemble data
-                time_uncertainty = days_until * 0.2  # 0.2°F per day
-                std_temp = np.sqrt(std_temp**2 + time_uncertainty**2)
+        # Add small time-based uncertainty for multi-day-out forecasts
+        if target_date:
+            days_until = max(0, (target_date - datetime.now()).days)
+            time_uncertainty = days_until * 0.3  # 0.3°F per day (was 0.2)
+            std_temp = float(np.sqrt(std_temp**2 + time_uncertainty**2))
 
-        elif len(forecasts) > 1:
-            # Fallback: Use actual std from forecast spread (synthetic uncertainty)
-            std_temp = np.std(forecasts)
-
-            # Add base uncertainty based on forecast horizon
-            if target_date:
-                total_hours = max(0, (target_date - datetime.now()).total_seconds() / 3600.0)
-                # Base uncertainty increases with time: +0.5°F per 24h (linear)
-                base_uncertainty = 1.0 + (total_hours * 0.5 / 24.0)
-                std_temp = max(std_temp, base_uncertainty)
-
-            # Incorporate historical forecast error if available
-            if series_ticker and target_date:
-                historical_error = self.get_historical_forecast_error(series_ticker, target_date.month)
-                # Blend actual std with historical error (weighted average)
-                std_temp = 0.5 * std_temp + 0.5 * historical_error
-        else:
-            # Only one forecast - use historical error or default
-            if series_ticker and target_date:
-                std_temp = self.get_historical_forecast_error(series_ticker, target_date.month)
-            else:
-                std_temp = 3.5  # Default std — matches real NWS MAE of ~2.5-3.5°F
-
-        # Ensure minimum std for stability
-        # Real forecast uncertainty is typically 2-4°F even for next-day forecasts
+        # Minimum std floor — NEVER replace the computed std, only raise it.
+        # City-error tracker contributes a floor from historical performance but
+        # cannot shrink the forecast uncertainty (this was the old bug).
         if is_range_market:
-            # Range markets need wider distribution — 2°F bin with tight std gives unrealistic probs
             min_std = getattr(Config, 'RANGE_MIN_STD_FLOOR', 3.0)
-        elif Config.CITY_SEASON_STD_ENABLED and series_ticker and target_date:
-            # Per-city, per-season floor from historical error tracking
-            try:
-                from .city_error_tracker import get_city_error_tracker
-                city_code = extract_city_code(series_ticker)
-                min_std = get_city_error_tracker().get_min_std(city_code, target_date.month)
-            except Exception:
-                min_std = max(Config.GLOBAL_MIN_STD, self.get_historical_forecast_error(series_ticker, target_date.month))
         else:
-            # City-specific floor from actual forecast track record
+            min_std = Config.GLOBAL_MIN_STD
+            if Config.CITY_SEASON_STD_ENABLED and series_ticker and target_date:
+                try:
+                    from .city_error_tracker import get_city_error_tracker
+                    city_code = extract_city_code(series_ticker)
+                    city_min = get_city_error_tracker().get_min_std(city_code, target_date.month)
+                    min_std = max(min_std, city_min)
+                except Exception:
+                    pass
             if series_ticker and target_date:
-                historical_min = self.get_historical_forecast_error(series_ticker, target_date.month)
-            else:
-                historical_min = 3.5
-            # Never go below global floor even with ensemble (actual forecast errors are 5-10°F)
-            min_std = max(Config.GLOBAL_MIN_STD, historical_min)
+                min_std = max(min_std, self.get_historical_forecast_error(series_ticker, target_date.month))
         std_temp = max(std_temp, min_std)
 
         # Day-over-day volatility boost: if yesterday's observed temp is far from

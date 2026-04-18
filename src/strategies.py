@@ -1,5 +1,5 @@
 import csv
-import time
+
 import uuid
 import logging
 import numpy as np
@@ -600,13 +600,10 @@ class TradingStrategy:
             display notification "{message}" with title "{title}"
             '''
             subprocess.run(['osascript', '-e', script], capture_output=True)
-        except Exception as e:
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
             # Silently fail if notifications don't work
             pass
 
-
-# BTC strategies removed - focusing on weather markets only
-# (Removed ~550 lines of commented BTC code for cleaner codebase)
 
 class WeatherDailyStrategy(TradingStrategy):
     """
@@ -686,8 +683,15 @@ class WeatherDailyStrategy(TradingStrategy):
         except ImportError as e:
             logger.warning(f"Could not load SettlementTracker: {e}")
 
-        # Drawdown protector — DISABLED (was blocking trades during calibration phase)
+        # Drawdown protector — progressive loss protection (config-gated)
         self.drawdown_protector = None
+        if Config.DRAWDOWN_PROTECTOR_ENABLED:
+            try:
+                from .drawdown_protector import DrawdownProtector
+                self.drawdown_protector = DrawdownProtector()
+                logger.info("📉 Drawdown protector ENABLED")
+            except ImportError as e:
+                logger.warning(f"Could not load DrawdownProtector: {e}")
 
         # Cooldown timer — time-based pause after losses
         self.cooldown_timer = None
@@ -1162,9 +1166,13 @@ class WeatherDailyStrategy(TradingStrategy):
             logger.debug(f"📊 SKIP {market_ticker}: risk manager reduced size to 0")
             return None
 
-        # Determine execution price (market making or taker)
+        # Determine execution price (maker-preferred; taker only if allowed)
+        # Rationale: Kalshi maker fee is ~4x lower than taker. Calibration backtest
+        # showed even with positive-edge models, 7% taker fees eat most of theoretical
+        # P&L. We default to maker-only unless explicitly disabled.
         execution_price = ask_price
         order_type = 'taker'
+        maker_only = getattr(Config, 'MAKER_ONLY', True)
         if self.market_making_enabled and hasattr(self, 'order_router'):
             routes = self.order_router.route_order(
                 side=side, count=position_size, orderbook=orderbook,
@@ -1175,12 +1183,16 @@ class WeatherDailyStrategy(TradingStrategy):
                 execution_price = routes[0]['price']
                 order_type = routes[0]['type']
                 if order_type == 'maker':
-                    logger.info(f"📝 Market making: posting at {execution_price}¢ (ask: {ask_price}¢, saving {ask_price - execution_price}¢)")
+                    logger.info(f"📝 Maker: posting at {execution_price}¢ (ask: {ask_price}¢, saving {ask_price - execution_price}¢)")
                     # Recalculate EV with maker fees (4x lower) and better price
                     maker_stake = execution_price / 100.0
                     ev = self.weather_agg.calculate_ev(
                         prob, 1.0, 1.0 - prob, maker_stake,
                         include_fees=True, is_maker=True)
+
+        if order_type != 'maker' and maker_only:
+            logger.info(f"📊 SKIP {market_ticker}: maker-only mode and no maker route available (would be taker at {execution_price}¢)")
+            return None
 
         # Build enhanced decision with analysis data
         # NOTE: active_positions write and INFO logging happen in caller
@@ -1380,7 +1392,7 @@ class WeatherDailyStrategy(TradingStrategy):
             return today + timedelta(days=1)
         
         # Fallback: assume tomorrow (original behavior)
-        logger.warning(f"Could not parse date from market, defaulting to tomorrow")
+        logger.warning("Could not parse date from market, defaulting to tomorrow")
         return today + timedelta(days=1)
     
     def should_trade(self, market: Dict) -> bool:
@@ -1689,6 +1701,16 @@ class WeatherDailyStrategy(TradingStrategy):
                     logger.debug(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}° only {dist_to_range:.1f}° from range ({range_low}-{range_high}°F) — near-boundary coin flip")
                     return None
 
+            # --- NEAR-BOUNDARY GUARD (single-threshold markets) ---
+            else:
+                dist_from_threshold = abs(mean_forecast - threshold)
+                min_dist = Config.MIN_DEGREES_FROM_THRESHOLD
+                if dist_from_threshold < min_dist:
+                    logger.debug(f"📊 SKIP {market_ticker}: forecast {mean_forecast:.1f}°F only "
+                                 f"{dist_from_threshold:.1f}°F from threshold {threshold}°F — "
+                                 f"need {min_dist:.1f}°F (near-boundary coin flip)")
+                    return None
+
             # Create temperature ranges around the forecast (2-degree brackets)
             temp_ranges = []
             base_temp = int(mean_forecast) - 10  # Start 10 degrees below
@@ -1758,12 +1780,6 @@ class WeatherDailyStrategy(TradingStrategy):
                 except Exception:
                     pass
 
-            # Apply calibration discount to combat systematic overconfidence
-            # Brier score 0.5461 (random=0.25) indicates severe miscalibration
-            cal_discount = getattr(Config, 'CALIBRATION_DISCOUNT', 1.0)
-            if cal_discount < 1.0:
-                our_prob *= cal_discount
-
             # Get market prices (reuse from earlier calculation if available)
             # Get orderbook data
             # Kalshi orderbook format: [[price, quantity], ...] sorted by price ASCENDING
@@ -1792,38 +1808,27 @@ class WeatherDailyStrategy(TradingStrategy):
             best_yes_ask = 100 - best_no_bid  # YES ask = 100 - NO bid
             best_no_ask = 100 - best_yes_bid  # NO ask = 100 - YES bid
 
-            # --- GUARDRAILS: Prevent model from overriding market consensus ---
+            # --- SANITY GATES (replacing the old guardrail blend) ---
+            # Calibration backtest showed the 50/50 model+market blend pulled Brier
+            # toward market (good) but also destroyed edge (bad). With a properly
+            # widened std from the fat-tail fix in weather_data.py, the raw model
+            # probability is the right signal to trade on. What we keep:
+            #   1. Market-floor block on cheap YES (still lottery-ticket risk)
+            #   2. Max-divergence skip: if |model - market| is very large, the
+            #      model is probably wrong, not the market — skip rather than blend.
             yes_blocked_by_floor = False
             if getattr(Config, 'GUARDRAIL_ENABLED', True):
-                # Use mid-price as market's implied probability (consensus),
-                # not the ask (which biases high and shrinks YES edge)
                 market_yes_prob = (best_yes_bid + best_yes_ask) / 2.0 / 100.0
-                raw_prob = our_prob
 
-                # Layer 1: Market probability floor — hard skip YES on very cheap contracts
-                # (cheap YES = lottery ticket; NO side still tradeable since it's expensive = high conviction)
                 market_prob_floor = getattr(Config, 'GUARDRAIL_MARKET_FLOOR', 0.15)
                 if market_yes_prob < market_prob_floor:
-                    logger.info(f"📊 SKIP YES {market_ticker}: market floor — YES mid {market_yes_prob:.0%} < {market_prob_floor:.0%} floor (lottery ticket)")
-                    # Flag so YES candidate is blocked below; NO side proceeds normally
+                    logger.info(f"📊 SKIP YES {market_ticker}: market floor — YES mid {market_yes_prob:.0%} < {market_prob_floor:.0%} (lottery ticket)")
                     yes_blocked_by_floor = True
-                else:
-                    yes_blocked_by_floor = False
 
-                # Layer 2: Divergence cap (clamp model within ±N% of market)
-                max_divergence = getattr(Config, 'GUARDRAIL_MAX_DIVERGENCE', 0.25)
-                capped_prob = max(market_yes_prob - max_divergence,
-                                  min(market_yes_prob + max_divergence, our_prob))
-
-                # Layer 3: Blend with market (don't fully trust model)
-                model_weight = getattr(Config, 'GUARDRAIL_MODEL_WEIGHT', 0.40)
-                blended_prob = model_weight * capped_prob + (1 - model_weight) * market_yes_prob
-
-                # Log the guardrail adjustment
-                if abs(blended_prob - raw_prob) > 0.01:
-                    logger.info(f"📊 GUARDRAIL {market_ticker}: raw={raw_prob:.1%} → capped={capped_prob:.1%} → blended={blended_prob:.1%} (mkt={market_yes_prob:.1%})")
-
-                our_prob = blended_prob
+                max_divergence = getattr(Config, 'GUARDRAIL_MAX_DIVERGENCE', 0.35)
+                if abs(our_prob - market_yes_prob) > max_divergence:
+                    logger.info(f"📊 SKIP {market_ticker}: |model {our_prob:.1%} − market {market_yes_prob:.1%}| = {abs(our_prob-market_yes_prob):.1%} > {max_divergence:.0%} divergence — model probably wrong")
+                    return None
                 no_prob = 1.0 - our_prob
 
             # EARLY PRICE CHECK: Skip if BOTH sides are too expensive (saves calculation time)
@@ -1844,7 +1849,6 @@ class WeatherDailyStrategy(TradingStrategy):
             prob_ci_yes, (ci_lower_yes, ci_upper_yes) = self.weather_agg.calculate_confidence_interval(
                 forecasts, threshold_for_ci, is_above=is_above_market, min_std=2.0
             )
-            prob_ci_no = 1.0 - prob_ci_yes
             ci_lower_no = 1.0 - ci_upper_yes
             ci_upper_no = 1.0 - ci_lower_yes
 
@@ -1974,8 +1978,13 @@ class WeatherDailyStrategy(TradingStrategy):
             high_confidence_no = ci_lower_no > best_no_ask / 100.0
 
             # Get required edge based on price (scaled edge for expensive contracts)
+            # NO premium uses max() not multiply — scaled edge and NO premium address
+            # different risks (price risk vs side bias), stacking them would be 8%*1.5*1.5=18%
             required_yes_edge = self._get_required_edge(best_yes_ask)
-            required_no_edge = self._get_required_edge(best_no_ask)
+            base_no_edge = self.min_edge_threshold
+            no_premium_edge = base_no_edge * Config.NO_EDGE_MULTIPLIER
+            scaled_no_edge = self._get_required_edge(best_no_ask)
+            required_no_edge = max(no_premium_edge, scaled_no_edge)
 
             # Range markets: require higher edge and enforce lower price cap
             range_yes_blocked = False
@@ -2256,8 +2265,6 @@ class WeatherDailyStrategy(TradingStrategy):
             best_yes_bid = yes_orders[-1][0] if yes_orders else 50
             current_yes_ask = 100 - best_no_bid
             current_no_ask = 100 - best_yes_bid
-            
-            current_ask = current_yes_ask if side == 'yes' else current_no_ask
             
             # Calculate current profit/loss
             # For both YES and NO: profit = what we can sell for now - what we paid

@@ -31,7 +31,7 @@ class Config:
     
     # Weather Strategy Parameters
     # Conservative strategy
-    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '8.0'))  # Minimum edge % to trade (wider stds + calibration discount already reduce overconfidence)
+    MIN_EDGE_THRESHOLD = float(os.getenv('MIN_EDGE_THRESHOLD', '8.0'))  # Minimum edge % to trade
     MIN_EV_THRESHOLD = float(os.getenv('MIN_EV_THRESHOLD', '0.02'))  # Minimum EV in dollars (relaxed for paper trading data collection)
     # If True, only trade when confidence interval does NOT overlap market price (stricter).
     # If False (default), trade when edge/EV meet thresholds even if CI overlaps (more trades, higher risk).
@@ -50,14 +50,17 @@ class Config:
     MIN_MARKET_VOLUME = int(os.getenv('MIN_MARKET_VOLUME', '15'))  # Minimum volume for liquidity
     MAX_MARKET_DATE_DAYS = int(os.getenv('MAX_MARKET_DATE_DAYS', '1'))  # 1-day horizon: only trade today/tomorrow (forecasts most accurate)
     # Never buy at or above this price (cents). Data shows 51-75¢ entries lose money (42% win rate).
-    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '92'))  # 92¢ ceiling — guardrails (market blend) prevent overconfidence; 93-99¢ not worth fees
+    MAX_BUY_PRICE_CENTS = int(os.getenv('MAX_BUY_PRICE_CENTS', '92'))  # 92¢ ceiling — 93-99¢ not worth fees
     MAX_NO_BUY_PRICE_CENTS = int(os.getenv('MAX_NO_BUY_PRICE_CENTS', '92'))  # Symmetric with YES — guardrails handle risk
     OBSERVATION_MIN_BUFFER = float(os.getenv('OBSERVATION_MIN_BUFFER', '2.0'))  # Observed temp must be ≥2°F past threshold to count as "determined"
 
     # Forecast quality gates
     MIN_FORECAST_SOURCES = int(os.getenv('MIN_FORECAST_SOURCES', '2'))  # Need >=2 independent forecasts (rate-limited sources often 429)
     MIN_FORECAST_SPREAD = float(os.getenv('MIN_FORECAST_SPREAD', '0.5'))  # Minimum std across forecasts (°F) — blocks correlated sources
-    GLOBAL_MIN_STD = float(os.getenv('GLOBAL_MIN_STD', '2.5'))  # Global minimum std floor (°F) for probability distributions (lowered from 4.0; guardrails prevent overconfidence)
+    # GLOBAL_MIN_STD raised from 2.5 → 3.5: calibration backtest (Apr 2026) showed the
+    # Normal CDF at 2.5°F had Brier 0.3136 (30% worse than market); fat-tail model
+    # with wider std achieved Brier 0.2792 and positive simulated P&L.
+    GLOBAL_MIN_STD = float(os.getenv('GLOBAL_MIN_STD', '3.5'))  # Global minimum std floor (°F) for probability distributions
 
     # Forecast direction gate: only trade when the forecast mean supports the bet direction
     # For "below" markets (YES = temp < T): require forecast mean < threshold
@@ -78,6 +81,9 @@ class Config:
 
     # Range market boundary guard
     RANGE_BOUNDARY_MIN_DISTANCE = float(os.getenv('RANGE_BOUNDARY_MIN_DISTANCE', '3.0'))  # Skip range markets when forecast is within 3°F of boundary
+
+    # Single-threshold near-boundary guard
+    MIN_DEGREES_FROM_THRESHOLD = float(os.getenv('MIN_DEGREES_FROM_THRESHOLD', '4.0'))  # Skip when forecast is within 4°F of threshold (coin flip)
 
     # Range market controls (range markets have 0% WR in real trading — disabled by default)
     RANGE_MARKETS_ENABLED = os.getenv('RANGE_MARKETS_ENABLED', 'false').lower() == 'true'
@@ -106,7 +112,8 @@ class Config:
     # Bias correction settings
     ENABLE_BIAS_CORRECTION = os.getenv('ENABLE_BIAS_CORRECTION', 'true').lower() == 'true'
     MIN_SAMPLES_FOR_BIAS = int(os.getenv('MIN_SAMPLES_FOR_BIAS', '3'))  # Min samples before applying bias correction (lowered from 10; with 12 trades we never hit 10)
-    MAX_BIAS_CORRECTION_F = float(os.getenv('MAX_BIAS_CORRECTION_F', '8.0'))  # Cap bias correction magnitude (°F) (raised from 3.0; actual biases are -13 to -18°F)
+    MAX_BIAS_CORRECTION_F = float(os.getenv('MAX_BIAS_CORRECTION_F', '15.0'))  # Cap bias correction magnitude (°F) — raised from 8.0; observed biases reach -18°F (Pirate PHIL Feb)
+    UNRELIABLE_BIAS_THRESHOLD_F = float(os.getenv('UNRELIABLE_BIAS_THRESHOLD_F', '12.0'))  # Drop a source for a city/month entirely when learned |bias| exceeds this (source is too broken to trust even after correction)
     NWS_SOURCE_WEIGHT = float(os.getenv('NWS_SOURCE_WEIGHT', '1.5'))  # Extra weight for NWS (Kalshi settles on NWS CLI)
 
     # Exit/Sell Logic
@@ -118,13 +125,19 @@ class Config:
     # Stale Order Management
     STALE_ORDER_MIN_AGE_MINUTES = int(os.getenv('STALE_ORDER_MIN_AGE_MINUTES', '5'))  # Don't cancel orders younger than 5 min
 
+    # NO-side edge premium (NO bets require higher edge — historically -$13.28 vs YES +$0.17)
+    NO_EDGE_MULTIPLIER = float(os.getenv('NO_EDGE_MULTIPLIER', '1.5'))  # 1.5x edge required for NO-side bets
+
     # Scaled Edge Requirements (require more edge for expensive contracts)
     SCALED_EDGE_ENABLED = os.getenv('SCALED_EDGE_ENABLED', 'true').lower() == 'true'
     SCALED_EDGE_PRICE_THRESHOLD = int(os.getenv('SCALED_EDGE_PRICE_THRESHOLD', '35'))  # Apply scaling above 35¢
-    SCALED_EDGE_MULTIPLIER = float(os.getenv('SCALED_EDGE_MULTIPLIER', '1.0'))  # 1.0 = disabled — guardrail market blend already prevents overconfidence on expensive contracts
+    SCALED_EDGE_MULTIPLIER = float(os.getenv('SCALED_EDGE_MULTIPLIER', '1.5'))  # Require 1.5x edge above 35¢ contracts
 
     # Market Making Mode (post limit orders at better prices instead of paying the ask)
     MARKET_MAKING_ENABLED = os.getenv('MARKET_MAKING_ENABLED', 'true').lower() == 'true'
+    # Maker-only enforcement (Apr 2026): calibration backtest showed 7% taker fees
+    # ate simulated P&L. When true, bot skips any trade that would cross the spread.
+    MAKER_ONLY = os.getenv('MAKER_ONLY', 'true').lower() == 'true'
     MM_MIN_SPREAD_TO_MAKE = int(os.getenv('MM_MIN_SPREAD_TO_MAKE', '3'))  # Minimum spread to post maker orders
     MM_MAX_SPREAD_TO_MAKE = int(os.getenv('MM_MAX_SPREAD_TO_MAKE', '15'))  # Don't make very wide markets
     MM_REQUOTE_THRESHOLD = int(os.getenv('MM_REQUOTE_THRESHOLD', '2'))  # Requote if outbid by this many cents
@@ -189,18 +202,22 @@ class Config:
     POSTMORTEM_ENABLED = os.getenv('POSTMORTEM_ENABLED', 'true').lower() == 'true'
 
     # Cooldown Timer (pause trading after losses)
+    DRAWDOWN_PROTECTOR_ENABLED = os.getenv('DRAWDOWN_PROTECTOR_ENABLED', 'false').lower() == 'true'  # Progressive loss protection (disable during paper trading data collection)
     COOLDOWN_ENABLED = os.getenv('COOLDOWN_ENABLED', 'true').lower() == 'true'
     COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '60'))  # Pause duration after a single loss
     COOLDOWN_SESSION_PAUSE_LOSSES = int(os.getenv('COOLDOWN_SESSION_PAUSE_LOSSES', '3'))  # Consecutive losses to pause rest of day
 
-    # Calibration discount (shrink probabilities toward 50% to combat overconfidence)
-    CALIBRATION_DISCOUNT = float(os.getenv('CALIBRATION_DISCOUNT', '1.0'))  # Multiply our_prob_yes by this factor (1.0 = no discount; wider stds handle conservatism)
 
-    # Guardrails: Prevent model from fighting market consensus (inspired by Boz)
+    # Guardrails (Apr 2026): the 50/50 model+market blend was removed after calibration
+    # backtest showed it destroyed edge without improving Brier (fat-tail std in
+    # weather_data.py is the right fix). Remaining guardrails are sanity filters only:
+    #   GUARDRAIL_MARKET_FLOOR: skip YES bets on contracts so cheap they're lottery tickets
+    #   GUARDRAIL_MAX_DIVERGENCE: if |model - market| exceeds this, skip entirely — model
+    #     is probably wrong, not the market. Don't blend, don't cap — skip.
+    # GUARDRAIL_MODEL_WEIGHT is retained in config for backwards compat but no longer read.
     GUARDRAIL_ENABLED = os.getenv('GUARDRAIL_ENABLED', 'true').lower() == 'true'
     GUARDRAIL_MARKET_FLOOR = float(os.getenv('GUARDRAIL_MARKET_FLOOR', '0.15'))  # Skip YES when market < 15¢
-    GUARDRAIL_MAX_DIVERGENCE = float(os.getenv('GUARDRAIL_MAX_DIVERGENCE', '0.25'))  # Max ±25% from market
-    GUARDRAIL_MODEL_WEIGHT = float(os.getenv('GUARDRAIL_MODEL_WEIGHT', '0.40'))  # 40% model, 60% market
+    GUARDRAIL_MAX_DIVERGENCE = float(os.getenv('GUARDRAIL_MAX_DIVERGENCE', '0.35'))  # Skip if |model − market| exceeds this
 
     # City/Season Error Std (per-city, per-season forecast uncertainty floor)
     CITY_SEASON_STD_ENABLED = os.getenv('CITY_SEASON_STD_ENABLED', 'true').lower() == 'true'

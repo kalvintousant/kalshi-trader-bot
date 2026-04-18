@@ -121,30 +121,40 @@ class CityErrorTracker:
     def get_min_std(self, city: str, month: int) -> float:
         """Get the minimum std floor for a city and month.
 
-        If enough historical data exists, uses the std of past errors.
-        Otherwise falls back to conservative per-city per-season defaults.
+        If enough historical data exists, uses the std of past errors but never
+        drops below 60% of the calibrated fallback (so a few small-error samples
+        can't tear down the safety margin). Otherwise falls back to conservative
+        per-city per-season defaults.
 
         Args:
             city: City code (e.g., 'NY', 'CHI')
             month: Month number (1-12)
 
         Returns:
-            Minimum std in °F (never below 1.5°F)
+            Minimum std in °F (never below 1.5°F or 60% of calibrated fallback)
         """
         season = self.SEASON_MAP.get(month, 'winter')
         min_samples = Config.CITY_SEASON_MIN_SAMPLES
+
+        city_defaults = self.FALLBACK_STD.get(city, {})
+        fallback = city_defaults.get(season, self.DEFAULT_FALLBACK)
 
         # Check historical data
         errors = self.errors.get(city, {}).get(season, [])
         if len(errors) >= min_samples:
             historical_std = float(np.std(errors))
-            result = max(1.5, historical_std)
-            logger.debug(f"City error std for {city}/{season}: {result:.2f}°F (from {len(errors)} samples)")
+            # Floor: 60% of the calibrated fallback — historical can override
+            # upward (atmosphere becoming more volatile) but not collapse the
+            # safety margin downward from a small low-error streak.
+            floor = max(1.5, fallback * 0.6)
+            result = max(floor, historical_std)
+            logger.debug(
+                f"City error std for {city}/{season}: {result:.2f}°F "
+                f"(historical={historical_std:.2f}, fallback_floor={floor:.2f}, n={len(errors)})"
+            )
             return result
 
         # Fall back to hardcoded defaults
-        city_defaults = self.FALLBACK_STD.get(city, {})
-        fallback = city_defaults.get(season, self.DEFAULT_FALLBACK)
         logger.debug(f"City error std for {city}/{season}: {fallback:.1f}°F (fallback, only {len(errors)} samples)")
         return fallback
 
